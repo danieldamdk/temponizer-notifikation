@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    https://ajourcare.dk/
-// @version      6.40
-// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun første 20 kB ved ændring. Indeholder ⚙ indstillinger til Pushover USER/TOKEN. Gear-ikonet rendres nu som overlay (fixed) for at undgå clipping.
+// @version      6.42
+// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. HEAD+ETag + 20 kB range. ⚙ Indstillinger til Pushover. **Sikkerhed**: sendPushover dobbelttjekker nu de to toggles (msg/int), og logger når push blokeres.
 // @match        https://ajourcare.temponizer.dk/*
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
@@ -20,6 +20,21 @@
 const POLL_MS     = 30000;  // interval mellem polls
 const SUPPRESS_MS = 45000;  // min. tid mellem push/toast pr. kategori
 const LOCK_MS     = SUPPRESS_MS + 5000; // lås til at undgå dobbelte notifikationer mellem tabs
+
+/*──────────────────── Utils ────────────────────*/
+function isPushEnabled(channel) {
+  if (channel === 'msg') return localStorage.getItem('tpPushEnableMsg') === 'true';
+  if (channel === 'int') return localStorage.getItem('tpPushEnableInt') === 'true';
+  return false;
+}
+function debugState(prefix) {
+  try {
+    console.info('[TP][DBG]', prefix, {
+      msg: localStorage.getItem('tpPushEnableMsg'),
+      int: localStorage.getItem('tpPushEnableInt')
+    });
+  } catch(_) {}
+}
 
 /*──────────────────── 2. TOAST ────────────────────*/
 function showToastOnce(key, msg) {
@@ -54,11 +69,16 @@ function showDOMToast(msg) {
   setTimeout(function () { el.style.opacity = 0; setTimeout(function () { el.remove(); }, 500); }, 4000);
 }
 
-/*──────────────────── 3. PUS H O V E R (GM storage) ────────────────────*/
-function sendPushover(msg) {
+/*──────────────────── 3. Pushover (GM storage) ────────────────────*/
+function sendPushover(msg, channel) {
+  // **DOBBELT GATE** – også her, så push aldrig sendes ved fejl andetsteds
+  if (!isPushEnabled(channel)) {
+    console.info('[TP] Push blokeret (toggle OFF for', channel + ')');
+    return;
+  }
+
   const user  = GM_getValue('pushover_user', '');
   const token = GM_getValue('pushover_token', '');
-
   if (!user || !token) {
     showToastOnce('po_missing', 'Pushover ikke sat op – klik tandhjulet for at indtaste nøgler');
     openTpSettings();
@@ -75,7 +95,6 @@ function sendPushover(msg) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     data: body,
     onerror: function () {
-      // fallback via fetch
       fetch('https://api.pushover.net/1/messages.json', {
         method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body
       }).catch(console.error);
@@ -83,7 +102,7 @@ function sendPushover(msg) {
   });
 }
 
-/*──────────────────── 4. BESKEDER ────────────────────*/
+/*──────────────────── 4. Beskeder ────────────────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
 const stMsg = JSON.parse(localStorage.getItem('tpPushState') || '{"count":0,"lastPush":0,"lastSent":0}');
@@ -99,12 +118,12 @@ function pollMessages() {
     .then(r => r.json())
     .then(d => {
       const n = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
-      const en = localStorage.getItem('tpPushEnableMsg') === 'true';
+      const en = isPushEnabled('msg');
 
       if (n > stMsg.count && n !== stMsg.lastSent) {
         if (Date.now() - stMsg.lastPush > SUPPRESS_MS && takeLock()) {
           const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
-          if (en) sendPushover(m);
+          if (en) sendPushover(m, 'msg'); else console.info('[TP] Ingen push (msg toggle OFF)');
           showToastOnce('msg', m);
           stMsg.lastPush = Date.now(); stMsg.lastSent = n;
         } else stMsg.lastSent = n;
@@ -116,7 +135,7 @@ function pollMessages() {
     .catch(console.error);
 }
 
-/*──────────────────── 5. INTERESSE (HEAD + ETag + Range) ────────────────────*/
+/*──────────────────── 5. Interesse (HEAD + ETag + Range) ────────────────────*/
 const HTML_URL = location.origin + '/index.php?page=freevagter';
 let   lastETag = null;
 
@@ -125,20 +144,12 @@ function saveInt() { localStorage.setItem('tpInterestState', JSON.stringify(stIn
 
 function pollInterest() {
   fetch(HTML_URL, {
-    method: 'HEAD',
-    credentials: 'same-origin',
-    headers: lastETag ? { 'If-None-Match': lastETag } : {}
+    method: 'HEAD', credentials: 'same-origin', headers: lastETag ? { 'If-None-Match': lastETag } : {}
   })
     .then(function (h) {
-      if (h.status === 304) {
-        console.info('[TP-interesse] uændret', new Date().toLocaleTimeString());
-        return;
-      }
+      if (h.status === 304) { console.info('[TP-interesse] uændret', new Date().toLocaleTimeString()); return; }
       lastETag = h.headers.get('ETag') || null;
-      return fetch(HTML_URL, {
-        credentials: 'same-origin',
-        headers: { Range: 'bytes=0-20000' }
-      })
+      return fetch(HTML_URL, { credentials: 'same-origin', headers: { Range: 'bytes=0-20000' } })
         .then(r => r.text())
         .then(parseInterestHTML);
     })
@@ -147,159 +158,79 @@ function pollInterest() {
 
 function parseInterestHTML(html) {
   const doc   = new DOMParser().parseFromString(html, 'text/html');
-  const boxes = Array.prototype.slice.call(
-    doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]')
-  );
-  const c = boxes.reduce((s, el) => {
-    const v = parseInt(el.textContent.trim(), 10);
-    return s + (isNaN(v) ? 0 : v);
-  }, 0);
+  const boxes = Array.prototype.slice.call(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
+  const c = boxes.reduce((s, el) => { const v = parseInt(el.textContent.trim(), 10); return s + (isNaN(v) ? 0 : v); }, 0);
   handleInterestCount(c);
   console.info('[TP-interesse]', c, new Date().toLocaleTimeString());
 }
 
 function handleInterestCount(c) {
-  const en = localStorage.getItem('tpPushEnableInt') === 'true';
-
+  const en = isPushEnabled('int');
   if (c > stInt.count && c !== stInt.lastSent) {
     if (Date.now() - stInt.lastPush > SUPPRESS_MS) {
       const m = '👀 ' + c + ' vikar(er) har vist interesse for ledige vagter';
-      if (en) sendPushover(m);
+      if (en) sendPushover(m, 'int'); else console.info('[TP] Ingen push (int toggle OFF)');
       showToastOnce('int', m);
       stInt.lastPush = Date.now(); stInt.lastSent = c;
     } else stInt.lastSent = c;
   } else if (c < stInt.count) stInt.lastPush = 0;
-
   stInt.count = c; saveInt();
 }
 
-/*──────────────────── 6. UI (panel + gear-overlay) ────────────────────*/
+/*──────────────────── 6. UI (on/off + gear) ────────────────────*/
 let _tpPanel, _tpGear;
 function injectUI() {
   const d = document.createElement('div');
   d.id = 'tpPanel';
   Object.assign(d.style, {
     position: 'fixed', bottom: '8px', right: '8px', zIndex: 2147483646,
-    background: '#f9f9f9', border: '1px solid #ccc',
-    padding: '10px 12px', borderRadius: '6px',
-    fontSize: '12px', fontFamily: 'sans-serif',
-    boxShadow: '1px 1px 5px rgba(0,0,0,.2)',
-    boxSizing: 'border-box',
-    minWidth: '220px'
+    background: '#f9f9f9', border: '1px solid #ccc', padding: '10px 12px', borderRadius: '6px',
+    fontSize: '12px', fontFamily: 'sans-serif', boxShadow: '1px 1px 5px rgba(0,0,0,.2)', boxSizing: 'border-box', minWidth: '220px'
   });
 
-  // Header
-  const header = document.createElement('div');
-  Object.assign(header.style, { marginBottom: '4px' });
-  const title = document.createElement('b');
-  title.textContent = 'TP Notifikationer';
-  header.appendChild(title);
-  d.appendChild(header);
+  const header = document.createElement('div'); header.style.marginBottom = '4px';
+  const title = document.createElement('b'); title.textContent = 'TP Notifikationer'; header.appendChild(title); d.appendChild(header);
 
-  // Body content
-  const line1 = document.createElement('label');
-  line1.style.display = 'block'; line1.style.marginTop = '4px';
-  line1.innerHTML = '<input type="checkbox" id="tp_msg"> Besked (Pushover)';
-  const line2 = document.createElement('label');
-  line2.style.display = 'block'; line2.style.marginTop = '2px';
-  line2.innerHTML = '<input type="checkbox" id="tp_int"> Interesse (Pushover)';
-  d.appendChild(line1);
-  d.appendChild(line2);
+  const line1 = document.createElement('label'); line1.style.display = 'block'; line1.style.marginTop = '4px'; line1.innerHTML = '<input type="checkbox" id="tp_msg"> Besked (Pushover)';
+  const line2 = document.createElement('label'); line2.style.display = 'block'; line2.style.marginTop = '2px'; line2.innerHTML = '<input type="checkbox" id="tp_int"> Interesse (Pushover)';
+  d.appendChild(line1); d.appendChild(line2);
 
-  document.body.appendChild(d);
-  _tpPanel = d;
+  document.body.appendChild(d); _tpPanel = d;
 
-  // Gear as FIXED overlay anchored to the panel's top-right (avoid any clipping/overflow)
   const gear = document.createElement('button');
-  gear.id = 'tpSettings';
-  gear.title = 'Indstillinger';
-  gear.setAttribute('aria-label', 'Indstillinger');
-  Object.assign(gear.style, {
-    position: 'fixed', zIndex: 2147483647,
-    width: '20px', height: '20px',
-    padding: 0, margin: 0,
-    lineHeight: 0,
-    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-    border: 'none', background: 'transparent', cursor: 'pointer',
-    opacity: 0.8, pointerEvents: 'auto'
-  });
-  gear.onmouseenter = function () { gear.style.opacity = 1; };
-  gear.onmouseleave = function () { gear.style.opacity = 0.8; };
-  gear.innerHTML = '\n    <svg viewBox="0 0 24 24" width="18" height="18" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="display:block">\n      <path d="M12 8.75a3.25 3.25 0 1 1 0 6.5a3.25 3.25 0 0 1 0-6.5Zm8.63 3.5c.03.25.05.5.05.75s-.02.5-.05.75l2 1.56a.5.5 0 0 1 .12.64l-1.9 3.29a.5.5 0 0 1-.6.22l-2.36-.95a7.6 7.6 0 0 1-1.3.76l-.36 2.52a.5.5 0 0 1-.49.42h-3.8a.5.5 0 0 1-.49-.42l-.36-2.52a7.6 7.6 0 0 1-1.3-.76l-2.36.95a.5.5 0 0 1-.6.22l1.9 3.29a.5.5 0 0 1-.12.64l-2 1.56Z" fill="currentColor"/>\n    </svg>\n  ';
-  gear.onclick = openTpSettings;
-  document.body.appendChild(gear);
-  _tpGear = gear;
-  placeGear();
-  window.addEventListener('resize', placeGear);
+  gear.id = 'tpSettings'; gear.title = 'Indstillinger'; gear.setAttribute('aria-label', 'Indstillinger');
+  Object.assign(gear.style, { position: 'fixed', zIndex: 2147483647, width: '22px', height: '22px', padding: 0, margin: 0, lineHeight: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', border: 'none', background: 'transparent', cursor: 'pointer', opacity: 0.9 });
+  gear.onmouseenter = function () { gear.style.opacity = 1; }; gear.onmouseleave = function () { gear.style.opacity = 0.9; };
+  gear.innerHTML = '\n    <svg viewBox="0 0 24 24" width="18" height="18" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="display:block">\n      <path d="M12 8.75a3.25 3.25 0 1 1 0 6.5a3.25 3.25 0 0 1 0-6.5Zm8.63 3.5c.03.25.05.5.05.75s-.02.5-.05.75l2 1.56a.5.5 0 0 1 .12.64l-1.9 3.29a.5.5 0 0 1-.6.22l-2.36-.95a7.6 7.6 0 0 1-1.3.76l-.36 2.52a.5.5 0 0 1-.49.42h-3.8a.5.5 0 0 1-.49-.42l-.36-2.52a7.6 7.6 0 0 1-1.3-.76l-2.36.95a.5.5 0 0 1-.6.22l-1.9 3.29a.5.5 0 0 1-.12.64l-2 1.56Z" fill="currentColor"/>\n    </svg>\n  ';
+  gear.onclick = openTpSettings; document.body.appendChild(gear); _tpGear = gear; placeGear();
+  window.addEventListener('resize', placeGear); window.addEventListener('scroll', placeGear, true);
+
+  var m = document.getElementById('tp_msg'); var i = document.getElementById('tp_int');
+  m.checked = isPushEnabled('msg'); i.checked = isPushEnabled('int');
+  m.onchange = function () { localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false'); debugState('toggle msg'); };
+  i.onchange = function () { localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false'); debugState('toggle int'); };
+
+  debugState('ui init');
 }
 
 function placeGear() {
   if (!_tpPanel || !_tpGear) return;
   const r = _tpPanel.getBoundingClientRect();
-  const size = 20, pad = 6;
-  // try top-right first
-  let left = r.right - size - pad;
-  let top  = r.top + pad;
-  // if outside viewport (e.g., clipped by window), fallback to top-left
-  if (left < 0) left = r.left + pad;
-  if (top  < 0) top  = pad;
-  // also ensure doesn't exceed viewport
-  const maxL = window.innerWidth - size - 1;
-  const maxT = window.innerHeight - size - 1;
-  if (left > maxL) left = Math.max(pad, r.left + pad);
-  if (top  > maxT) top  = Math.max(pad, r.top + pad);
-  _tpGear.style.left = left + 'px';
-  _tpGear.style.top  = top  + 'px';
-}
-
-function openTpSettings() {
-  if (document.getElementById('tpSettingsModal')) return;
-
-  const overlay = document.createElement('div');
-  overlay.id = 'tpSettingsModal';
-  Object.assign(overlay.style, {
-    position: 'fixed', inset: 0, background: 'rgba(0,0,0,.35)', zIndex: 2147483647
-  });
-
-  const box = document.createElement('div');
-  Object.assign(box.style, {
-    position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%,-50%)',
-    background: '#fff', borderRadius: '8px', padding: '16px', width: '380px',
-    boxShadow: '0 8px 24px rgba(0,0,0,.25)', fontFamily: 'sans-serif', fontSize: '13px'
-  });
-
-  const userVal  = GM_getValue('pushover_user', '');
-  const tokenVal = GM_getValue('pushover_token', '');
-
-  box.innerHTML =
-    '<div style="font-weight:600;margin-bottom:8px;">Pushover – opsætning</div>'+
-    '<label style="display:block;margin:6px 0 2px;">USER key</label>'+
-    '<input id="tpUserKey" type="text" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;" value="' + (userVal||'') + '">' +
-    '<label style="display:block;margin:8px 0 2px;">API Token/Key</label>'+
-    '<input id="tpApiToken" type="text" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;" value="' + (tokenVal||'') + '">' +
-    '<div style="margin-top:10px;line-height:1.4;">' +
-      'Hjælp: ' +
-      '<a href="https://pushover.net/" target="_blank" rel="noopener">Find din USER key (Dashboard)</a> · ' +
-      '<a href="https://pushover.net/apps" target="_blank" rel="noopener">Opret/vis API Token</a> · ' +
-      '<a href="https://pushover.net/api" target="_blank" rel="noopener">API-guide</a>' +
-    '</div>' +
-    '<div style="margin-top:14px;text-align:right;">' +
-      '<button id="tpCancel" style="margin-right:6px;padding:6px 10px;">Luk</button>' +
-      '<button id="tpSave" style="padding:6px 10px;">Gem</button>' +
-    '</div>';
-
-  overlay.appendChild(box);
-  document.body.appendChild(overlay);
-
-  document.getElementById('tpCancel').onclick = function () { overlay.remove(); };
-  document.getElementById('tpSave').onclick = function () {
-    const u = document.getElementById('tpUserKey').value.trim();
-    const t = document.getElementById('tpApiToken').value.trim();
-    GM_setValue('pushover_user', u);
-    GM_setValue('pushover_token', t);
-    showToast('Pushover nøgler gemt');
-    overlay.remove();
-  };
+  const size = 22, padX = 12, padY = 10;
+  const candidates = [
+    { left: r.right - size - padX, top: r.top + padY }, // TR
+    { left: r.right - size - padX, top: r.bottom - size - padY }, // BR
+    { left: r.left + padX,        top: r.bottom - size - padY }, // BL
+    { left: r.left + padX,        top: r.top + padY }  // TL
+  ];
+  function vis(p){
+    const vx1=Math.max(0,p.left), vy1=Math.max(0,p.top), vx2=Math.min(window.innerWidth,p.left+size), vy2=Math.min(window.innerHeight,p.top+size);
+    return Math.max(0,vx2-vx1)*Math.max(0,vy2-vy1);
+  }
+  let best=candidates[0], s=-1; for(const c of candidates){const sc=vis(c); if(sc>s){s=sc; best=c;}}
+  if (s<=0) { best={ left: Math.max(8, window.innerWidth - size - 8), top: Math.max(8, window.innerHeight - size - 8) }; }
+  _tpGear.style.left = Math.round(best.left) + 'px';
+  _tpGear.style.top  = Math.round(best.top)  + 'px';
 }
 
 /*──────────────────── 7. START ────────────────────*/
@@ -308,14 +239,13 @@ document.addEventListener('click', function (e) {
   if (a && /Beskeder/.test(a.textContent || '')) { stMsg.lastPush = stMsg.lastSent = 0; saveMsg(); }
 });
 
-pollMessages();
-pollInterest();
+pollMessages(); pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 
 injectUI();
 
-/*──────────────────── 8. HOVER “Intet Svar” (én knap) ────────────────────*/
+/*──────────────────── 8. Hover “Intet Svar” (én knap) ────────────────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
   function mkMenu() {
@@ -355,4 +285,4 @@ injectUI();
 })();
 
 // Hjælp i konsol
-console.info('[TP] kører version', '6.40');
+console.info('[TP] kører version', '6.42');
