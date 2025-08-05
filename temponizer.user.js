@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    https://ajourcare.dk/
-// @version      6.44
-// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. HEAD+ETag + 20 kB range. ⚙ Indstillinger til Pushover. **Fix:** tandhjulet er nu en robust tekst-knap (⚙︎) i headeren og kan ikke klippes væk af CSS.
+// @version      6.46
+// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. HEAD+ETag + 20 kB range. ⚙ Indstillinger til Pushover. **Admin‑låst API Token**: kollegaer indtaster kun deres User Key.
 // @match        https://ajourcare.temponizer.dk/*
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
@@ -20,6 +20,10 @@
 const POLL_MS     = 30000;  // interval mellem polls
 const SUPPRESS_MS = 45000;  // min. tid mellem push/toast pr. kategori
 const LOCK_MS     = SUPPRESS_MS + 5000; // lås til at undgå dobbelte notifikationer mellem tabs
+
+// **ORG‑TOKENS (admin‑låst)**
+// UDFYLD DENNE KONSTANT med jeres Pushover API Token (app key). Brug samme token for alle.
+const ORG_PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
 
 /*──────────────────── Utils ────────────────────*/
 function isPushEnabled(channel) {
@@ -69,7 +73,7 @@ function showDOMToast(msg) {
   setTimeout(function () { el.style.opacity = 0; setTimeout(function () { el.remove(); }, 500); }, 4000);
 }
 
-/*──────────────────── 3. Pushover (GM storage) ────────────────────*/
+/*──────────────────── 3. Pushover (admin‑låst token) ────────────────────*/
 function sendPushover(msg, channel) {
   // Dobbelttjek toggle her også
   if (!isPushEnabled(channel)) {
@@ -77,10 +81,15 @@ function sendPushover(msg, channel) {
     return;
   }
 
-  const user  = GM_getValue('pushover_user', '');
-  const token = GM_getValue('pushover_token', '');
-  if (!user || !token) {
-    showToastOnce('po_missing', 'Pushover ikke sat op – klik ⚙︎ for at indtaste nøgler');
+  const user  = GM_getValue('pushover_user', '').trim();
+  const token = ORG_PUSHOVER_TOKEN.trim();
+
+  if (!token) {
+    showToastOnce('po_missing_token', 'ADMIN: ORG_PUSHOVER_TOKEN mangler i scriptet');
+    return;
+  }
+  if (!user) {
+    showToastOnce('po_missing_user', 'Pushover USER mangler – klik ⚙︎ og indsæt din USER key');
     openTpSettings();
     return;
   }
@@ -196,17 +205,13 @@ function injectUI() {
   // **Robust gear som tekst‑knap (⚙︎) inde i headeren**
   const gear = document.createElement('button');
   gear.id = 'tpSettings'; gear.title = 'Indstillinger'; gear.setAttribute('aria-label', 'Indstillinger');
-  // neutraliser side-CSS
   gear.style.all = 'unset';
   Object.assign(gear.style, {
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
     width: '22px', height: '22px', cursor: 'pointer',
-    borderRadius: '50%',
-    padding: '0', margin: '0', lineHeight: '1',
+    borderRadius: '50%', padding: '0', margin: '0', lineHeight: '1',
     userSelect: 'none', WebkitUserSelect: 'none',
-    background: 'rgba(255,255,255,0.95)',
-    border: '1px solid rgba(0,0,0,0.15)',
-    boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
+    background: 'rgba(255,255,255,0.95)', border: '1px solid rgba(0,0,0,0.15)', boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
   });
   gear.textContent = '⚙︎';
   gear.onclick = openTpSettings;
@@ -237,20 +242,18 @@ function openTpSettings() {
   const box = document.createElement('div');
   Object.assign(box.style, { position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%,-50%)', background: '#fff', borderRadius: '8px', padding: '16px', width: '380px', boxShadow: '0 8px 24px rgba(0,0,0,.25)', fontFamily: 'sans-serif', fontSize: '13px' });
 
-  const userVal  = GM_getValue('pushover_user', '');
-  const tokenVal = GM_getValue('pushover_token', '');
+  const userVal = GM_getValue('pushover_user', '');
 
   box.innerHTML =
     '<div style="font-weight:600;margin-bottom:8px;">Pushover – opsætning</div>'+
     '<label style="display:block;margin:6px 0 2px;">USER key</label>'+
     '<input id="tpUserKey" type="text" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;" value="' + (userVal||'') + '">' +
-    '<label style="display:block;margin:8px 0 2px;">API Token/Key</label>'+
-    '<input id="tpApiToken" type="text" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;" value="' + (tokenVal||'') + '">' +
+    '<div style="margin-top:8px;padding:8px;border:1px solid #e5e5e5;border-radius:6px;background:#fafafa;">' +
+      '<b>API Token:</b> Låst af administrator i scriptet.' +
+    '</div>' +
     '<div style="margin-top:10px;line-height:1.4;">' +
       'Hjælp: ' +
-      '<a href="https://pushover.net/" target="_blank" rel="noopener">Find din USER key (Dashboard)</a> · ' +
-      '<a href="https://pushover.net/apps" target="_blank" rel="noopener">Opret/vis API Token</a> · ' +
-      '<a href="https://pushover.net/api" target="_blank" rel="noopener">API-guide</a>' +
+      '<a href="https://pushover.net/" target="_blank" rel="noopener">Find din USER key (Dashboard)</a>' +
     '</div>' +
     '<div style="margin-top:14px;text-align:right;">' +
       '<button id="tpCancel" style="margin-right:6px;padding:6px 10px;">Luk</button>' +
@@ -263,10 +266,8 @@ function openTpSettings() {
   document.getElementById('tpCancel').onclick = function () { overlay.remove(); };
   document.getElementById('tpSave').onclick = function () {
     const u = document.getElementById('tpUserKey').value.trim();
-    const t = document.getElementById('tpApiToken').value.trim();
     GM_setValue('pushover_user', u);
-    GM_setValue('pushover_token', t);
-    showToast('Pushover nøgler gemt');
+    showToast('Pushover USER gemt');
     overlay.remove();
   };
 }
@@ -315,7 +316,7 @@ injectUI();
     ml.forEach(function (m) {
       m.addedNodes.forEach(function (n) {
         if (!(n instanceof HTMLElement)) return;
-        var ta = (n.matches && n.matches('textarea[name="phonetext"]')) ? n : (n.querySelector && n.querySelector('textarea[name="phonetext"]'));
+        var ta = (n.matches && n.matches('textarea[name=\"phonetext\"]')) ? n : (n.querySelector && n.querySelector('textarea[name=\"phonetext\"]'));
         if (ta) { if (!ta.value.trim()) ta.value = 'Intet Svar'; ta.focus(); auto = false; }
       });
     });
@@ -323,4 +324,4 @@ injectUI();
 })();
 
 // Hjælp i konsol
-console.info('[TP] kører version', '6.44');
+console.info('[TP] kører version', '6.46');
