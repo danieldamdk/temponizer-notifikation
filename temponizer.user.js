@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    https://ajourcare.dk/
-// @version      6.39
-// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun første 20 kB ved ændring. Indeholder ⚙ indstillinger til Pushover USER/TOKEN.
+// @version      6.40
+// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun første 20 kB ved ændring. Indeholder ⚙ indstillinger til Pushover USER/TOKEN. Gear-ikonet rendres nu som overlay (fixed) for at undgå clipping.
 // @match        https://ajourcare.temponizer.dk/*
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
@@ -173,7 +173,8 @@ function handleInterestCount(c) {
   stInt.count = c; saveInt();
 }
 
-/*──────────────────── 6. UI (on/off + tandhjul – flex header) ────────────────────*/
+/*──────────────────── 6. UI (panel + gear-overlay) ────────────────────*/
+let _tpPanel, _tpGear;
 function injectUI() {
   const d = document.createElement('div');
   d.id = 'tpPanel';
@@ -184,41 +185,15 @@ function injectUI() {
     fontSize: '12px', fontFamily: 'sans-serif',
     boxShadow: '1px 1px 5px rgba(0,0,0,.2)',
     boxSizing: 'border-box',
-    minWidth: '220px',
-    overflow: 'visible'
+    minWidth: '220px'
   });
-  // in case global CSS tries to force it
-  d.style.setProperty('overflow', 'visible', 'important');
 
+  // Header
   const header = document.createElement('div');
-  Object.assign(header.style, {
-    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-    gap: '8px', marginBottom: '4px'
-  });
-
+  Object.assign(header.style, { marginBottom: '4px' });
   const title = document.createElement('b');
   title.textContent = 'TP Notifikationer';
   header.appendChild(title);
-
-  const gear = document.createElement('button');
-  gear.id = 'tpSettings';
-  gear.title = 'Indstillinger';
-  gear.setAttribute('aria-label', 'Indstillinger');
-  Object.assign(gear.style, {
-    width: '20px', height: '20px',
-    padding: 0, margin: 0, lineHeight: 0,
-    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-    border: 'none', background: 'transparent', cursor: 'pointer',
-    opacity: 0.75
-  });
-  // prevent page CSS (e.g. button{overflow:hidden}) from clipping
-  gear.style.setProperty('overflow', 'visible', 'important');
-  gear.onmouseenter = function () { gear.style.opacity = 1; };
-  gear.onmouseleave = function () { gear.style.opacity = 0.75; };
-  gear.innerHTML = '\n    <svg viewBox="0 0 24 24" width="18" height="18" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="display:block">\n      <path d="M12 8.75a3.25 3.25 0 1 1 0 6.5a3.25 3.25 0 0 1 0-6.5Zm8.63 3.5c.03.25.05.5.05.75s-.02.5-.05.75l2 1.56a.5.5 0 0 1 .12.64l-1.9 3.29a.5.5 0 0 1-.6.22l-2.36-.95a7.6 7.6 0 0 1-1.3.76l-.36 2.52a.5.5 0 0 1-.49.42h-3.8a.5.5 0 0 1-.49-.42l-.36-2.52a7.6 7.6 0 0 1-1.3-.76l-2.36.95a.5.5 0 0 1-.6.22l1.9 3.29a.5.5 0 0 1-.12.64l-2 1.56Z" fill="currentColor"/>\n    </svg>\n  ';
-  gear.onclick = openTpSettings;
-
-  header.appendChild(gear);
   d.appendChild(header);
 
   // Body content
@@ -228,17 +203,53 @@ function injectUI() {
   const line2 = document.createElement('label');
   line2.style.display = 'block'; line2.style.marginTop = '2px';
   line2.innerHTML = '<input type="checkbox" id="tp_int"> Interesse (Pushover)';
-
   d.appendChild(line1);
   d.appendChild(line2);
 
   document.body.appendChild(d);
+  _tpPanel = d;
 
-  var m = document.getElementById('tp_msg'); var i = document.getElementById('tp_int');
-  m.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
-  i.checked = localStorage.getItem('tpPushEnableInt') === 'true';
-  m.onchange = function () { localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false'); };
-  i.onchange = function () { localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false'); };
+  // Gear as FIXED overlay anchored to the panel's top-right (avoid any clipping/overflow)
+  const gear = document.createElement('button');
+  gear.id = 'tpSettings';
+  gear.title = 'Indstillinger';
+  gear.setAttribute('aria-label', 'Indstillinger');
+  Object.assign(gear.style, {
+    position: 'fixed', zIndex: 2147483647,
+    width: '20px', height: '20px',
+    padding: 0, margin: 0,
+    lineHeight: 0,
+    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    border: 'none', background: 'transparent', cursor: 'pointer',
+    opacity: 0.8, pointerEvents: 'auto'
+  });
+  gear.onmouseenter = function () { gear.style.opacity = 1; };
+  gear.onmouseleave = function () { gear.style.opacity = 0.8; };
+  gear.innerHTML = '\n    <svg viewBox="0 0 24 24" width="18" height="18" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="display:block">\n      <path d="M12 8.75a3.25 3.25 0 1 1 0 6.5a3.25 3.25 0 0 1 0-6.5Zm8.63 3.5c.03.25.05.5.05.75s-.02.5-.05.75l2 1.56a.5.5 0 0 1 .12.64l-1.9 3.29a.5.5 0 0 1-.6.22l-2.36-.95a7.6 7.6 0 0 1-1.3.76l-.36 2.52a.5.5 0 0 1-.49.42h-3.8a.5.5 0 0 1-.49-.42l-.36-2.52a7.6 7.6 0 0 1-1.3-.76l-2.36.95a.5.5 0 0 1-.6.22l1.9 3.29a.5.5 0 0 1-.12.64l-2 1.56Z" fill="currentColor"/>\n    </svg>\n  ';
+  gear.onclick = openTpSettings;
+  document.body.appendChild(gear);
+  _tpGear = gear;
+  placeGear();
+  window.addEventListener('resize', placeGear);
+}
+
+function placeGear() {
+  if (!_tpPanel || !_tpGear) return;
+  const r = _tpPanel.getBoundingClientRect();
+  const size = 20, pad = 6;
+  // try top-right first
+  let left = r.right - size - pad;
+  let top  = r.top + pad;
+  // if outside viewport (e.g., clipped by window), fallback to top-left
+  if (left < 0) left = r.left + pad;
+  if (top  < 0) top  = pad;
+  // also ensure doesn't exceed viewport
+  const maxL = window.innerWidth - size - 1;
+  const maxT = window.innerHeight - size - 1;
+  if (left > maxL) left = Math.max(pad, r.left + pad);
+  if (top  > maxT) top  = Math.max(pad, r.top + pad);
+  _tpGear.style.left = left + 'px';
+  _tpGear.style.top  = top  + 'px';
 }
 
 function openTpSettings() {
@@ -344,4 +355,4 @@ injectUI();
 })();
 
 // Hjælp i konsol
-console.info('[TP] kører version', '6.39');
+console.info('[TP] kører version', '6.40');
