@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    https://ajourcare.dk/
-// @version      6.36
+// @version      6.37
 // @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun første 20 kB ved ændring. Indeholder ⚙ indstillinger til Pushover USER/TOKEN.
 // @match        https://ajourcare.temponizer.dk/*
-// @updateURL    https://github.com/danieldamdk/temponizer-notifikation/raw/refs/heads/main/temponizer.user.js
-// @downloadURL  https://github.com/danieldamdk/temponizer-notifikation/raw/refs/heads/main/temponizer.user.js
+// @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
+// @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=temponizer.dk
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -193,7 +193,7 @@ function injectUI() {
   });
   gear.onmouseenter = function () { gear.style.opacity = 1; };
   gear.onmouseleave = function () { gear.style.opacity = 0.6; };
-  gear.innerHTML = '\n    <svg viewBox="0 0 24 24" width="18" height="18" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">\n      <path d="M12 8.75a3.25 3.25 0 1 1 0 6.5a3.25 3.25 0 0 1 0-6.5Zm8.63 3.5c.03.25.05.5.05.75s-.02.5-.05.75l2 1.56a.5.5 0 0 1 .12.64l-1.9 3.29a.5.5 0 0 1-.6.22l-2.36-.95a7.6 7.6 0 0 1-1.3.76l-.36 2.52a.5.5 0 0 1-.49.42h-3.8a.5.5 0 0 1-.49-.42l-.36-2.52a7.6 7.6 0 0 1-1.3-.76l-2.36.95a.5.5 0 0 1-.6.22l-1.9 3.29a.5.5 0 0 1-.12.64l-2 1.56Z" fill="currentColor"/>\n    </svg>\n  ';
+  gear.innerHTML = '\n    <svg viewBox="0 0 24 24" width="18" height="18" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">\n      <path d="M12 8.75a3.25 3.25 0 1 1 0 6.5a3.25 3.25 0 0 1 0-6.5Zm8.63 3.5c.03.25.05.5.05.75s-.02.5-.05.75l2 1.56a.5.5 0 0 1 .12.64l-1.9 3.29a.5.5 0 0 1-.6.22l-2.36-.95a7.6 7.6 0 0 1-1.3.76l-.36 2.52a.5.5 0 0 1-.49.42h-3.8a.5.5 0 0 1-.49-.42l-.36-2.52a7.6 7.6 0 0 1-1.3-.76l-2.36.95a.5.5 0 0 1-.6.22l1.9 3.29a.5.5 0 0 1-.12.64l-2 1.56Z" fill="currentColor"/>\n    </svg>\n  ';
 
   d.appendChild(gear);
   document.body.appendChild(d);
@@ -308,3 +308,6 @@ injectUI();
     });
   }).observe(document.body, { childList: true, subtree: true });
 })();
+
+// Hjælp i konsol
+console.info('[TP] kører version', '6.37');
