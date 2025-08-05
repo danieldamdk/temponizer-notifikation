@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    https://ajourcare.dk/
-// @version      6.46
-// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. HEAD+ETag + 20 kB range. ⚙ Indstillinger til Pushover. **Admin‑låst API Token**: kollegaer indtaster kun deres User Key.
+// @version      6.47
+// @description  Push ved nye beskeder og interesse, hover-menu “Intet svar” AUTOGEM. Interesse-poll bruger HEAD+ETag og henter kun første 20 kB ved ændring. ⚙ Pushover-opsætning (API låst).
 // @match        https://ajourcare.temponizer.dk/*
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
@@ -10,10 +10,10 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @grant        GM_openInTab
 // @grant        unsafeWindow
 // @connect      api.pushover.net
 // @run-at       document-idle
+// @noframes
 // ==/UserScript==
 
 /*──────────────────── 1. KONFIG ────────────────────*/
@@ -21,8 +21,7 @@ const POLL_MS     = 30000;  // interval mellem polls
 const SUPPRESS_MS = 45000;  // min. tid mellem push/toast pr. kategori
 const LOCK_MS     = SUPPRESS_MS + 5000; // lås til at undgå dobbelte notifikationer mellem tabs
 
-// **ORG‑TOKENS (admin‑låst)**
-// UDFYLD DENNE KONSTANT med jeres Pushover API Token (app key). Brug samme token for alle.
+// **ORG-TOKEN (admin-låst)**
 const ORG_PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
 
 /*──────────────────── Utils ────────────────────*/
@@ -73,26 +72,18 @@ function showDOMToast(msg) {
   setTimeout(function () { el.style.opacity = 0; setTimeout(function () { el.remove(); }, 500); }, 4000);
 }
 
-/*──────────────────── 3. Pushover (admin‑låst token) ────────────────────*/
+/*──────────────────── 3. Pushover (admin-låst token) ────────────────────*/
 function sendPushover(msg, channel) {
-  // Dobbelttjek toggle her også
+  // dobbelttjek toggle
   if (!isPushEnabled(channel)) {
     console.info('[TP] Push blokeret (toggle OFF for', channel + ')');
     return;
   }
 
-  const user  = GM_getValue('pushover_user', '').trim();
+  const user  = (GM_getValue('pushover_user', '') || '').trim();
   const token = ORG_PUSHOVER_TOKEN.trim();
-
-  if (!token) {
-    showToastOnce('po_missing_token', 'ADMIN: ORG_PUSHOVER_TOKEN mangler i scriptet');
-    return;
-  }
-  if (!user) {
-    showToastOnce('po_missing_user', 'Pushover USER mangler – klik ⚙︎ og indsæt din USER key');
-    openTpSettings();
-    return;
-  }
+  if (!token) { showToastOnce('po_missing_token', 'ADMIN: ORG_PUSHOVER_TOKEN mangler i scriptet'); return; }
+  if (!user)  { showToastOnce('po_missing_user', 'Pushover USER mangler – klik ⚙︎ og indsæt din USER key'); openTpSettings(); return; }
 
   const body = 'token=' + encodeURIComponent(token) +
                '&user=' + encodeURIComponent(user) +
@@ -111,7 +102,7 @@ function sendPushover(msg, channel) {
   });
 }
 
-/*──────────────────── 4. Beskeder ────────────────────*/
+/*──────────────────── 4. BESKEDER ────────────────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
 const stMsg = JSON.parse(localStorage.getItem('tpPushState') || '{"count":0,"lastPush":0,"lastSent":0}');
@@ -144,7 +135,7 @@ function pollMessages() {
     .catch(console.error);
 }
 
-/*──────────────────── 5. Interesse (HEAD + ETag + Range) ────────────────────*/
+/*──────────────────── 5. INTERESSE (HEAD + ETag + Range) ────────────────────*/
 const HTML_URL = location.origin + '/index.php?page=freevagter';
 let   lastETag = null;
 
@@ -164,15 +155,18 @@ function pollInterest() {
     })
     .catch(console.error);
 }
-
 function parseInterestHTML(html) {
   const doc   = new DOMParser().parseFromString(html, 'text/html');
-  const boxes = Array.prototype.slice.call(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
-  const c = boxes.reduce((s, el) => { const v = parseInt(el.textContent.trim(), 10); return s + (isNaN(v) ? 0 : v); }, 0);
+  const boxes = Array.prototype.slice.call(
+    doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]')
+  );
+  const c = boxes.reduce((s, el) => {
+    const v = parseInt(el.textContent.trim(), 10);
+    return s + (isNaN(v) ? 0 : v);
+  }, 0);
   handleInterestCount(c);
   console.info('[TP-interesse]', c, new Date().toLocaleTimeString());
 }
-
 function handleInterestCount(c) {
   const en = isPushEnabled('int');
   if (c > stInt.count && c !== stInt.lastSent) {
@@ -187,14 +181,14 @@ function handleInterestCount(c) {
 }
 
 /*──────────────────── 6. UI (panel + ⚙︎ i header – robust) ────────────────────*/
-let _tpPanel;
 function injectUI() {
   const d = document.createElement('div');
   d.id = 'tpPanel';
   Object.assign(d.style, {
     position: 'fixed', bottom: '8px', right: '8px', zIndex: 2147483646,
     background: '#f9f9f9', border: '1px solid #ccc', padding: '10px 12px', borderRadius: '6px',
-    fontSize: '12px', fontFamily: 'sans-serif', boxShadow: '1px 1px 5px rgba(0,0,0,.2)', boxSizing: 'border-box', minWidth: '220px'
+    fontSize: '12px', fontFamily: 'sans-serif', boxShadow: '1px 1px 5px rgba(0,0,0,.2)',
+    boxSizing: 'border-box', minWidth: '220px'
   });
 
   const header = document.createElement('div');
@@ -202,7 +196,7 @@ function injectUI() {
 
   const title = document.createElement('b'); title.textContent = 'TP Notifikationer';
 
-  // **Robust gear som tekst‑knap (⚙︎) inde i headeren**
+  // ⚙︎ – neutraliser side-CSS via all: unset
   const gear = document.createElement('button');
   gear.id = 'tpSettings'; gear.title = 'Indstillinger'; gear.setAttribute('aria-label', 'Indstillinger');
   gear.style.all = 'unset';
@@ -224,7 +218,7 @@ function injectUI() {
   const line2 = document.createElement('label'); line2.style.display = 'block'; line2.style.marginTop = '2px'; line2.innerHTML = '<input type="checkbox" id="tp_int"> Interesse (Pushover)';
   d.appendChild(line1); d.appendChild(line2);
 
-  document.body.appendChild(d); _tpPanel = d;
+  document.body.appendChild(d);
 
   var m = document.getElementById('tp_msg'); var i = document.getElementById('tp_int');
   m.checked = isPushEnabled('msg'); i.checked = isPushEnabled('int');
@@ -233,7 +227,6 @@ function injectUI() {
 
   debugState('ui init');
 }
-
 function openTpSettings() {
   if (document.getElementById('tpSettingsModal')) return;
   const overlay = document.createElement('div'); overlay.id = 'tpSettingsModal';
@@ -246,14 +239,13 @@ function openTpSettings() {
 
   box.innerHTML =
     '<div style="font-weight:600;margin-bottom:8px;">Pushover – opsætning</div>'+
-    '<label style="display:block;margin:6px 0 2px;">USER key</label>'+
+    '<label style="display:block;margin:6px 0 2px;">Din USER key</label>'+
     '<input id="tpUserKey" type="text" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;" value="' + (userVal||'') + '">' +
     '<div style="margin-top:8px;padding:8px;border:1px solid #e5e5e5;border-radius:6px;background:#fafafa;">' +
       '<b>API Token:</b> Låst af administrator i scriptet.' +
     '</div>' +
     '<div style="margin-top:10px;line-height:1.4;">' +
-      'Hjælp: ' +
-      '<a href="https://pushover.net/" target="_blank" rel="noopener">Find din USER key (Dashboard)</a>' +
+      'Hjælp: <a href="https://pushover.net/" target="_blank" rel="noopener">Find din USER key (Dashboard)</a>' +
     '</div>' +
     '<div style="margin-top:14px;text-align:right;">' +
       '<button id="tpCancel" style="margin-right:6px;padding:6px 10px;">Luk</button>' +
@@ -277,33 +269,131 @@ document.addEventListener('click', function (e) {
   const a = e.target.closest && e.target.closest('a');
   if (a && /Beskeder/.test(a.textContent || '')) { stMsg.lastPush = stMsg.lastSent = 0; saveMsg(); }
 });
-
 pollMessages(); pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
-
 injectUI();
 
-/*──────────────────── 8. Hover “Intet Svar” (én knap) ────────────────────*/
+/*──────────────────── 8. HOVER “Intet svar” (auto-udfyld + auto-gem) ────────────────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
+
   function mkMenu() {
     if (menu) return menu;
     menu = document.createElement('div');
-    Object.assign(menu.style, { position: 'fixed', zIndex: 2147483647, background: '#fff', border: '1px solid #ccc', borderRadius: '4px', boxShadow: '0 2px 8px rgba(0,0,0,.25)', fontSize: '12px', fontFamily: 'sans-serif' });
+    Object.assign(menu.style, {
+      position: 'fixed', zIndex: 2147483647, background: '#fff',
+      border: '1px solid #ccc', borderRadius: '4px',
+      boxShadow: '0 2px 8px rgba(0,0,0,.25)', fontSize: '12px',
+      fontFamily: 'sans-serif'
+    });
     var btn = document.createElement('div');
-    btn.textContent = 'Registrér “Intet Svar”';
+    btn.textContent = 'Registrér “Intet svar”';
     btn.style.cssText = 'padding:6px 12px;white-space:nowrap;cursor:default';
     btn.onmouseenter = function () { btn.style.background = '#f0f0f0'; };
     btn.onmouseleave = function () { btn.style.background = ''; };
     btn.onclick = function () { auto = true; if (icon) icon.click(); hide(); };
-    menu.appendChild(btn); document.body.appendChild(menu); return menu;
+    menu.appendChild(btn);
+    document.body.appendChild(menu);
+    return menu;
   }
-  function show(el) { icon = el; var r = el.getBoundingClientRect(); var m = mkMenu(); m.style.left = r.left + 'px'; m.style.top = r.bottom + 4 + 'px'; m.style.display = 'block'; }
+
+  function show(el) {
+    icon = el;
+    var r = el.getBoundingClientRect();
+    var m = mkMenu();
+    m.style.left = r.left + 'px';
+    m.style.top = (r.bottom + 4) + 'px';
+    m.style.display = 'block';
+  }
   function hide() { clearTimeout(hideT); hideT = setTimeout(function () { if (menu) menu.style.display = 'none'; icon = null; }, 120); }
   function findIcon(n) { while (n && n !== document) { if (n.getAttribute && n.getAttribute('title') === 'Registrer opkald til vikar') return n; n = n.parentNode; } return null; }
 
-  document.addEventListener('mouseover', function (e) { var ic = findIcon(e.target); if (ic) show(ic); }, true);
+  function triggerInput(el) {
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function findGemKnap(root) {
+    // Præcis knap
+    var btn = root.querySelector('input[type="button"][value="Gem registrering"]');
+    if (btn) return btn;
+    // Fallback: andre varianter med RegistrerOpkald i onclick
+    var cand = Array.prototype.slice.call(
+      root.querySelectorAll('input[type="button"][onclick]')
+    ).find(function (b) {
+      var oc = b.getAttribute('onclick') || '';
+      return /RegistrerOpkald\s*\(/.test(oc);
+    });
+    return cand || null;
+  }
+
+  function callRegistrerOpkaldFrom(onclickStr) {
+    try {
+      if (!onclickStr) return false;
+      var m = onclickStr.match(/RegistrerOpkald\s*\(\s*(['"]?)([^,'")]+)\1\s*,\s*(['"]?)([^,'")]+)\3\s*\)/);
+      if (m && typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.RegistrerOpkald === 'function') {
+        unsafeWindow.RegistrerOpkald(m[2], m[4]);
+        console.info('[TP][Intet svar] Kaldte RegistrerOpkald(', m[2], ',', m[4], ') direkte');
+        return true;
+      }
+    } catch (e) {
+      console.warn('[TP][Intet svar] Direkte kald fejlede', e);
+    }
+    return false;
+  }
+
+  function submitIntetSvar(textarea) {
+    try {
+      // 1) Udfyld tekst
+      var wanted = 'Intet svar';
+      if (textarea.value.trim() !== wanted) {
+        textarea.value = wanted;
+        triggerInput(textarea);
+      }
+
+      // 2) Find knap i nærmeste form/dialog – ellers hele dokumentet
+      var form = (textarea.closest && textarea.closest('form')) || document;
+      var root = (textarea.closest && (textarea.closest('[role="dialog"], .modal, .ui-dialog, .bootbox, .sweet-alert') || form)) || form;
+      var btn = findGemKnap(root) || findGemKnap(document);
+
+      if (btn) {
+        setTimeout(function () {
+          btn.click();
+          console.info('[TP][Intet svar] Klikkede "Gem registrering"');
+          auto = false;
+        }, 80);
+        return;
+      }
+
+      // 3) Fallback: parse onclick og kald direkte
+      var any = document.querySelector('input[type="button"][onclick*="RegistrerOpkald"]');
+      if (any && callRegistrerOpkaldFrom(any.getAttribute('onclick'))) {
+        auto = false;
+        return;
+      }
+
+      // 4) Sidste udvej: submit form eller send Enter
+      if (form && form !== document) {
+        if (form.requestSubmit) form.requestSubmit(); else form.submit();
+        console.info('[TP][Intet svar] Submit af nærmeste form (fallback)');
+      } else {
+        textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        textarea.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Enter', bubbles: true }));
+        console.info('[TP][Intet svar] Faldt tilbage til Enter-event');
+      }
+      auto = false;
+    } catch (e) {
+      console.error('[TP][Intet svar] Auto-gem fejlede', e);
+      auto = false;
+    }
+  }
+
+  document.addEventListener('mouseover', function (e) {
+    var ic = findIcon(e.target);
+    if (ic) show(ic);
+  }, true);
+
   document.addEventListener('mousemove', function (e) {
     if (!menu || menu.style.display !== 'block') return;
     var overM = menu.contains(e.target);
@@ -311,17 +401,19 @@ injectUI();
     if (!overM && !overI) hide();
   }, true);
 
+  // Når dialogen/textarea dukker op, udfyld & gem automatisk
   new MutationObserver(function (ml) {
     if (!auto) return;
     ml.forEach(function (m) {
       m.addedNodes.forEach(function (n) {
         if (!(n instanceof HTMLElement)) return;
-        var ta = (n.matches && n.matches('textarea[name=\"phonetext\"]')) ? n : (n.querySelector && n.querySelector('textarea[name=\"phonetext\"]'));
-        if (ta) { if (!ta.value.trim()) ta.value = 'Intet Svar'; ta.focus(); auto = false; }
+        var ta = (n.matches && n.matches('textarea[name="phonetext"]')) ? n :
+                 (n.querySelector && n.querySelector('textarea[name="phonetext"]'));
+        if (ta) submitIntetSvar(ta);
       });
     });
   }).observe(document.body, { childList: true, subtree: true });
 })();
 
 // Hjælp i konsol
-console.info('[TP] kører version', '6.46');
+console.info('[TP] kører version', '6.47');
