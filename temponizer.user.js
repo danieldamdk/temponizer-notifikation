@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      6.56
-// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun 20 kB HTML ved ændring. APP-token er fastlåst af administrator. USER-token sættes i ⚙️-menuen (GM storage). Inkl. testknap i ⚙️-menuen.
+// @version      6.57
+// @description  Push ved nye beskeder og interesse med cross-tab "single leader", hover-menu “Intet Svar”, ETag-optimering. APP-token fastlåst. USER-token i GM storage. Testknap i ⚙️.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -14,13 +14,19 @@
 // @downloadURL  https://github.com/danieldamdk/temponizer-notifikation/raw/refs/heads/main/temponizer.user.js
 // ==/UserScript==
 
-/*──────────────────── 1) KONFIG (APP-token fastlåst) ────────────────────*/
+/*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7'; // ADMIN-FASTLÅST
 const POLL_MS     = 30000;
 const SUPPRESS_MS = 45000;
 const LOCK_MS     = SUPPRESS_MS + 5000;
 
-/*──────────────────── 1a) MIGRATION til GM storage ────────────────────*/
+// Cross-tab leader (én fane styrer push)
+const LEADER_KEY = 'tpLeaderV1';
+const HEARTBEAT_MS = 5000;         // hvor tit leder forlænger sit “lease”
+const LEASE_MS     = 15000;        // gyldighed for lederskab
+const TAB_ID = (crypto && crypto.randomUUID ? crypto.randomUUID() : ('tab-' + Math.random().toString(36).slice(2) + Date.now()));
+
+/*──────── 1a) MIGRATION til GM storage ────────*/
 (function migrateUserKeyToGM(){
   try {
     const gm = (GM_getValue('tpUserKey') || '').trim();
@@ -29,13 +35,13 @@ const LOCK_MS     = SUPPRESS_MS + 5000;
       if (ls) {
         GM_setValue('tpUserKey', ls);
         localStorage.removeItem('tpUserKey');
-        console.info('[TP][MIGRATE] Flyttede USER-token fra localStorage → GM storage');
+        console.info('[TP][MIGRATE] USER-token localStorage → GM storage');
       }
     }
   } catch(_) {}
 })();
 
-/*──────────────────── 2) TOAST ────────────────────*/
+/*──────── 2) TOAST ────────*/
 function showToastOnce(key, msg) {
   const lk = 'tpToastLock_' + key;
   const o  = JSON.parse(localStorage.getItem(lk) || '{"t":0}');
@@ -68,7 +74,7 @@ function showDOMToast(msg) {
   setTimeout(function () { el.style.opacity = 0; setTimeout(function () { el.remove(); }, 500); }, 4000);
 }
 
-/*──────────────────── 3) PUSHOVER ────────────────────*/
+/*──────── 3) PUSHOVER ────────*/
 function getUserKey() {
   try { return (GM_getValue('tpUserKey') || '').trim(); }
   catch (_) { return ''; }
@@ -102,50 +108,66 @@ function sendPushover(msg) {
   });
 }
 
-/*──────────────────── 4) BESKEDER ────────────────────*/
+/*──────── 4) FÆLLES STATE + LOCK ────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
-const stMsg = JSON.parse(localStorage.getItem('tpPushState') || '{"count":0,"lastPush":0,"lastSent":0}');
-function saveMsg() { localStorage.setItem('tpPushState', JSON.stringify(stMsg)); }
+const ST_MSG_KEY = 'tpPushState';        // {count,lastPush,lastSent}
+const ST_INT_KEY = 'tpInterestState';    // {count,lastPush,lastSent}
+
+function loadJson(key, fallback) {
+  try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); }
+  catch (_) { return JSON.parse(JSON.stringify(fallback)); }
+}
+function saveJsonIfLeader(key, obj) {
+  if (!isLeader()) return;   // kritisk: kun leder må skrive
+  localStorage.setItem(key, JSON.stringify(obj));
+}
 function takeLock() {
   const l = JSON.parse(localStorage.getItem('tpPushLock') || '{"t":0}');
   if (Date.now() - l.t < LOCK_MS) return false;
   localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() })); return true;
 }
+
+/*──────── 5) POLLERS (kun leder agerer) ────────*/
 function pollMessages() {
+  if (!isLeader()) return;
   fetch(MSG_URL + '&ts=' + Date.now(), { credentials: 'same-origin' })
     .then(r => r.json())
     .then(d => {
-      const n = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
+      // Læs altid frisk state for at undgå “stale overwrite”
+      const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
+      const n  = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
       const en = localStorage.getItem('tpPushEnableMsg') === 'true';
-      console.debug('[TP][DBG][MSG]', { n, stMsg, en });
+      // console.debug('[TP][DBG][MSG]', { n, stMsg, en, leader:isLeader(), tab:TAB_ID });
+
       if (n > stMsg.count && n !== stMsg.lastSent) {
         const canPush = (Date.now() - stMsg.lastPush > SUPPRESS_MS) && takeLock();
         if (canPush) {
           const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
-          if (en) { console.info('[TP][SEND][MSG] push'); sendPushover(m); }
+          if (en) { console.info('[TP][SEND][MSG] push (leader)'); sendPushover(m); }
           else    { console.info('[TP][SKIP][MSG] en=false (kun toast)'); }
           showToastOnce('msg', m);
           stMsg.lastPush = Date.now(); stMsg.lastSent = n;
         } else {
-          console.info('[TP][SKIP][MSG]', 'suppression/lock', { dt: Date.now() - stMsg.lastPush });
+          // ingen push pga. lock/suppression – men registrér at vi har set n
           stMsg.lastSent = n;
         }
       } else if (n < stMsg.count) {
-        stMsg.lastPush = 0;
+        stMsg.lastPush = 0; // reset hvis tæller falder
       }
-      stMsg.count = n; saveMsg();
+
+      stMsg.count = n;
+      saveJsonIfLeader(ST_MSG_KEY, stMsg);
       console.info('[TP-besked]', n, new Date().toLocaleTimeString());
     })
     .catch(e => console.warn('[TP][ERR][MSG]', e));
 }
 
-/*──────────────────── 5) INTERESSE (HEAD + ETag) ────────────────────*/
 const HTML_URL = location.origin + '/index.php?page=freevagter';
 let lastETag = localStorage.getItem('tpLastETag') || null;
-const stInt = JSON.parse(localStorage.getItem('tpInterestState') || '{"count":0,"lastPush":0,"lastSent":0}');
-function saveInt() { localStorage.setItem('tpInterestState', JSON.stringify(stInt)); }
+
 function pollInterest() {
+  if (!isLeader()) return;
   fetch(HTML_URL, {
     method: 'HEAD',
     credentials: 'same-origin',
@@ -160,36 +182,71 @@ function pollInterest() {
     })
     .catch(e => console.warn('[TP][ERR][INT][HEAD]', e));
 }
+
 function parseInterestHTML(html) {
+  if (!isLeader()) return;
   const doc   = new DOMParser().parseFromString(html, 'text/html');
   const boxes = Array.prototype.slice.call(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
   const c = boxes.reduce((s, el) => { const v = parseInt(el.textContent.trim(), 10); return s + (isNaN(v) ? 0 : v); }, 0);
-  handleInterestCount(c);
-  console.info('[TP-interesse]', c, new Date().toLocaleTimeString());
-}
-function handleInterestCount(c) {
+
+  const stInt = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0});
   const en = localStorage.getItem('tpPushEnableInt') === 'true';
-  console.debug('[TP][DBG][INT]', { c, stInt, en });
+  // console.debug('[TP][DBG][INT]', { c, stInt, en, leader:isLeader(), tab:TAB_ID });
+
   if (c > stInt.count && c !== stInt.lastSent) {
     if (Date.now() - stInt.lastPush > SUPPRESS_MS && takeLock()) {
       const m = '👀 ' + c + ' vikar(er) har vist interesse for ledige vagter';
-      if (en) { console.info('[TP][SEND][INT] push'); sendPushover(m); }
+      if (en) { console.info('[TP][SEND][INT] push (leader)'); sendPushover(m); }
       else    { console.info('[TP][SKIP][INT] en=false (kun toast)'); }
       showToastOnce('int', m);
       stInt.lastPush = Date.now(); stInt.lastSent = c;
     } else {
-      console.info('[TP][SKIP][INT]', 'suppression/lock', { dt: Date.now() - stInt.lastPush });
       stInt.lastSent = c;
     }
   } else if (c < stInt.count) {
     stInt.lastPush = 0;
   }
-  stInt.count = c; saveInt();
+
+  stInt.count = c; saveJsonIfLeader(ST_INT_KEY, stInt);
+  console.info('[TP-interesse]', c, new Date().toLocaleTimeString());
 }
 
-/*──────────────────── 6) UI (panel m. toggles + gear; gear-menu har token+test) ────────────────────*/
+/*──────── 6) LEADER-ELECTION ────────*/
+function now() { return Date.now(); }
+function getLeader() {
+  try { return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null'); }
+  catch (_) { return null; }
+}
+function setLeader(obj) { localStorage.setItem(LEADER_KEY, JSON.stringify(obj)); }
+
+function isLeader() {
+  const L = getLeader();
+  return !!(L && L.id === TAB_ID && L.until > now());
+}
+function tryBecomeLeader() {
+  const L = getLeader();
+  const t = now();
+  if (!L || (L.until || 0) <= t) {
+    // “lease” er udløbet – tag lederrollen
+    setLeader({ id: TAB_ID, until: t + LEASE_MS, ts: t });
+    if (isLeader()) console.info('[TP][LEADER] Denne fane er nu leder:', TAB_ID);
+  }
+}
+function heartbeatIfLeader() {
+  if (!isLeader()) return;
+  const t = now();
+  setLeader({ id: TAB_ID, until: t + LEASE_MS, ts: t });
+}
+window.addEventListener('storage', function (e) {
+  if (e.key === LEADER_KEY) {
+    const L = getLeader();
+    // Log evt. skift (valgfrit)
+    // console.info('[TP][LEADER][UPDATE]', L);
+  }
+});
+
+/*──────── 7) UI (panel m. toggles + gear; gear-menu har token+test) ────────*/
 function injectUI() {
-  // Panel: kun toggles
   const d = document.createElement('div');
   d.id = 'tpPanel';
   d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:2147483645;background:#f9f9f9;border:1px solid #ccc;padding:8px 10px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2);min-width:220px';
@@ -222,7 +279,7 @@ function injectUI() {
   document.body.appendChild(gear);
   ensureFullyVisible(gear);
 
-  // Gear-menu (byg ved behov)
+  // Gear-menu
   let menu = null;
   function buildMenu() {
     if (menu) return menu;
@@ -244,13 +301,19 @@ function injectUI() {
         '</div>' +
       '</div>' +
       '<div style="border-top:1px solid #eee;margin:6px 0"></div>' +
-      '<button id="tpTestPushoverBtn" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🧪 Test Pushover (Besked + Interesse)</button>';
+      '<button id="tpTestPushoverBtn" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🧪 Test Pushover (Besked + Interesse)</button>' +
+      '<div id="tpLeaderHint" style="margin-top:8px;font-size:11px;color:#666"></div>';
     document.body.appendChild(menu);
 
-    // Prefill + events
     const inp  = menu.querySelector('#tpUserKeyMenu');
     const save = menu.querySelector('#tpSaveUserKeyMenu');
     const test = menu.querySelector('#tpTestPushoverBtn');
+    const hint = menu.querySelector('#tpLeaderHint');
+
+    function refreshLeaderHint(){
+      hint.textContent = (isLeader() ? 'Denne fane er LEADER for push.' : 'Denne fane er ikke leader. En anden fane sender push.');
+    }
+    refreshLeaderHint();
 
     inp.value = getUserKey();
     function saveUserKey() {
@@ -265,6 +328,11 @@ function injectUI() {
       menu.style.display = 'none';
     });
 
+    // opdater hint ved leader-skift
+    window.addEventListener('storage', function (e) {
+      if (e.key === LEADER_KEY) refreshLeaderHint();
+    });
+
     return menu;
   }
 
@@ -274,20 +342,19 @@ function injectUI() {
     mnu.style.right = (window.innerWidth - r.right) + 'px';
     mnu.style.bottom = (window.innerHeight - r.top + 6) + 'px';
     mnu.style.display = (mnu.style.display === 'block' ? 'none' : 'block');
-    // hver åbning: sync feltet med GM
     const inp = mnu.querySelector('#tpUserKeyMenu');
     if (inp) inp.value = getUserKey();
+    const hint = mnu.querySelector('#tpLeaderHint');
+    if (hint) hint.textContent = (isLeader() ? 'Denne fane er LEADER for push.' : 'Denne fane er ikke leader. En anden fane sender push.');
   }
   gear.addEventListener('click', toggleMenu);
 
-  // Klik udenfor → luk menu
   document.addEventListener('mousedown', function (e) {
     if (menu && e.target !== menu && !menu.contains(e.target) && e.target !== gear) menu.style.display = 'none';
   });
 
-  console.debug('[TP][DBG] ui init', { panel: !!d, gear: !!gear });
+  console.debug('[TP][DBG] ui init', { panel: true, gear: true });
 }
-
 function ensureFullyVisible(el){
   const r = el.getBoundingClientRect();
   let dx = 0, dy = 0;
@@ -298,13 +365,10 @@ function ensureFullyVisible(el){
   if (dx || dy) el.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
 }
 
-/* Test-knap (bruger USER-token fra GM storage) */
+/* Test-knap (sender uanset leader – manuel test må godt gå igennem) */
 function tpTestPushoverBoth(){
   const userKey = getUserKey();
-  if (!userKey) {
-    showToast('Indsæt din USER-token i ⚙️-menuen før test.');
-    return;
-  }
+  if (!userKey) { showToast('Indsæt din USER-token i ⚙️-menuen før test.'); return; }
   const ts = new Date().toLocaleTimeString();
   const m1 = '🧪 [TEST] Besked-kanal OK — ' + ts;
   const m2 = '🧪 [TEST] Interesse-kanal OK — ' + ts;
@@ -317,18 +381,34 @@ function tpTestPushoverBoth(){
   showToast('Sendte Pushover-test (Besked + Interesse). Tjek Pushover.');
 }
 
-/*──────────────────── 7) START ────────────────────*/
+/*──────── 8) STARTUP ────────*/
 document.addEventListener('click', function (e) {
   const a = e.target.closest('a');
-  if (a && /Beskeder/.test(a.textContent)) { stMsg.lastPush = stMsg.lastSent = 0; saveMsg(); }
+  if (a && /Beskeder/.test(a.textContent)) {
+    // Kun læs/skriv state hvis leader
+    if (isLeader()) {
+      const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
+      stMsg.lastPush = stMsg.lastSent = 0;
+      saveJsonIfLeader(ST_MSG_KEY, stMsg);
+    }
+  }
 });
+
+// Leader init + loops
+tryBecomeLeader();
+setInterval(heartbeatIfLeader, HEARTBEAT_MS);
+setInterval(tryBecomeLeader, HEARTBEAT_MS + 1200);
+
+// Pollers kører i alle faner, men no-op hvis ikke leader
 pollMessages(); pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
-injectUI();
-console.info('[TP] kører version 6.56');
 
-/*──────────────────── 8) HOVER “Intet Svar” (auto-gem) ────────────────────*/
+// UI
+injectUI();
+console.info('[TP] kører version 6.57');
+
+/*──────── 9) HOVER “Intet Svar” (auto-gem) ────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
   function mkMenu() {
