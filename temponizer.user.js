@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    https://ajourcare.dk/
-// @version      6.42
-// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. HEAD+ETag + 20 kB range. ⚙ Indstillinger til Pushover. **Sikkerhed**: sendPushover dobbelttjekker nu de to toggles (msg/int), og logger når push blokeres.
+// @version      6.44
+// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. HEAD+ETag + 20 kB range. ⚙ Indstillinger til Pushover. **Fix:** tandhjulet er nu en robust tekst-knap (⚙︎) i headeren og kan ikke klippes væk af CSS.
 // @match        https://ajourcare.temponizer.dk/*
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
@@ -23,8 +23,8 @@ const LOCK_MS     = SUPPRESS_MS + 5000; // lås til at undgå dobbelte notifikat
 
 /*──────────────────── Utils ────────────────────*/
 function isPushEnabled(channel) {
-  if (channel === 'msg') return localStorage.getItem('tpPushEnableMsg') === 'true';
-  if (channel === 'int') return localStorage.getItem('tpPushEnableInt') === 'true';
+  if (channel === 'msg') return (localStorage.getItem('tpPushEnableMsg') || '').trim().toLowerCase() === 'true';
+  if (channel === 'int') return (localStorage.getItem('tpPushEnableInt') || '').trim().toLowerCase() === 'true';
   return false;
 }
 function debugState(prefix) {
@@ -71,7 +71,7 @@ function showDOMToast(msg) {
 
 /*──────────────────── 3. Pushover (GM storage) ────────────────────*/
 function sendPushover(msg, channel) {
-  // **DOBBELT GATE** – også her, så push aldrig sendes ved fejl andetsteds
+  // Dobbelttjek toggle her også
   if (!isPushEnabled(channel)) {
     console.info('[TP] Push blokeret (toggle OFF for', channel + ')');
     return;
@@ -80,7 +80,7 @@ function sendPushover(msg, channel) {
   const user  = GM_getValue('pushover_user', '');
   const token = GM_getValue('pushover_token', '');
   if (!user || !token) {
-    showToastOnce('po_missing', 'Pushover ikke sat op – klik tandhjulet for at indtaste nøgler');
+    showToastOnce('po_missing', 'Pushover ikke sat op – klik ⚙︎ for at indtaste nøgler');
     openTpSettings();
     return;
   }
@@ -177,8 +177,8 @@ function handleInterestCount(c) {
   stInt.count = c; saveInt();
 }
 
-/*──────────────────── 6. UI (on/off + gear) ────────────────────*/
-let _tpPanel, _tpGear;
+/*──────────────────── 6. UI (panel + ⚙︎ i header – robust) ────────────────────*/
+let _tpPanel;
 function injectUI() {
   const d = document.createElement('div');
   d.id = 'tpPanel';
@@ -188,22 +188,38 @@ function injectUI() {
     fontSize: '12px', fontFamily: 'sans-serif', boxShadow: '1px 1px 5px rgba(0,0,0,.2)', boxSizing: 'border-box', minWidth: '220px'
   });
 
-  const header = document.createElement('div'); header.style.marginBottom = '4px';
-  const title = document.createElement('b'); title.textContent = 'TP Notifikationer'; header.appendChild(title); d.appendChild(header);
+  const header = document.createElement('div');
+  Object.assign(header.style, { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px', gap: '8px' });
+
+  const title = document.createElement('b'); title.textContent = 'TP Notifikationer';
+
+  // **Robust gear som tekst‑knap (⚙︎) inde i headeren**
+  const gear = document.createElement('button');
+  gear.id = 'tpSettings'; gear.title = 'Indstillinger'; gear.setAttribute('aria-label', 'Indstillinger');
+  // neutraliser side-CSS
+  gear.style.all = 'unset';
+  Object.assign(gear.style, {
+    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    width: '22px', height: '22px', cursor: 'pointer',
+    borderRadius: '50%',
+    padding: '0', margin: '0', lineHeight: '1',
+    userSelect: 'none', WebkitUserSelect: 'none',
+    background: 'rgba(255,255,255,0.95)',
+    border: '1px solid rgba(0,0,0,0.15)',
+    boxShadow: '0 1px 3px rgba(0,0,0,0.2)'
+  });
+  gear.textContent = '⚙︎';
+  gear.onclick = openTpSettings;
+
+  header.appendChild(title);
+  header.appendChild(gear);
+  d.appendChild(header);
 
   const line1 = document.createElement('label'); line1.style.display = 'block'; line1.style.marginTop = '4px'; line1.innerHTML = '<input type="checkbox" id="tp_msg"> Besked (Pushover)';
   const line2 = document.createElement('label'); line2.style.display = 'block'; line2.style.marginTop = '2px'; line2.innerHTML = '<input type="checkbox" id="tp_int"> Interesse (Pushover)';
   d.appendChild(line1); d.appendChild(line2);
 
   document.body.appendChild(d); _tpPanel = d;
-
-  const gear = document.createElement('button');
-  gear.id = 'tpSettings'; gear.title = 'Indstillinger'; gear.setAttribute('aria-label', 'Indstillinger');
-  Object.assign(gear.style, { position: 'fixed', zIndex: 2147483647, width: '22px', height: '22px', padding: 0, margin: 0, lineHeight: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', border: 'none', background: 'transparent', cursor: 'pointer', opacity: 0.9 });
-  gear.onmouseenter = function () { gear.style.opacity = 1; }; gear.onmouseleave = function () { gear.style.opacity = 0.9; };
-  gear.innerHTML = '\n    <svg viewBox="0 0 24 24" width="18" height="18" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="display:block">\n      <path d="M12 8.75a3.25 3.25 0 1 1 0 6.5a3.25 3.25 0 0 1 0-6.5Zm8.63 3.5c.03.25.05.5.05.75s-.02.5-.05.75l2 1.56a.5.5 0 0 1 .12.64l-1.9 3.29a.5.5 0 0 1-.6.22l-2.36-.95a7.6 7.6 0 0 1-1.3.76l-.36 2.52a.5.5 0 0 1-.49.42h-3.8a.5.5 0 0 1-.49-.42l-.36-2.52a7.6 7.6 0 0 1-1.3-.76l-2.36.95a.5.5 0 0 1-.6.22l-1.9 3.29a.5.5 0 0 1-.12.64l-2 1.56Z" fill="currentColor"/>\n    </svg>\n  ';
-  gear.onclick = openTpSettings; document.body.appendChild(gear); _tpGear = gear; placeGear();
-  window.addEventListener('resize', placeGear); window.addEventListener('scroll', placeGear, true);
 
   var m = document.getElementById('tp_msg'); var i = document.getElementById('tp_int');
   m.checked = isPushEnabled('msg'); i.checked = isPushEnabled('int');
@@ -213,24 +229,46 @@ function injectUI() {
   debugState('ui init');
 }
 
-function placeGear() {
-  if (!_tpPanel || !_tpGear) return;
-  const r = _tpPanel.getBoundingClientRect();
-  const size = 22, padX = 12, padY = 10;
-  const candidates = [
-    { left: r.right - size - padX, top: r.top + padY }, // TR
-    { left: r.right - size - padX, top: r.bottom - size - padY }, // BR
-    { left: r.left + padX,        top: r.bottom - size - padY }, // BL
-    { left: r.left + padX,        top: r.top + padY }  // TL
-  ];
-  function vis(p){
-    const vx1=Math.max(0,p.left), vy1=Math.max(0,p.top), vx2=Math.min(window.innerWidth,p.left+size), vy2=Math.min(window.innerHeight,p.top+size);
-    return Math.max(0,vx2-vx1)*Math.max(0,vy2-vy1);
-  }
-  let best=candidates[0], s=-1; for(const c of candidates){const sc=vis(c); if(sc>s){s=sc; best=c;}}
-  if (s<=0) { best={ left: Math.max(8, window.innerWidth - size - 8), top: Math.max(8, window.innerHeight - size - 8) }; }
-  _tpGear.style.left = Math.round(best.left) + 'px';
-  _tpGear.style.top  = Math.round(best.top)  + 'px';
+function openTpSettings() {
+  if (document.getElementById('tpSettingsModal')) return;
+  const overlay = document.createElement('div'); overlay.id = 'tpSettingsModal';
+  Object.assign(overlay.style, { position: 'fixed', inset: 0, background: 'rgba(0,0,0,.35)', zIndex: 2147483647 });
+
+  const box = document.createElement('div');
+  Object.assign(box.style, { position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%,-50%)', background: '#fff', borderRadius: '8px', padding: '16px', width: '380px', boxShadow: '0 8px 24px rgba(0,0,0,.25)', fontFamily: 'sans-serif', fontSize: '13px' });
+
+  const userVal  = GM_getValue('pushover_user', '');
+  const tokenVal = GM_getValue('pushover_token', '');
+
+  box.innerHTML =
+    '<div style="font-weight:600;margin-bottom:8px;">Pushover – opsætning</div>'+
+    '<label style="display:block;margin:6px 0 2px;">USER key</label>'+
+    '<input id="tpUserKey" type="text" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;" value="' + (userVal||'') + '">' +
+    '<label style="display:block;margin:8px 0 2px;">API Token/Key</label>'+
+    '<input id="tpApiToken" type="text" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;" value="' + (tokenVal||'') + '">' +
+    '<div style="margin-top:10px;line-height:1.4;">' +
+      'Hjælp: ' +
+      '<a href="https://pushover.net/" target="_blank" rel="noopener">Find din USER key (Dashboard)</a> · ' +
+      '<a href="https://pushover.net/apps" target="_blank" rel="noopener">Opret/vis API Token</a> · ' +
+      '<a href="https://pushover.net/api" target="_blank" rel="noopener">API-guide</a>' +
+    '</div>' +
+    '<div style="margin-top:14px;text-align:right;">' +
+      '<button id="tpCancel" style="margin-right:6px;padding:6px 10px;">Luk</button>' +
+      '<button id="tpSave" style="padding:6px 10px;">Gem</button>' +
+    '</div>';
+
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  document.getElementById('tpCancel').onclick = function () { overlay.remove(); };
+  document.getElementById('tpSave').onclick = function () {
+    const u = document.getElementById('tpUserKey').value.trim();
+    const t = document.getElementById('tpApiToken').value.trim();
+    GM_setValue('pushover_user', u);
+    GM_setValue('pushover_token', t);
+    showToast('Pushover nøgler gemt');
+    overlay.remove();
+  };
 }
 
 /*──────────────────── 7. START ────────────────────*/
@@ -285,4 +323,4 @@ injectUI();
 })();
 
 // Hjælp i konsol
-console.info('[TP] kører version', '6.42');
+console.info('[TP] kører version', '6.44');
