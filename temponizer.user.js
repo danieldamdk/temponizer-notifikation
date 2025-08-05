@@ -2,11 +2,12 @@
 // @name         Temponizer → Pushover + toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
 // @version      6.33
-// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun 20 kB HTML ved ændring (ESLint-clean).
+// @description  ...
 // @match        https://ajourcare.temponizer.dk/*
+// @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer-ajourcare.user.js
+// @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer-ajourcare.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
-// @connect      api.pushover.net
 // @run-at       document-idle
 // ==/UserScript==
 
