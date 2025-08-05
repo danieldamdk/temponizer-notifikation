@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet svar" (AjourCare)
 // @namespace    https://ajourcare.dk/
-// @version      6.50
+// @version      6.51
 // @description  Push ved nye beskeder og interesse. “Intet svar” autogem (single-shot) og diskret UI. ⚙ Pushover (API låst: kun User Key i UI).
 // @match        https://ajourcare.temponizer.dk/*
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
@@ -259,10 +259,52 @@ setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 injectUI();
 
-/*──────────────────── 8. “Intet svar” – auto-udfyld + auto-gem (single-shot, luk dialog) ────────────────────*/
+/*──────────────────── 8. “Intet svar” – auto-udfyld + auto-gem (single-shot, no-blink Highslide) ────────────────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
   var inFlight = false; // single-shot guard
+  var cleanupT = null, hsPrev = null;
+
+  function ensureNoBlinkCSS() {
+    if (document.getElementById('tp-no-blink-style')) return;
+    var st = document.createElement('style');
+    st.id = 'tp-no-blink-style';
+    // Skjul KUN highslide-dialogen, der indeholder vores registrerings-form
+    st.textContent = [
+      'html.tp-intetsvar-opening .highslide-container:has(form[id^="registreropkaldvagtid_"]),',
+      'html.tp-intetsvar-opening .highslide-wrapper:has(form[id^="registreropkaldvagtid_"]),',
+      'html.tp-intetsvar-opening .highslide-html:has(form[id^="registreropkaldvagtid_"]),',
+      'html.tp-intetsvar-opening .highslide-body:has(form[id^="registreropkaldvagtid_"]) {',
+      '  opacity: 0 !important;',
+      '  pointer-events: none !important;',
+      '}'
+    ].join('\n');
+    document.head.appendChild(st);
+  }
+  function stealthOn() {
+    ensureNoBlinkCSS();
+    document.documentElement.classList.add('tp-intetsvar-opening');
+    // slå evt. Highslide-animation fra midlertidigt
+    try {
+      var hs = (typeof unsafeWindow !== 'undefined') && unsafeWindow.hs;
+      if (hs) {
+        hsPrev = { expand: hs.expandDuration, restore: hs.restoreDuration };
+        hs.expandDuration = 0; hs.restoreDuration = 0;
+      }
+    } catch (_) {}
+    // failsafe: sørg for at vi fjerner klassen igen uanset hvad
+    clearTimeout(cleanupT);
+    cleanupT = setTimeout(stealthOff, 3000);
+  }
+  function stealthOff() {
+    document.documentElement.classList.remove('tp-intetsvar-opening');
+    clearTimeout(cleanupT); cleanupT = null;
+    try {
+      var hs = (typeof unsafeWindow !== 'undefined') && unsafeWindow.hs;
+      if (hs && hsPrev) { hs.expandDuration = hsPrev.expand; hs.restoreDuration = hsPrev.restore; }
+    } catch (_) {}
+    hsPrev = null;
+  }
 
   function mkMenu() {
     if (menu) return menu;
@@ -276,7 +318,8 @@ injectUI();
     btn.onclick = function () {
       if (inFlight) return;
       auto = true; inFlight = true;
-      if (icon) icon.click(); // åbner dialogen
+      stealthOn();                    // pre-hide dialogen + slå animation fra
+      if (icon) icon.click();         // åbner dialogen
       hide();
     };
     menu.appendChild(btn);
@@ -299,15 +342,10 @@ injectUI();
   }
 
   function closeDialog(modalRoot) {
-    // 1) Prøv Annullér-knappen
     var cancel = (modalRoot && modalRoot.querySelector('input[type="button"][onclick*="hs.close"]')) ||
                  document.querySelector('input[type="button"][onclick*="hs.close"]');
     if (cancel) { cancel.click(); return true; }
-    // 2) Prøv global hs.close()
-    if (typeof unsafeWindow !== 'undefined' && unsafeWindow.hs && typeof unsafeWindow.hs.close === 'function') {
-      unsafeWindow.hs.close(); return true;
-    }
-    // 3) Sidste udvej: skjul selve modal-roden
+    if (typeof unsafeWindow !== 'undefined' && unsafeWindow.hs && typeof unsafeWindow.hs.close === 'function') { unsafeWindow.hs.close(); return true; }
     if (modalRoot && modalRoot !== document) { modalRoot.style.display = 'none'; return true; }
     return false;
   }
@@ -338,31 +376,30 @@ injectUI();
       var modalRoot = (textarea.closest && (textarea.closest('.highslide-body, .ui-dialog, .modal, .bootbox, .sweet-alert') || form)) || form;
       var btn = findGemKnap(modalRoot) || findGemKnap(document);
 
+      var finish = function() {
+        // Færdig: luk dialog og ryd stealth/flags
+        setTimeout(function(){
+          closeDialog(modalRoot);
+          stealthOff();
+          inFlight = false; auto = false;
+        }, 120);
+      };
+
       if (btn) {
-        setTimeout(function () {
-          btn.click();                         // ét klik → én registrering
-          console.info('[TP][Intet svar] Klikkede "Gem registrering"');
-          auto = false;
-          setTimeout(function(){ closeDialog(modalRoot); inFlight = false; }, 250);
-        }, 50);
+        setTimeout(function () { btn.click(); console.info('[TP][Intet svar] Klikkede "Gem registrering"'); finish(); }, 20);
         return;
       }
 
-      // 3) Fallback: direkte kald af RegistrerOpkald(...)
+      // 3) Fallback: direkte kald
       var any = document.querySelector('input[type="button"][onclick*="RegistrerOpkald"]');
-      if (any && callRegistrerOpkaldFrom(any.getAttribute('onclick'))) {
-        auto = false;
-        setTimeout(function(){ closeDialog(modalRoot); inFlight = false; }, 250);
-        return;
-      }
+      if (any && callRegistrerOpkaldFrom(any.getAttribute('onclick'))) { finish(); return; }
 
-      // 4) Sidste udvej: submit form
+      // 4) Sidste udvej
       if (form && form !== document) { if (form.requestSubmit) form.requestSubmit(); else form.submit(); console.info('[TP][Intet svar] Submit form (fallback)'); }
-      auto = false;
-      setTimeout(function(){ closeDialog(modalRoot); inFlight = false; }, 250);
+      finish();
     } catch (e) {
       console.error('[TP][Intet svar] Auto-gem fejlede', e);
-      auto = false; inFlight = false;
+      stealthOff(); inFlight = false; auto = false;
     }
   }
 
@@ -382,8 +419,9 @@ injectUI();
         var n = m.addedNodes[j];
         if (!(n instanceof HTMLElement)) continue;
         var ta = (n.matches && n.matches('textarea[name="phonetext"]')) ? n : (n.querySelector && n.querySelector('textarea[name="phonetext"]'));
-        if (ta) { submitIntetSvar(ta); return; } // 1 gang
+        if (ta) { submitIntetSvar(ta); return; }
       }
     }
   }).observe(document.body, { childList: true, subtree: true });
 })();
+
