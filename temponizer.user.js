@@ -1,23 +1,25 @@
 // ==UserScript==
-// @name         Temponizer → Pushover + toast + Quick "Intet Svar" (AjourCare)
-// @namespace    ajourcare.dk
-// @version      6.33
-// @description  ...
+// @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
+// @namespace    https://ajourcare.dk/
+// @version      6.34
+// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun første 20 kB ved ændring. Indeholder ⚙ indstillinger til Pushover USER/TOKEN.
 // @match        https://ajourcare.temponizer.dk/*
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer-ajourcare.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer-ajourcare.user.js
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=temponizer.dk
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_openInTab
 // @grant        unsafeWindow
+// @connect      api.pushover.net
 // @run-at       document-idle
 // ==/UserScript==
 
 /*──────────────────── 1. KONFIG ────────────────────*/
-const PUSHOVER_USER  = 'uPenUF7H43j6R8JxwAq1YYyHBn7ZFd';
-const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
-
-const POLL_MS     = 30000;
-const SUPPRESS_MS = 45000;
-const LOCK_MS     = SUPPRESS_MS + 5000;
+const POLL_MS     = 30000;  // interval mellem polls
+const SUPPRESS_MS = 45000;  // min. tid mellem push/toast pr. kategori
+const LOCK_MS     = SUPPRESS_MS + 5000; // lås til at undgå dobbelte notifikationer mellem tabs
 
 /*──────────────────── 2. TOAST ────────────────────*/
 function showToastOnce(key, msg) {
@@ -28,10 +30,10 @@ function showToastOnce(key, msg) {
   showToast(msg);
 }
 function showToast(msg) {
-  if (Notification.permission === 'granted') {
+  if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
     try { new Notification('Temponizer', { body: msg }); }
     catch (_) { showDOMToast(msg); }
-  } else if (Notification.permission !== 'denied') {
+  } else if (typeof Notification !== 'undefined' && Notification.permission !== 'denied') {
     Notification.requestPermission().then(function (p) {
       p === 'granted' ? new Notification('Temponizer', { body: msg }) : showDOMToast(msg);
     });
@@ -44,7 +46,7 @@ function showDOMToast(msg) {
     position: 'fixed', bottom: '16px', right: '16px',
     background: '#333', color: '#fff', padding: '10px 14px',
     borderRadius: '6px', fontSize: '13px', fontFamily: 'sans-serif',
-    boxShadow: '1px 1px 8px rgba(0,0,0,.4)', zIndex: 9999,
+    boxShadow: '1px 1px 8px rgba(0,0,0,.4)', zIndex: 2147483647,
     opacity: 0, transition: 'opacity .4s'
   });
   document.body.appendChild(el);
@@ -52,16 +54,28 @@ function showDOMToast(msg) {
   setTimeout(function () { el.style.opacity = 0; setTimeout(function () { el.remove(); }, 500); }, 4000);
 }
 
-/*──────────────────── 3. PUSHOVER ────────────────────*/
+/*──────────────────── 3. PUS H O V E R (GM storage) ────────────────────*/
 function sendPushover(msg) {
-  const body = 'token=' + PUSHOVER_TOKEN + '&user=' + PUSHOVER_USER +
+  const user  = GM_getValue('pushover_user', '');
+  const token = GM_getValue('pushover_token', '');
+
+  if (!user || !token) {
+    showToastOnce('po_missing', 'Pushover ikke sat op – klik ⚙ for at indtaste nøgler');
+    openTpSettings();
+    return;
+  }
+
+  const body = 'token=' + encodeURIComponent(token) +
+               '&user=' + encodeURIComponent(user) +
                '&message=' + encodeURIComponent(msg);
+
   GM_xmlhttpRequest({
     method: 'POST',
     url: 'https://api.pushover.net/1/messages.json',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     data: body,
     onerror: function () {
+      // fallback via fetch (samme oprindelse tillader cross-site POST til pushover)
       fetch('https://api.pushover.net/1/messages.json', {
         method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body
       }).catch(console.error);
@@ -69,7 +83,7 @@ function sendPushover(msg) {
   });
 }
 
-/*──────────────────── 4. BESKEDER (uændret) ────────────────────*/
+/*──────────────────── 4. BESKEDER ────────────────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
 const stMsg = JSON.parse(localStorage.getItem('tpPushState') || '{"count":0,"lastPush":0,"lastSent":0}');
@@ -77,7 +91,8 @@ function saveMsg() { localStorage.setItem('tpPushState', JSON.stringify(stMsg));
 function takeLock() {
   const l = JSON.parse(localStorage.getItem('tpPushLock') || '{"t":0}');
   if (Date.now() - l.t < LOCK_MS) return false;
-  localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() })); return true;
+  localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() }));
+  return true;
 }
 function pollMessages() {
   fetch(MSG_URL + '&ts=' + Date.now(), { credentials: 'same-origin' })
@@ -89,7 +104,8 @@ function pollMessages() {
       if (n > stMsg.count && n !== stMsg.lastSent) {
         if (Date.now() - stMsg.lastPush > SUPPRESS_MS && takeLock()) {
           const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
-          if (en) sendPushover(m); showToastOnce('msg', m);
+          if (en) sendPushover(m);
+          showToastOnce('msg', m);
           stMsg.lastPush = Date.now(); stMsg.lastSent = n;
         } else stMsg.lastSent = n;
       } else if (n < stMsg.count) stMsg.lastPush = 0;
@@ -100,9 +116,9 @@ function pollMessages() {
     .catch(console.error);
 }
 
-/*──────────────────── 5. INTERESSE (HEAD + ETag) ────────────────────*/
+/*──────────────────── 5. INTERESSE (HEAD + ETag + Range) ────────────────────*/
 const HTML_URL = location.origin + '/index.php?page=freevagter';
-let   lastETag = null;
+let   lastETag = null; // kan evt. persisteres i localStorage hvis ønsket
 
 const stInt = JSON.parse(localStorage.getItem('tpInterestState') || '{"count":0,"lastPush":0,"lastSent":0}');
 function saveInt() { localStorage.setItem('tpInterestState', JSON.stringify(stInt)); }
@@ -148,7 +164,8 @@ function handleInterestCount(c) {
   if (c > stInt.count && c !== stInt.lastSent) {
     if (Date.now() - stInt.lastPush > SUPPRESS_MS) {
       const m = '👀 ' + c + ' vikar(er) har vist interesse for ledige vagter';
-      if (en) sendPushover(m); showToastOnce('int', m);
+      if (en) sendPushover(m);
+      showToastOnce('int', m);
       stInt.lastPush = Date.now(); stInt.lastSent = c;
     } else stInt.lastSent = c;
   } else if (c < stInt.count) stInt.lastPush = 0;
@@ -156,27 +173,86 @@ function handleInterestCount(c) {
   stInt.count = c; saveInt();
 }
 
-/*──────────────────── 6. UI (on/off switches) ────────────────────*/
+/*──────────────────── 6. UI (on/off + ⚙ indstillinger) ────────────────────*/
 function injectUI() {
   const d = document.createElement('div');
   d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:9999;background:#f9f9f9;border:1px solid #ccc;padding:6px 10px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2)';
-  d.innerHTML = '<b>TP Notifikationer</b><br><label><input type="checkbox" id="m"> Besked (Pushover)</label><br><label><input type="checkbox" id="i"> Interesse (Pushover)</label>';
+  d.innerHTML = '<b>TP Notifikationer</b><br>'+
+    '<label><input type="checkbox" id="tp_msg"> Besked (Pushover)</label><br>'+
+    '<label><input type="checkbox" id="tp_int"> Interesse (Pushover)</label> '+
+    '<button id="tpSettings" style="margin-left:8px">⚙ Indstillinger</button>';
   document.body.appendChild(d);
-  var m = document.getElementById('m'); var i = document.getElementById('i');
+
+  var m = document.getElementById('tp_msg'); var i = document.getElementById('tp_int');
   m.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
   i.checked = localStorage.getItem('tpPushEnableInt') === 'true';
   m.onchange = function () { localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false'); };
   i.onchange = function () { localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false'); };
+
+  document.getElementById('tpSettings').onclick = openTpSettings;
+}
+
+function openTpSettings() {
+  if (document.getElementById('tpSettingsModal')) return;
+
+  const overlay = document.createElement('div');
+  overlay.id = 'tpSettingsModal';
+  Object.assign(overlay.style, {
+    position: 'fixed', inset: 0, background: 'rgba(0,0,0,.35)', zIndex: 2147483646
+  });
+
+  const box = document.createElement('div');
+  Object.assign(box.style, {
+    position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%,-50%)',
+    background: '#fff', borderRadius: '8px', padding: '16px', width: '380px',
+    boxShadow: '0 8px 24px rgba(0,0,0,.25)', fontFamily: 'sans-serif', fontSize: '13px'
+  });
+
+  const userVal  = GM_getValue('pushover_user', '');
+  const tokenVal = GM_getValue('pushover_token', '');
+
+  box.innerHTML =
+    '<div style="font-weight:600;margin-bottom:8px;">Pushover – opsætning</div>'+
+    '<label style="display:block;margin:6px 0 2px;">USER key</label>'+
+    '<input id="tpUserKey" type="text" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;" value="' + (userVal||'') + '">' +
+    '<label style="display:block;margin:8px 0 2px;">API Token/Key</label>'+
+    '<input id="tpApiToken" type="text" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;" value="' + (tokenVal||'') + '">' +
+    '<div style="margin-top:10px;line-height:1.4;">' +
+      'Hjælp: ' +
+      '<a href="https://pushover.net/" target="_blank" rel="noopener">Find din USER key (Dashboard)</a> · ' +
+      '<a href="https://pushover.net/apps" target="_blank" rel="noopener">Opret/vis API Token</a> · ' +
+      '<a href="https://pushover.net/api" target="_blank" rel="noopener">API-guide</a>' +
+    '</div>' +
+    '<div style="margin-top:14px;text-align:right;">' +
+      '<button id="tpCancel" style="margin-right:6px;padding:6px 10px;">Luk</button>' +
+      '<button id="tpSave" style="padding:6px 10px;">Gem</button>' +
+    '</div>';
+
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  document.getElementById('tpCancel').onclick = function () { overlay.remove(); };
+  document.getElementById('tpSave').onclick = function () {
+    const u = document.getElementById('tpUserKey').value.trim();
+    const t = document.getElementById('tpApiToken').value.trim();
+    GM_setValue('pushover_user', u);
+    GM_setValue('pushover_token', t);
+    showToast('Pushover nøgler gemt');
+    overlay.remove();
+  };
 }
 
 /*──────────────────── 7. START ────────────────────*/
 document.addEventListener('click', function (e) {
-  const a = e.target.closest('a');
-  if (a && /Beskeder/.test(a.textContent)) { stMsg.lastPush = stMsg.lastSent = 0; saveMsg(); }
+  const a = e.target.closest && e.target.closest('a');
+  if (a && /Beskeder/.test(a.textContent || '')) { stMsg.lastPush = stMsg.lastSent = 0; saveMsg(); }
 });
-pollMessages(); pollInterest();
+
+pollMessages();
+pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
+
 injectUI();
 
 /*──────────────────── 8. HOVER “Intet Svar” (én knap) ────────────────────*/
@@ -202,7 +278,7 @@ injectUI();
   document.addEventListener('mousemove', function (e) {
     if (!menu || menu.style.display !== 'block') return;
     var overM = menu.contains(e.target);
-    var overI = icon && (icon === e.target || icon.contains(e.target) || e.target.contains(icon));
+    var overI = icon && (icon === e.target || icon.contains(e.target) || (e.target && e.target.contains && e.target.contains(icon)));
     if (!overM && !overI) hide();
   }, true);
 
@@ -211,7 +287,7 @@ injectUI();
     ml.forEach(function (m) {
       m.addedNodes.forEach(function (n) {
         if (!(n instanceof HTMLElement)) return;
-        var ta = (n.matches && n.matches('textarea[name=\"phonetext\"]')) ? n : (n.querySelector && n.querySelector('textarea[name=\"phonetext\"]'));
+        var ta = (n.matches && n.matches('textarea[name="phonetext"]')) ? n : (n.querySelector && n.querySelector('textarea[name="phonetext"]'));
         if (ta) { if (!ta.value.trim()) ta.value = 'Intet Svar'; ta.focus(); auto = false; }
       });
     });
