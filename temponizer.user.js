@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      6.55
-// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun 20 kB HTML ved ændring. Inkl. testknap for Pushover. APP-token er fastlåst af administrator. USER-token lagres i GM storage.
+// @version      6.56
+// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun 20 kB HTML ved ændring. APP-token er fastlåst af administrator. USER-token sættes i ⚙️-menuen (GM storage). Inkl. testknap i ⚙️-menuen.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -14,13 +14,13 @@
 // @downloadURL  https://github.com/danieldamdk/temponizer-notifikation/raw/refs/heads/main/temponizer.user.js
 // ==/UserScript==
 
-/*──────────────────── 1. KONFIG (APP-token er fastlåst) ────────────────────*/
+/*──────────────────── 1) KONFIG (APP-token fastlåst) ────────────────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7'; // ADMIN-FASTLÅST
 const POLL_MS     = 30000;
 const SUPPRESS_MS = 45000;
 const LOCK_MS     = SUPPRESS_MS + 5000;
 
-/*──────────────────── 1a. MIGRATION til GM storage ────────────────────*/
+/*──────────────────── 1a) MIGRATION til GM storage ────────────────────*/
 (function migrateUserKeyToGM(){
   try {
     const gm = (GM_getValue('tpUserKey') || '').trim();
@@ -35,7 +35,7 @@ const LOCK_MS     = SUPPRESS_MS + 5000;
   } catch(_) {}
 })();
 
-/*──────────────────── 2. TOAST ────────────────────*/
+/*──────────────────── 2) TOAST ────────────────────*/
 function showToastOnce(key, msg) {
   const lk = 'tpToastLock_' + key;
   const o  = JSON.parse(localStorage.getItem(lk) || '{"t":0}');
@@ -68,7 +68,7 @@ function showDOMToast(msg) {
   setTimeout(function () { el.style.opacity = 0; setTimeout(function () { el.remove(); }, 500); }, 4000);
 }
 
-/*──────────────────── 3. PUSHOVER ────────────────────*/
+/*──────────────────── 3) PUSHOVER ────────────────────*/
 function getUserKey() {
   try { return (GM_getValue('tpUserKey') || '').trim(); }
   catch (_) { return ''; }
@@ -77,7 +77,7 @@ function sendPushover(msg) {
   const userKey = getUserKey();
   if (!PUSHOVER_TOKEN || !userKey) {
     console.warn('[TP][PUSH][SKIP] mangler token/user', { hasApp: !!PUSHOVER_TOKEN, hasUser: !!userKey });
-    showToast('Pushover er ikke konfigureret (mangler USER-token). Åbn boksen og gem din USER-nøgle.');
+    showToast('Pushover er ikke konfigureret (mangler USER-token). Klik på ⚙️ og gem din USER-nøgle.');
     return;
   }
   const body = 'token=' + encodeURIComponent(PUSHOVER_TOKEN) +
@@ -102,7 +102,7 @@ function sendPushover(msg) {
   });
 }
 
-/*──────────────────── 4. BESKEDER ────────────────────*/
+/*──────────────────── 4) BESKEDER ────────────────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
 const stMsg = JSON.parse(localStorage.getItem('tpPushState') || '{"count":0,"lastPush":0,"lastSent":0}');
@@ -140,7 +140,7 @@ function pollMessages() {
     .catch(e => console.warn('[TP][ERR][MSG]', e));
 }
 
-/*──────────────────── 5. INTERESSE (HEAD + ETag) ────────────────────*/
+/*──────────────────── 5) INTERESSE (HEAD + ETag) ────────────────────*/
 const HTML_URL = location.origin + '/index.php?page=freevagter';
 let lastETag = localStorage.getItem('tpLastETag') || null;
 const stInt = JSON.parse(localStorage.getItem('tpInterestState') || '{"count":0,"lastPush":0,"lastSent":0}');
@@ -187,47 +187,27 @@ function handleInterestCount(c) {
   stInt.count = c; saveInt();
 }
 
-/*──────────────────── 6. UI (panel + gear + test) ────────────────────*/
+/*──────────────────── 6) UI (panel m. toggles + gear; gear-menu har token+test) ────────────────────*/
 function injectUI() {
+  // Panel: kun toggles
   const d = document.createElement('div');
   d.id = 'tpPanel';
-  d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:2147483645;background:#f9f9f9;border:1px solid #ccc;padding:8px 10px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2);min-width:260px';
+  d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:2147483645;background:#f9f9f9;border:1px solid #ccc;padding:8px 10px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2);min-width:220px';
   d.innerHTML =
     '<b>TP Notifikationer</b>' +
     '<div style="margin-top:6px">' +
       '<label style="display:block;margin:2px 0"><input type="checkbox" id="m"> Besked (Pushover)</label>' +
       '<label style="display:block;margin:2px 0"><input type="checkbox" id="i"> Interesse (Pushover)</label>' +
-    '</div>' +
-    '<div style="margin-top:6px">' +
-      '<div style="font-weight:600;margin-bottom:2px">Pushover USER-token</div>' +
-      '<input id="tpUserKey" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid #ccc;border-radius:4px">' +
-      '<div style="margin-top:4px;display:flex;gap:6px;align-items:center">' +
-        '<button id="tpSaveUserKey" style="padding:4px 8px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer">Gem</button>' +
-        '<a href="https://pushover.net/" target="_blank" rel="noopener" style="color:#06c;text-decoration:none">Sådan finder du USER-token</a>' +
-      '</div>' +
     '</div>';
   document.body.appendChild(d);
 
-  // toggles (beholdt i localStorage)
   var m = d.querySelector('#m'), i = d.querySelector('#i');
   m.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
   i.checked = localStorage.getItem('tpPushEnableInt') === 'true';
   m.onchange = function () { localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false'); };
   i.onchange = function () { localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false'); };
 
-  // USER-token felt (GM storage)
-  const userInp = d.querySelector('#tpUserKey');
-  const saveBtn = d.querySelector('#tpSaveUserKey');
-  userInp.value = getUserKey();
-  function saveUserKey() {
-    const v = (userInp.value || '').trim();
-    GM_setValue('tpUserKey', v);
-    showToast('Pushover USER-token gemt.');
-  }
-  saveBtn.addEventListener('click', saveUserKey);
-  userInp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); saveUserKey(); } });
-
-  // tandhjul
+  // Tandhjul
   const gear = document.createElement('div');
   gear.id = 'tpGear';
   gear.setAttribute('title', 'Indstillinger');
@@ -242,33 +222,72 @@ function injectUI() {
   document.body.appendChild(gear);
   ensureFullyVisible(gear);
 
-  // menu
+  // Gear-menu (byg ved behov)
   let menu = null;
-  function toggleMenu() {
-    if (!menu) {
-      menu = document.createElement('div');
-      Object.assign(menu.style, {
-        position:'fixed', zIndex:2147483647, background:'#fff', border:'1px solid #ccc',
-        borderRadius:'6px', boxShadow:'0 2px 12px rgba(0,0,0,.25)', fontSize:'12px',
-        fontFamily:'sans-serif', padding:'6px 0'
-      });
-      document.body.appendChild(menu);
-      tpAddMenuItems(menu);
+  function buildMenu() {
+    if (menu) return menu;
+    menu = document.createElement('div');
+    Object.assign(menu.style, {
+      position:'fixed', zIndex:2147483647, background:'#fff', border:'1px solid #ccc',
+      borderRadius:'8px', boxShadow:'0 2px 12px rgba(0,0,0,.25)', fontSize:'12px',
+      fontFamily:'sans-serif', padding:'8px', width:'280px'
+    });
+    menu.innerHTML =
+      '<div style="font-weight:700;margin-bottom:6px">Indstillinger</div>' +
+      '<div style="margin-bottom:8px">' +
+        '<div style="font-weight:600;margin-bottom:4px">Pushover USER-token</div>' +
+        '<input id="tpUserKeyMenu" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" ' +
+          'style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
+        '<div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
+          '<button id="tpSaveUserKeyMenu" style="padding:4px 8px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer">Gem</button>' +
+          '<a href="https://pushover.net/" target="_blank" rel="noopener" style="color:#06c;text-decoration:none">Sådan finder du USER-token</a>' +
+        '</div>' +
+      '</div>' +
+      '<div style="border-top:1px solid #eee;margin:6px 0"></div>' +
+      '<button id="tpTestPushoverBtn" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🧪 Test Pushover (Besked + Interesse)</button>';
+    document.body.appendChild(menu);
+
+    // Prefill + events
+    const inp  = menu.querySelector('#tpUserKeyMenu');
+    const save = menu.querySelector('#tpSaveUserKeyMenu');
+    const test = menu.querySelector('#tpTestPushoverBtn');
+
+    inp.value = getUserKey();
+    function saveUserKey() {
+      const v = (inp.value || '').trim();
+      GM_setValue('tpUserKey', v);
+      showToast('Pushover USER-token gemt.');
     }
+    save.addEventListener('click', saveUserKey);
+    inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); saveUserKey(); } });
+    test.addEventListener('click', function () {
+      tpTestPushoverBoth();
+      menu.style.display = 'none';
+    });
+
+    return menu;
+  }
+
+  function toggleMenu() {
+    const mnu = buildMenu();
     const r = gear.getBoundingClientRect();
-    menu.style.right = (window.innerWidth - r.right) + 'px';
-    menu.style.bottom = (window.innerHeight - r.top + 6) + 'px';
-    menu.style.display = (menu.style.display === 'block' ? 'none' : 'block');
+    mnu.style.right = (window.innerWidth - r.right) + 'px';
+    mnu.style.bottom = (window.innerHeight - r.top + 6) + 'px';
+    mnu.style.display = (mnu.style.display === 'block' ? 'none' : 'block');
+    // hver åbning: sync feltet med GM
+    const inp = mnu.querySelector('#tpUserKeyMenu');
+    if (inp) inp.value = getUserKey();
   }
   gear.addEventListener('click', toggleMenu);
 
-  // klik udenfor → luk
+  // Klik udenfor → luk menu
   document.addEventListener('mousedown', function (e) {
     if (menu && e.target !== menu && !menu.contains(e.target) && e.target !== gear) menu.style.display = 'none';
   });
 
   console.debug('[TP][DBG] ui init', { panel: !!d, gear: !!gear });
 }
+
 function ensureFullyVisible(el){
   const r = el.getBoundingClientRect();
   let dx = 0, dy = 0;
@@ -278,19 +297,14 @@ function ensureFullyVisible(el){
   if (r.top < 0) dy = 6 - r.top;
   if (dx || dy) el.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
 }
-function tpAddMenuItems(menuEl) {
-  function addItem(txt, onclick){
-    var item = document.createElement('div');
-    item.textContent = txt;
-    item.style.cssText = 'padding:6px 10px; white-space:nowrap; cursor:pointer';
-    item.onmouseenter = function(){ item.style.background = '#f0f0f0'; };
-    item.onmouseleave = function(){ item.style.background = ''; };
-    item.onclick = function(){ onclick(); menuEl.style.display = 'none'; };
-    menuEl.appendChild(item);
-  }
-  addItem('🧪 Test Pushover (Besked + Interesse)', tpTestPushoverBoth);
-}
+
+/* Test-knap (bruger USER-token fra GM storage) */
 function tpTestPushoverBoth(){
+  const userKey = getUserKey();
+  if (!userKey) {
+    showToast('Indsæt din USER-token i ⚙️-menuen før test.');
+    return;
+  }
   const ts = new Date().toLocaleTimeString();
   const m1 = '🧪 [TEST] Besked-kanal OK — ' + ts;
   const m2 = '🧪 [TEST] Interesse-kanal OK — ' + ts;
@@ -303,7 +317,7 @@ function tpTestPushoverBoth(){
   showToast('Sendte Pushover-test (Besked + Interesse). Tjek Pushover.');
 }
 
-/*──────────────────── 7. START ────────────────────*/
+/*──────────────────── 7) START ────────────────────*/
 document.addEventListener('click', function (e) {
   const a = e.target.closest('a');
   if (a && /Beskeder/.test(a.textContent)) { stMsg.lastPush = stMsg.lastSent = 0; saveMsg(); }
@@ -312,9 +326,9 @@ pollMessages(); pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 injectUI();
-console.info('[TP] kører version 6.55');
+console.info('[TP] kører version 6.56');
 
-/*──────────────────── 8. HOVER “Intet Svar” (auto-gem) ────────────────────*/
+/*──────────────────── 8) HOVER “Intet Svar” (auto-gem) ────────────────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
   function mkMenu() {
