@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet svar" (AjourCare)
 // @namespace    https://ajourcare.dk/
-// @version      6.49
+// @version      6.50
 // @description  Push ved nye beskeder og interesse. “Intet svar” autogem (single-shot) og diskret UI. ⚙ Pushover (API låst: kun User Key i UI).
 // @match        https://ajourcare.temponizer.dk/*
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
@@ -259,7 +259,7 @@ setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 injectUI();
 
-/*──────────────────── 8. “Intet svar” – auto-udfyld + auto-gem (single-shot, scoped stealth) ────────────────────*/
+/*──────────────────── 8. “Intet svar” – auto-udfyld + auto-gem (single-shot, luk dialog) ────────────────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
   var inFlight = false; // single-shot guard
@@ -297,6 +297,21 @@ injectUI();
     });
     return cand || null;
   }
+
+  function closeDialog(modalRoot) {
+    // 1) Prøv Annullér-knappen
+    var cancel = (modalRoot && modalRoot.querySelector('input[type="button"][onclick*="hs.close"]')) ||
+                 document.querySelector('input[type="button"][onclick*="hs.close"]');
+    if (cancel) { cancel.click(); return true; }
+    // 2) Prøv global hs.close()
+    if (typeof unsafeWindow !== 'undefined' && unsafeWindow.hs && typeof unsafeWindow.hs.close === 'function') {
+      unsafeWindow.hs.close(); return true;
+    }
+    // 3) Sidste udvej: skjul selve modal-roden
+    if (modalRoot && modalRoot !== document) { modalRoot.style.display = 'none'; return true; }
+    return false;
+  }
+
   function callRegistrerOpkaldFrom(onclickStr) {
     try {
       if (!onclickStr) return false;
@@ -318,60 +333,33 @@ injectUI();
       var wanted = 'Intet svar';
       if (textarea.value.trim() !== wanted) { textarea.value = wanted; triggerInput(textarea); }
 
-      // 2) Find modal-root og gem-knap
+      // 2) Find modal-root + knap
       var form = (textarea.closest && textarea.closest('form')) || document;
       var modalRoot = (textarea.closest && (textarea.closest('.highslide-body, .ui-dialog, .modal, .bootbox, .sweet-alert') || form)) || form;
-
-      // Stealth KUN på modalRoot (ikke globalt)
-      var prevOpacity = modalRoot && modalRoot.style.opacity;
-      var prevPE      = modalRoot && modalRoot.style.pointerEvents;
-      if (modalRoot && modalRoot !== document) {
-        modalRoot.style.opacity = '0';
-        modalRoot.style.pointerEvents = 'none';
-      }
-
       var btn = findGemKnap(modalRoot) || findGemKnap(document);
 
       if (btn) {
         setTimeout(function () {
-          btn.click();
+          btn.click();                         // ét klik → én registrering
           console.info('[TP][Intet svar] Klikkede "Gem registrering"');
           auto = false;
-          setTimeout(function(){
-            inFlight = false;
-            if (modalRoot && modalRoot !== document) {
-              modalRoot.style.opacity = prevOpacity || '';
-              modalRoot.style.pointerEvents = prevPE || '';
-            }
-          }, 250);
+          setTimeout(function(){ closeDialog(modalRoot); inFlight = false; }, 250);
         }, 50);
         return;
       }
 
-      // 3) Fallback: direkte kald
+      // 3) Fallback: direkte kald af RegistrerOpkald(...)
       var any = document.querySelector('input[type="button"][onclick*="RegistrerOpkald"]');
       if (any && callRegistrerOpkaldFrom(any.getAttribute('onclick'))) {
         auto = false;
-        setTimeout(function(){
-          inFlight = false;
-          if (modalRoot && modalRoot !== document) {
-            modalRoot.style.opacity = prevOpacity || '';
-            modalRoot.style.pointerEvents = prevPE || '';
-          }
-        }, 250);
+        setTimeout(function(){ closeDialog(modalRoot); inFlight = false; }, 250);
         return;
       }
 
-      // 4) Sidste udvej
+      // 4) Sidste udvej: submit form
       if (form && form !== document) { if (form.requestSubmit) form.requestSubmit(); else form.submit(); console.info('[TP][Intet svar] Submit form (fallback)'); }
       auto = false;
-      setTimeout(function(){
-        inFlight = false;
-        if (modalRoot && modalRoot !== document) {
-          modalRoot.style.opacity = prevOpacity || '';
-          modalRoot.style.pointerEvents = prevPE || '';
-        }
-      }, 250);
+      setTimeout(function(){ closeDialog(modalRoot); inFlight = false; }, 250);
     } catch (e) {
       console.error('[TP][Intet svar] Auto-gem fejlede', e);
       auto = false; inFlight = false;
@@ -394,11 +382,8 @@ injectUI();
         var n = m.addedNodes[j];
         if (!(n instanceof HTMLElement)) continue;
         var ta = (n.matches && n.matches('textarea[name="phonetext"]')) ? n : (n.querySelector && n.querySelector('textarea[name="phonetext"]'));
-        if (ta) { submitIntetSvar(ta); return; }
+        if (ta) { submitIntetSvar(ta); return; } // 1 gang
       }
     }
   }).observe(document.body, { childList: true, subtree: true });
 })();
-
-// Hjælp i konsol
-console.info('[TP] kører version', '6.49');
