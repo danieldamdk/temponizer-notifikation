@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    https://ajourcare.dk/
-// @version      6.34
+// @version      6.35
 // @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun første 20 kB ved ændring. Indeholder ⚙ indstillinger til Pushover USER/TOKEN.
 // @match        https://ajourcare.temponizer.dk/*
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer-ajourcare.user.js
@@ -60,7 +60,7 @@ function sendPushover(msg) {
   const token = GM_getValue('pushover_token', '');
 
   if (!user || !token) {
-    showToastOnce('po_missing', 'Pushover ikke sat op – klik ⚙ for at indtaste nøgler');
+    showToastOnce('po_missing', 'Pushover ikke sat op – klik tandhjulet for at indtaste nøgler');
     openTpSettings();
     return;
   }
@@ -173,14 +173,31 @@ function handleInterestCount(c) {
   stInt.count = c; saveInt();
 }
 
-/*──────────────────── 6. UI (on/off + ⚙ indstillinger) ────────────────────*/
+/*──────────────────── 6. UI (on/off + diskret tandhjul i hjørnet) ────────────────────*/
 function injectUI() {
   const d = document.createElement('div');
-  d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:9999;background:#f9f9f9;border:1px solid #ccc;padding:6px 10px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2)';
-  d.innerHTML = '<b>TP Notifikationer</b><br>'+
-    '<label><input type="checkbox" id="tp_msg"> Besked (Pushover)</label><br>'+
-    '<label><input type="checkbox" id="tp_int"> Interesse (Pushover)</label> '+
-    '<button id="tpSettings" style="margin-left:8px">⚙ Indstillinger</button>';
+  d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:9999;background:#f9f9f9;border:1px solid #ccc;padding:10px 12px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2)';
+  // Indhold uden knap — vi tilføjer et lille tandhjul separat
+  d.innerHTML = '<b style="display:block;margin-right:18px;">TP Notifikationer</b>'+
+    '<label style="display:block;margin-top:4px;"><input type="checkbox" id="tp_msg"> Besked (Pushover)</label>'+
+    '<label style="display:block;margin-top:2px;"><input type="checkbox" id="tp_int"> Interesse (Pushover)</label>';
+
+  // Lille tandhjul i øverste højre hjørne af boksen
+  const gear = document.createElement('button');
+  gear.id = 'tpSettings';
+  gear.title = 'Indstillinger';
+  gear.setAttribute('aria-label', 'Indstillinger');
+  Object.assign(gear.style, {
+    position: 'absolute', top: '6px', right: '6px',
+    width: '18px', height: '18px', padding: 0,
+    border: 'none', background: 'transparent', cursor: 'pointer',
+    opacity: 0.6
+  });
+  gear.onmouseenter = function () { gear.style.opacity = 1; };
+  gear.onmouseleave = function () { gear.style.opacity = 0.6; };
+  gear.innerHTML = '\n    <svg viewBox="0 0 24 24" width="18" height="18" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">\n      <path d="M12 8.75a3.25 3.25 0 1 1 0 6.5a3.25 3.25 0 0 1 0-6.5Zm8.63 3.5c.03.25.05.5.05.75s-.02.5-.05.75l2 1.56a.5.5 0 0 1 .12.64l-1.9 3.29a.5.5 0 0 1-.6.22l-2.36-.95a7.6 7.6 0 0 1-1.3.76l-.36 2.52a.5.5 0 0 1-.49.42h-3.8a.5.5 0 0 1-.49-.42l-.36-2.52a7.6 7.6 0 0 1-1.3-.76l-2.36.95a.5.5 0 0 1-.6-.22l-1.9-3.29a.5.5 0 0 1 .12-.64l2-1.56c-.03-.25-.05-.5-.05-.75s.02-.5.05-.75l-2-1.56a.5.5 0 0 1-.12-.64l1.9-3.29a.5.5 0 0 1 .6-.22l2.36.95c.41-.32.85-.58 1.3-.76l.36-2.52a.5.5 0 0 1 .49-.42h3.8a.5.5 0 0 1 .49.42l.36 2.52c.45.18.89.44 1.3.76l2.36-.95a.5.5 0 0 1 .6.22l1.9 3.29a.5.5 0 0 1-.12.64l-2 1.56Z" fill="currentColor"/>\n    </svg>\n  ';
+
+  d.appendChild(gear);
   document.body.appendChild(d);
 
   var m = document.getElementById('tp_msg'); var i = document.getElementById('tp_int');
