@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet svar" (AjourCare)
 // @namespace    https://ajourcare.dk/
-// @version      6.51
-// @description  Push ved nye beskeder og interesse. “Intet svar” autogem (single-shot) og diskret UI. ⚙ Pushover (API låst: kun User Key i UI).
+// @version      6.52
+// @description  Push ved nye beskeder og interesse. “Intet svar” autogem (single-shot, no-blink) og diskret UI. ⚙ Pushover (API låst: kun User Key i UI). Cross-tab dedupe ⇒ kun én push på tværs af faner.
 // @match        https://ajourcare.temponizer.dk/*
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-/*──────────────────── 1. KONFIG ────────────────────*/
+/*──────────────────── 1) KONFIG ────────────────────*/
 const POLL_MS     = 30000;
 const SUPPRESS_MS = 45000;
 const LOCK_MS     = SUPPRESS_MS + 5000;
@@ -39,7 +39,62 @@ function debugState(prefix) {
   } catch(_) {}
 }
 
-/*──────────────────── 2. TOAST ────────────────────*/
+/*──────────────────── 2) Cross-tab dedupe (BroadcastChannel) ────────────────────*/
+const TP_BC   = ('BroadcastChannel' in window) ? new BroadcastChannel('tp-notify') : null;
+const TP_TAB  = (crypto && crypto.randomUUID) ? crypto.randomUUID() : (Math.random().toString(36).slice(2));
+const TP_WIN  = 2000; // ms: suppression-vindue efter “sent”
+const tpClaims = new Map(); // key -> best { id, ts }
+const tpSent   = new Map(); // key -> lastSentTs
+
+if (TP_BC) {
+  TP_BC.onmessage = function (ev) {
+    const m = ev.data || {};
+    if (m.op === 'claim') {
+      const cur = tpClaims.get(m.key);
+      if (!cur || m.ts < cur.ts || (m.ts === cur.ts && String(m.id) < String(cur.id))) {
+        tpClaims.set(m.key, { id: String(m.id), ts: m.ts });
+      }
+    } else if (m.op === 'sent') {
+      tpSent.set(m.key, m.ts);
+      setTimeout(function () { tpSent.delete(m.key); }, TP_WIN);
+    }
+  };
+}
+
+/** Koordiner send på tværs af faner: den fane der “vinder” claim, sender. */
+function claimAndSend(key, doSend) {
+  if (!TP_BC) { doSend(); return; } // fallback
+
+  // hvis en anden fane lige har sendt samme key, drop
+  var last = tpSent.get(key);
+  if (last && (Date.now() - last < TP_WIN)) { console.info('[TP][dedupe] Droppet (allerede sendt):', key); return; }
+
+  var ts = Date.now();
+  // registrér egen claim lokalt (nogle browsere fire ikke onmessage til afsenderen)
+  const mine = { id: String(TP_TAB), ts: ts };
+  const cur  = tpClaims.get(key);
+  if (!cur || ts < cur.ts || (ts === cur.ts && mine.id < cur.id)) tpClaims.set(key, mine);
+
+  // broadcast claim
+  TP_BC.postMessage({ op: 'claim', key: key, ts: ts, id: TP_TAB });
+
+  // afvent kort koordinationsvindue
+  setTimeout(function () {
+    var best = tpClaims.get(key);
+    var iWin = !best || best.id === String(TP_TAB); // jeg står som bedste claim
+    if (iWin) {
+      doSend();
+      var sentTs = Date.now();
+      tpSent.set(key, sentTs);
+      TP_BC.postMessage({ op: 'sent', key: key, ts: sentTs, id: TP_TAB });
+      setTimeout(function () { if (tpClaims.get(key)?.id === String(TP_TAB)) tpClaims.delete(key); }, 500);
+    } else {
+      console.info('[TP][dedupe] Tabte claim, sender ikke:', key, best);
+    }
+  }, 100); // 80–120 ms fungerer i praksis
+}
+
+/*──────────────────── 3) TOAST ────────────────────*/
 function showToastOnce(key, msg) {
   const lk = 'tpToastLock_' + key;
   const o  = JSON.parse(localStorage.getItem(lk) || '{"t":0}');
@@ -72,7 +127,7 @@ function showDOMToast(msg) {
   setTimeout(function () { el.style.opacity = 0; setTimeout(function () { el.remove(); }, 500); }, 4000);
 }
 
-/*──────────────────── 3. Pushover ────────────────────*/
+/*──────────────────── 4) Pushover (med cross-tab dedupe) ────────────────────*/
 function sendPushover(msg, channel) {
   if (!isPushEnabled(channel)) { console.info('[TP] Push blokeret (toggle OFF for', channel + ')'); return; }
   const user  = (GM_getValue('pushover_user', '') || '').trim();
@@ -80,19 +135,32 @@ function sendPushover(msg, channel) {
   if (!token) { showToastOnce('po_missing_token', 'ADMIN: ORG_PUSHOVER_TOKEN mangler i scriptet'); return; }
   if (!user)  { showToastOnce('po_missing_user', 'Pushover USER mangler – klik ⚙︎ og indsæt din USER key'); openTpSettings(); return; }
 
-  const body = 'token=' + encodeURIComponent(token) + '&user=' + encodeURIComponent(user) + '&message=' + encodeURIComponent(msg);
-  GM_xmlhttpRequest({
-    method: 'POST',
-    url: 'https://api.pushover.net/1/messages.json',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    data: body,
-    onerror: function () {
-      fetch('https://api.pushover.net/1/messages.json', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body }).catch(console.error);
-    }
+  // Unik nøgle for dedupe – kanal + besked
+  const key = 'push|' + channel + '|' + msg;
+
+  claimAndSend(key, function doSend() {
+    const body = 'token=' + encodeURIComponent(token) +
+                 '&user='  + encodeURIComponent(user)  +
+                 '&message=' + encodeURIComponent(msg);
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url: 'https://api.pushover.net/1/messages.json',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      data: body,
+      onload: function () { console.info('[TP][push] sendt:', channel); },
+      onerror: function () {
+        fetch('https://api.pushover.net/1/messages.json', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body
+        }).then(function(){ console.info('[TP][push] sendt via fetch fallback'); })
+          .catch(console.error);
+      }
+    });
   });
 }
 
-/*──────────────────── 4. BESKEDER ────────────────────*/
+/*──────────────────── 5) BESKEDER ────────────────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
 const stMsg = JSON.parse(localStorage.getItem('tpPushState') || '{"count":0,"lastPush":0,"lastSent":0}');
@@ -124,7 +192,7 @@ function pollMessages() {
     .catch(console.error);
 }
 
-/*──────────────────── 5. INTERESSE ────────────────────*/
+/*──────────────────── 6) INTERESSE ────────────────────*/
 const HTML_URL = location.origin + '/index.php?page=freevagter';
 let   lastETag = null;
 
@@ -162,7 +230,7 @@ function handleInterestCount(c) {
   stInt.count = c; saveInt();
 }
 
-/*──────────────────── 6. UI ────────────────────*/
+/*──────────────────── 7) UI ────────────────────*/
 function injectUI() {
   try {
     const d = document.createElement('div');
@@ -249,7 +317,7 @@ function openTpSettings() {
   };
 }
 
-/*──────────────────── 7. START ────────────────────*/
+/*──────────────────── 8) START ────────────────────*/
 document.addEventListener('click', function (e) {
   const a = e.target.closest && e.target.closest('a');
   if (a && /Beskeder/.test(a.textContent || '')) { stMsg.lastPush = stMsg.lastSent = 0; saveMsg(); }
@@ -259,7 +327,7 @@ setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 injectUI();
 
-/*──────────────────── 8. “Intet svar” – auto-udfyld + auto-gem (single-shot, no-blink Highslide) ────────────────────*/
+/*──────────────────── 9) “Intet svar” – auto-udfyld + auto-gem (single-shot, no-blink Highslide) ────────────────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
   var inFlight = false; // single-shot guard
@@ -269,7 +337,6 @@ injectUI();
     if (document.getElementById('tp-no-blink-style')) return;
     var st = document.createElement('style');
     st.id = 'tp-no-blink-style';
-    // Skjul KUN highslide-dialogen, der indeholder vores registrerings-form
     st.textContent = [
       'html.tp-intetsvar-opening .highslide-container:has(form[id^="registreropkaldvagtid_"]),',
       'html.tp-intetsvar-opening .highslide-wrapper:has(form[id^="registreropkaldvagtid_"]),',
@@ -284,7 +351,6 @@ injectUI();
   function stealthOn() {
     ensureNoBlinkCSS();
     document.documentElement.classList.add('tp-intetsvar-opening');
-    // slå evt. Highslide-animation fra midlertidigt
     try {
       var hs = (typeof unsafeWindow !== 'undefined') && unsafeWindow.hs;
       if (hs) {
@@ -292,7 +358,6 @@ injectUI();
         hs.expandDuration = 0; hs.restoreDuration = 0;
       }
     } catch (_) {}
-    // failsafe: sørg for at vi fjerner klassen igen uanset hvad
     clearTimeout(cleanupT);
     cleanupT = setTimeout(stealthOff, 3000);
   }
@@ -318,8 +383,8 @@ injectUI();
     btn.onclick = function () {
       if (inFlight) return;
       auto = true; inFlight = true;
-      stealthOn();                    // pre-hide dialogen + slå animation fra
-      if (icon) icon.click();         // åbner dialogen
+      stealthOn();
+      if (icon) icon.click(); // åbner dialogen
       hide();
     };
     menu.appendChild(btn);
@@ -367,17 +432,14 @@ injectUI();
     try {
       if (!inFlight) return;
 
-      // 1) Udfyld tekst
       var wanted = 'Intet svar';
       if (textarea.value.trim() !== wanted) { textarea.value = wanted; triggerInput(textarea); }
 
-      // 2) Find modal-root + knap
       var form = (textarea.closest && textarea.closest('form')) || document;
       var modalRoot = (textarea.closest && (textarea.closest('.highslide-body, .ui-dialog, .modal, .bootbox, .sweet-alert') || form)) || form;
       var btn = findGemKnap(modalRoot) || findGemKnap(document);
 
       var finish = function() {
-        // Færdig: luk dialog og ryd stealth/flags
         setTimeout(function(){
           closeDialog(modalRoot);
           stealthOff();
@@ -390,11 +452,9 @@ injectUI();
         return;
       }
 
-      // 3) Fallback: direkte kald
       var any = document.querySelector('input[type="button"][onclick*="RegistrerOpkald"]');
       if (any && callRegistrerOpkaldFrom(any.getAttribute('onclick'))) { finish(); return; }
 
-      // 4) Sidste udvej
       if (form && form !== document) { if (form.requestSubmit) form.requestSubmit(); else form.submit(); console.info('[TP][Intet svar] Submit form (fallback)'); }
       finish();
     } catch (e) {
@@ -425,3 +485,5 @@ injectUI();
   }).observe(document.body, { childList: true, subtree: true });
 })();
 
+/*──────────────────── Debug ────────────────────*/
+console.info('[TP] kører version', '6.52');
