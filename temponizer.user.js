@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      6.53
-// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun 20 kB HTML ved ændring (ESLint-clean). Inkl. testknap for Pushover.
+// @version      6.55
+// @description  Push ved nye beskeder og interesse, hover-menu “Intet Svar”. Interesse-poll bruger HEAD+ETag og henter kun 20 kB HTML ved ændring. Inkl. testknap for Pushover. APP-token er fastlåst af administrator. USER-token lagres i GM storage.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        unsafeWindow
 // @connect      api.pushover.net
 // @run-at       document-idle
@@ -12,14 +14,26 @@
 // @downloadURL  https://github.com/danieldamdk/temponizer-notifikation/raw/refs/heads/main/temponizer.user.js
 // ==/UserScript==
 
-/*──────────────────── 1. KONFIG ────────────────────*/
-// Fælles app-token (fast i scriptet) + modtager (gruppe/brugernøgle).
-const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
-const PUSHOVER_USER  = 'uPenUF7H43j6R8JxwAq1YYyHBn7ZFd'; // kan være gruppe-nøgle
+/*──────────────────── 1. KONFIG (APP-token er fastlåst) ────────────────────*/
+const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7'; // ADMIN-FASTLÅST
+const POLL_MS     = 30000;
+const SUPPRESS_MS = 45000;
+const LOCK_MS     = SUPPRESS_MS + 5000;
 
-const POLL_MS     = 30000;  // poll-interval for besked + interesse
-const SUPPRESS_MS = 45000;  // minimumstid mellem push på samme tæller
-const LOCK_MS     = SUPPRESS_MS + 5000; // låse-vindue så faner ikke dobbelt-sender
+/*──────────────────── 1a. MIGRATION til GM storage ────────────────────*/
+(function migrateUserKeyToGM(){
+  try {
+    const gm = (GM_getValue('tpUserKey') || '').trim();
+    if (!gm) {
+      const ls = (localStorage.getItem('tpUserKey') || '').trim();
+      if (ls) {
+        GM_setValue('tpUserKey', ls);
+        localStorage.removeItem('tpUserKey');
+        console.info('[TP][MIGRATE] Flyttede USER-token fra localStorage → GM storage');
+      }
+    }
+  } catch(_) {}
+})();
 
 /*──────────────────── 2. TOAST ────────────────────*/
 function showToastOnce(key, msg) {
@@ -55,9 +69,19 @@ function showDOMToast(msg) {
 }
 
 /*──────────────────── 3. PUSHOVER ────────────────────*/
+function getUserKey() {
+  try { return (GM_getValue('tpUserKey') || '').trim(); }
+  catch (_) { return ''; }
+}
 function sendPushover(msg) {
+  const userKey = getUserKey();
+  if (!PUSHOVER_TOKEN || !userKey) {
+    console.warn('[TP][PUSH][SKIP] mangler token/user', { hasApp: !!PUSHOVER_TOKEN, hasUser: !!userKey });
+    showToast('Pushover er ikke konfigureret (mangler USER-token). Åbn boksen og gem din USER-nøgle.');
+    return;
+  }
   const body = 'token=' + encodeURIComponent(PUSHOVER_TOKEN) +
-               '&user=' + encodeURIComponent(PUSHOVER_USER) +
+               '&user=' + encodeURIComponent(userKey) +
                '&message=' + encodeURIComponent(msg);
   GM_xmlhttpRequest({
     method: 'POST',
@@ -69,7 +93,6 @@ function sendPushover(msg) {
     },
     onerror: function (e) {
       console.warn('[TP][PUSH][ERR][GM]', e && e.error || e);
-      // fallback med fetch
       fetch('https://api.pushover.net/1/messages.json', {
         method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body
       })
@@ -82,25 +105,20 @@ function sendPushover(msg) {
 /*──────────────────── 4. BESKEDER ────────────────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
-
 const stMsg = JSON.parse(localStorage.getItem('tpPushState') || '{"count":0,"lastPush":0,"lastSent":0}');
 function saveMsg() { localStorage.setItem('tpPushState', JSON.stringify(stMsg)); }
-
 function takeLock() {
   const l = JSON.parse(localStorage.getItem('tpPushLock') || '{"t":0}');
   if (Date.now() - l.t < LOCK_MS) return false;
   localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() })); return true;
 }
-
 function pollMessages() {
   fetch(MSG_URL + '&ts=' + Date.now(), { credentials: 'same-origin' })
     .then(r => r.json())
     .then(d => {
       const n = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
       const en = localStorage.getItem('tpPushEnableMsg') === 'true';
-
       console.debug('[TP][DBG][MSG]', { n, stMsg, en });
-
       if (n > stMsg.count && n !== stMsg.lastSent) {
         const canPush = (Date.now() - stMsg.lastPush > SUPPRESS_MS) && takeLock();
         if (canPush) {
@@ -111,12 +129,11 @@ function pollMessages() {
           stMsg.lastPush = Date.now(); stMsg.lastSent = n;
         } else {
           console.info('[TP][SKIP][MSG]', 'suppression/lock', { dt: Date.now() - stMsg.lastPush });
-          stMsg.lastSent = n; // husk vi har set denne stigning
+          stMsg.lastSent = n;
         }
       } else if (n < stMsg.count) {
-        stMsg.lastPush = 0; // reset hvis tæller falder
+        stMsg.lastPush = 0;
       }
-
       stMsg.count = n; saveMsg();
       console.info('[TP-besked]', n, new Date().toLocaleTimeString());
     })
@@ -126,10 +143,8 @@ function pollMessages() {
 /*──────────────────── 5. INTERESSE (HEAD + ETag) ────────────────────*/
 const HTML_URL = location.origin + '/index.php?page=freevagter';
 let lastETag = localStorage.getItem('tpLastETag') || null;
-
 const stInt = JSON.parse(localStorage.getItem('tpInterestState') || '{"count":0,"lastPush":0,"lastSent":0}');
 function saveInt() { localStorage.setItem('tpInterestState', JSON.stringify(stInt)); }
-
 function pollInterest() {
   fetch(HTML_URL, {
     method: 'HEAD',
@@ -137,40 +152,24 @@ function pollInterest() {
     headers: lastETag ? { 'If-None-Match': lastETag } : {}
   })
     .then(function (h) {
-      if (h.status === 304) {
-        console.info('[TP-interesse] uændret', new Date().toLocaleTimeString());
-        return;
-      }
+      if (h.status === 304) { console.info('[TP-interesse] uændret', new Date().toLocaleTimeString()); return; }
       lastETag = h.headers.get('ETag') || null;
       if (lastETag) localStorage.setItem('tpLastETag', lastETag);
-
-      return fetch(HTML_URL, {
-        credentials: 'same-origin',
-        headers: { Range: 'bytes=0-20000' } // første 20 kB
-      })
-        .then(r => r.text())
-        .then(parseInterestHTML);
+      return fetch(HTML_URL, { credentials: 'same-origin', headers: { Range: 'bytes=0-20000' } })
+        .then(r => r.text()).then(parseInterestHTML);
     })
     .catch(e => console.warn('[TP][ERR][INT][HEAD]', e));
 }
-
 function parseInterestHTML(html) {
   const doc   = new DOMParser().parseFromString(html, 'text/html');
-  const boxes = Array.prototype.slice.call(
-    doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]')
-  );
-  const c = boxes.reduce((s, el) => {
-    const v = parseInt(el.textContent.trim(), 10);
-    return s + (isNaN(v) ? 0 : v);
-  }, 0);
+  const boxes = Array.prototype.slice.call(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
+  const c = boxes.reduce((s, el) => { const v = parseInt(el.textContent.trim(), 10); return s + (isNaN(v) ? 0 : v); }, 0);
   handleInterestCount(c);
   console.info('[TP-interesse]', c, new Date().toLocaleTimeString());
 }
-
 function handleInterestCount(c) {
   const en = localStorage.getItem('tpPushEnableInt') === 'true';
   console.debug('[TP][DBG][INT]', { c, stInt, en });
-
   if (c > stInt.count && c !== stInt.lastSent) {
     if (Date.now() - stInt.lastPush > SUPPRESS_MS && takeLock()) {
       const m = '👀 ' + c + ' vikar(er) har vist interesse for ledige vagter';
@@ -185,32 +184,56 @@ function handleInterestCount(c) {
   } else if (c < stInt.count) {
     stInt.lastPush = 0;
   }
-
   stInt.count = c; saveInt();
 }
 
-/*──────────────────── 6. UI (gear + on/off) ────────────────────*/
+/*──────────────────── 6. UI (panel + gear + test) ────────────────────*/
 function injectUI() {
-  // wrapper (panel) – eksisterende toggle-boks
   const d = document.createElement('div');
   d.id = 'tpPanel';
-  d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:2147483645;background:#f9f9f9;border:1px solid #ccc;padding:6px 10px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2)';
-  d.innerHTML = '<b>TP Notifikationer</b><br><label><input type="checkbox" id="m"> Besked (Pushover)</label><br><label><input type="checkbox" id="i"> Interesse (Pushover)</label>';
+  d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:2147483645;background:#f9f9f9;border:1px solid #ccc;padding:8px 10px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2);min-width:260px';
+  d.innerHTML =
+    '<b>TP Notifikationer</b>' +
+    '<div style="margin-top:6px">' +
+      '<label style="display:block;margin:2px 0"><input type="checkbox" id="m"> Besked (Pushover)</label>' +
+      '<label style="display:block;margin:2px 0"><input type="checkbox" id="i"> Interesse (Pushover)</label>' +
+    '</div>' +
+    '<div style="margin-top:6px">' +
+      '<div style="font-weight:600;margin-bottom:2px">Pushover USER-token</div>' +
+      '<input id="tpUserKey" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid #ccc;border-radius:4px">' +
+      '<div style="margin-top:4px;display:flex;gap:6px;align-items:center">' +
+        '<button id="tpSaveUserKey" style="padding:4px 8px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer">Gem</button>' +
+        '<a href="https://pushover.net/" target="_blank" rel="noopener" style="color:#06c;text-decoration:none">Sådan finder du USER-token</a>' +
+      '</div>' +
+    '</div>';
   document.body.appendChild(d);
 
-  var m = document.getElementById('m'); var i = document.getElementById('i');
+  // toggles (beholdt i localStorage)
+  var m = d.querySelector('#m'), i = d.querySelector('#i');
   m.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
   i.checked = localStorage.getItem('tpPushEnableInt') === 'true';
   m.onchange = function () { localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false'); };
   i.onchange = function () { localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false'); };
 
-  // tandhjul – lille, diskret, altid fuldt synligt
+  // USER-token felt (GM storage)
+  const userInp = d.querySelector('#tpUserKey');
+  const saveBtn = d.querySelector('#tpSaveUserKey');
+  userInp.value = getUserKey();
+  function saveUserKey() {
+    const v = (userInp.value || '').trim();
+    GM_setValue('tpUserKey', v);
+    showToast('Pushover USER-token gemt.');
+  }
+  saveBtn.addEventListener('click', saveUserKey);
+  userInp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); saveUserKey(); } });
+
+  // tandhjul
   const gear = document.createElement('div');
   gear.id = 'tpGear';
   gear.setAttribute('title', 'Indstillinger');
   gear.innerHTML = '⚙️';
   Object.assign(gear.style, {
-    position:'fixed', right:'12px', bottom: (8 + d.offsetHeight + 8) + 'px',
+    position:'fixed', right:'12px', bottom: (8 + d.offsetHeight + 10) + 'px',
     width:'22px', height:'22px', lineHeight:'22px', textAlign:'center',
     background:'#fff', border:'1px solid #ccc', borderRadius:'50%',
     boxShadow:'0 1px 5px rgba(0,0,0,.2)', cursor:'pointer',
@@ -244,9 +267,8 @@ function injectUI() {
     if (menu && e.target !== menu && !menu.contains(e.target) && e.target !== gear) menu.style.display = 'none';
   });
 
-  console.debug('[TP][DBG] ui init', {panel: !!d, gear: !!gear});
+  console.debug('[TP][DBG] ui init', { panel: !!d, gear: !!gear });
 }
-
 function ensureFullyVisible(el){
   const r = el.getBoundingClientRect();
   let dx = 0, dy = 0;
@@ -254,13 +276,9 @@ function ensureFullyVisible(el){
   if (r.bottom > window.innerHeight) dy = window.innerHeight - r.bottom - 6;
   if (r.left < 0) dx = 6 - r.left;
   if (r.top < 0) dy = 6 - r.top;
-  if (dx || dy) {
-    el.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
-  }
+  if (dx || dy) el.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
 }
-
 function tpAddMenuItems(menuEl) {
-  // standard menu items (kan udvides)
   function addItem(txt, onclick){
     var item = document.createElement('div');
     item.textContent = txt;
@@ -270,12 +288,8 @@ function tpAddMenuItems(menuEl) {
     item.onclick = function(){ onclick(); menuEl.style.display = 'none'; };
     menuEl.appendChild(item);
   }
-
   addItem('🧪 Test Pushover (Besked + Interesse)', tpTestPushoverBoth);
-  // evt. flere menupunkter kan tilføjes her…
 }
-
-// Test-knap: sender to Pushover-tests (ignorerer toggles)
 function tpTestPushoverBoth(){
   const ts = new Date().toLocaleTimeString();
   const m1 = '🧪 [TEST] Besked-kanal OK — ' + ts;
@@ -298,13 +312,11 @@ pollMessages(); pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 injectUI();
+console.info('[TP] kører version 6.55');
 
-console.info('[TP] kører version 6.53');
-
-/*──────────────────── 8. HOVER “Intet Svar” (én knap, auto-gem) ────────────────────*/
+/*──────────────────── 8. HOVER “Intet Svar” (auto-gem) ────────────────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
-
   function mkMenu() {
     if (menu) return menu;
     menu = document.createElement('div');
@@ -329,21 +341,16 @@ console.info('[TP] kører version 6.53');
     if (!overM && !overI) hide();
   }, true);
 
-  // Auto-udfyld + auto-gem + “ingen blink”
   new MutationObserver(function (ml) {
     if (!auto) return;
     ml.forEach(function (m) {
       m.addedNodes.forEach(function (n) {
         if (!(n instanceof HTMLElement)) return;
-
-        // skjul popup midlertidigt (ingen blink)
         const hsWrap = n.closest && n.closest('.highslide-body, .highslide-container');
         if (hsWrap) { hsWrap.style.opacity = '0'; hsWrap.style.pointerEvents = 'none'; }
-
         var ta = (n.matches && n.matches('textarea[name="phonetext"]')) ? n : (n.querySelector && n.querySelector('textarea[name="phonetext"]'));
         if (ta) {
           if (!ta.value.trim()) ta.value = 'Intet Svar';
-          // find “Gem registrering”-knappen i samme form
           var frm = ta.closest('form');
           var saveBtn = frm && Array.prototype.find.call(frm.querySelectorAll('input[type="button"]'), function (b) {
             return /Gem registrering/i.test(b.value || '');
@@ -351,9 +358,7 @@ console.info('[TP] kører version 6.53');
           if (saveBtn) {
             setTimeout(function () {
               try { saveBtn.click(); } catch (_) {}
-              // luk popup (highslide)
               try { if (unsafeWindow.hs && unsafeWindow.hs.close) unsafeWindow.hs.close(); } catch (_) {}
-              // genskab visning
               if (hsWrap) { hsWrap.style.opacity = ''; hsWrap.style.pointerEvents = ''; }
             }, 30);
           }
