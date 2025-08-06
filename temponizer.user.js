@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      6.59
-// @description  6.57-stil + telefonbog (caller-pop) + GitHub-synk af CSV. Push ved nye beskeder/interesse (leader på tværs af faner), hover-menu “Intet Svar” (auto), ETag-optimering. APP-token fastlåst. USER-token i GM storage. Testknapper i ⚙️.
+// @version      6.60
+// @description  Push (leader på tværs af faner), hover “Intet Svar”, ETag-optimering. Telefonbog: caller-pop fra RAW CSV + GitHub-synk. NYT: ⚡ Hent Excel direkte fra server og upload som vikarer.xlsx (hurtigst/komplet). APP-token fastlåst, USER-token i GM storage.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -11,9 +11,10 @@
 // @connect      api.pushover.net
 // @connect      raw.githubusercontent.com
 // @connect      api.github.com
+// @connect      ajourcare.temponizer.dk
 // @run-at       document-idle
-// @updateURL    https://github.com/danieldamdk/temponizer-notifikation/raw/refs/heads/main/temponizer.user.js
-// @downloadURL  https://github.com/danieldamdk/temponizer-notifikation/raw/refs/heads/main/temponizer.user.js
+// @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
+// @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // ==/UserScript==
 
 /*──────── 1) KONFIG ────────*/
@@ -22,18 +23,19 @@ const POLL_MS     = 30000;
 const SUPPRESS_MS = 45000;
 const LOCK_MS     = SUPPRESS_MS + 5000;
 
-// Cross-tab leader (én fane styrer push)
+// Cross-tab leader
 const LEADER_KEY = 'tpLeaderV1';
 const HEARTBEAT_MS = 5000;
 const LEASE_MS     = 15000;
 const TAB_ID = (crypto && crypto.randomUUID ? crypto.randomUUID() : ('tab-' + Math.random().toString(36).slice(2) + Date.now()));
 
-// Telefonbog (central CSV i dit repo)
+// Telefonbog (central i GitHub)
 const PB_OWNER  = 'danieldamdk';
 const PB_REPO   = 'temponizer-notifikation';
 const PB_BRANCH = 'main';
-const PB_PATH   = 'vikarer.csv';
-const RAW_PHONEBOOK = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_PATH}`;
+const PB_CSV    = 'vikarer.csv';
+const PB_XLSX   = 'vikarer.xlsx';
+const RAW_PHONEBOOK = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_CSV}`;
 
 /*──────── 1a) MIGRATION til GM storage ────────*/
 (function migrateUserKeyToGM(){
@@ -41,11 +43,7 @@ const RAW_PHONEBOOK = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/
     const gm = (GM_getValue('tpUserKey') || '').trim();
     if (!gm) {
       const ls = (localStorage.getItem('tpUserKey') || '').trim();
-      if (ls) {
-        GM_setValue('tpUserKey', ls);
-        localStorage.removeItem('tpUserKey');
-        console.info('[TP][MIGRATE] USER-token localStorage → GM storage');
-      }
+      if (ls) { GM_setValue('tpUserKey', ls); localStorage.removeItem('tpUserKey'); }
     }
   } catch(_) {}
 })();
@@ -60,12 +58,9 @@ function showToastOnce(key, msg) {
 }
 function showToast(msg) {
   if (Notification.permission === 'granted') {
-    try { new Notification('Temponizer', { body: msg }); }
-    catch (_) { showDOMToast(msg); }
+    try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
   } else if (Notification.permission !== 'denied') {
-    Notification.requestPermission().then(function (p) {
-      p === 'granted' ? new Notification('Temponizer', { body: msg }) : showDOMToast(msg);
-    });
+    Notification.requestPermission().then(p => { p === 'granted' ? new Notification('Temponizer', { body: msg }) : showDOMToast(msg); });
   } else showDOMToast(msg);
 }
 function showDOMToast(msg) {
@@ -79,65 +74,42 @@ function showDOMToast(msg) {
     opacity: 0, transition: 'opacity .4s'
   });
   document.body.appendChild(el);
-  requestAnimationFrame(function () { el.style.opacity = 1; });
-  setTimeout(function () { el.style.opacity = 0; setTimeout(function () { el.remove(); }, 500); }, 4000);
+  requestAnimationFrame(() => { el.style.opacity = 1; });
+  setTimeout(() => { el.style.opacity = 0; setTimeout(() => { el.remove(); }, 500); }, 4000);
 }
 
 /*──────── 3) PUSHOVER ────────*/
-function getUserKey() {
-  try { return (GM_getValue('tpUserKey') || '').trim(); }
-  catch (_) { return ''; }
-}
+function getUserKey() { try { return (GM_getValue('tpUserKey') || '').trim(); } catch (_) { return ''; } }
 function sendPushover(msg) {
   const userKey = getUserKey();
-  if (!PUSHOVER_TOKEN || !userKey) {
-    console.warn('[TP][PUSH][SKIP] mangler token/user', { hasApp: !!PUSHOVER_TOKEN, hasUser: !!userKey });
-    showToast('Pushover er ikke konfigureret (mangler USER-token). Klik på ⚙️ og gem din USER-nøgle.');
-    return;
-  }
-  const body = 'token=' + encodeURIComponent(PUSHOVER_TOKEN) +
-               '&user=' + encodeURIComponent(userKey) +
-               '&message=' + encodeURIComponent(msg);
+  if (!PUSHOVER_TOKEN || !userKey) { showToast('Pushover ikke konfigureret – indsæt USER-token i ⚙️.'); return; }
+  const body = 'token=' + encodeURIComponent(PUSHOVER_TOKEN) + '&user=' + encodeURIComponent(userKey) + '&message=' + encodeURIComponent(msg);
   GM_xmlhttpRequest({
     method: 'POST',
     url: 'https://api.pushover.net/1/messages.json',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     data: body,
-    onload: function (r) {
-      try { console.info('[TP][PUSH][OK]', r.status, (r.responseText||'').slice(0,120)); } catch (_) {}
-    },
-    onerror: function (e) {
-      console.warn('[TP][PUSH][ERR][GM]', e && e.error || e);
-      fetch('https://api.pushover.net/1/messages.json', {
-        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body
-      })
-      .then(r => r.text().then(t => console.info('[TP][PUSH][OK][fetch]', r.status, t.slice(0,120))))
-      .catch(err => console.warn('[TP][PUSH][ERR][fetch]', err));
+    onerror: () => {
+      fetch('https://api.pushover.net/1/messages.json', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body })
+        .catch(console.warn);
     }
   });
 }
 
-/*──────── 4) FÆLLES STATE + LOCK ────────*/
+/*──────── 4) STATE + LOCK ────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
 const ST_MSG_KEY = 'tpPushState';        // {count,lastPush,lastSent}
 const ST_INT_KEY = 'tpInterestState';    // {count,lastPush,lastSent}
-
-function loadJson(key, fallback) {
-  try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); }
-  catch (_) { return JSON.parse(JSON.stringify(fallback)); }
-}
-function saveJsonIfLeader(key, obj) {
-  if (!isLeader()) return;
-  localStorage.setItem(key, JSON.stringify(obj));
-}
+function loadJson(key, fallback) { try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch (_) { return JSON.parse(JSON.stringify(fallback)); } }
+function saveJsonIfLeader(key, obj) { if (isLeader()) localStorage.setItem(key, JSON.stringify(obj)); }
 function takeLock() {
   const l = JSON.parse(localStorage.getItem('tpPushLock') || '{"t":0}');
   if (Date.now() - l.t < LOCK_MS) return false;
   localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() })); return true;
 }
 
-/*──────── 5) POLLERS (kun leder agerer) ────────*/
+/*──────── 5) POLLERS ────────*/
 function pollMessages() {
   if (!isLeader()) return;
   fetch(MSG_URL + '&ts=' + Date.now(), { credentials: 'same-origin' })
@@ -146,21 +118,15 @@ function pollMessages() {
       const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
       const n  = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
       const en = localStorage.getItem('tpPushEnableMsg') === 'true';
-
       if (n > stMsg.count && n !== stMsg.lastSent) {
         const canPush = (Date.now() - stMsg.lastPush > SUPPRESS_MS) && takeLock();
         if (canPush) {
           const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
-          if (en) sendPushover(m);
-          showToastOnce('msg', m);
+          if (en) sendPushover(m); showToastOnce('msg', m);
           stMsg.lastPush = Date.now(); stMsg.lastSent = n;
-        } else {
-          stMsg.lastSent = n;
-        }
+        } else stMsg.lastSent = n;
       } else if (n < stMsg.count) { stMsg.lastPush = 0; }
-
-      stMsg.count = n;
-      saveJsonIfLeader(ST_MSG_KEY, stMsg);
+      stMsg.count = n; saveJsonIfLeader(ST_MSG_KEY, stMsg);
       console.info('[TP-besked]', n, new Date().toLocaleTimeString());
     })
     .catch(e => console.warn('[TP][ERR][MSG]', e));
@@ -172,72 +138,46 @@ let lastETag = localStorage.getItem('tpLastETag') || null;
 function pollInterest() {
   if (!isLeader()) return;
   fetch(HTML_URL, {
-    method: 'HEAD',
-    credentials: 'same-origin',
+    method: 'HEAD', credentials: 'same-origin',
     headers: lastETag ? { 'If-None-Match': lastETag } : {}
   })
-    .then(function (h) {
-      if (h.status === 304) { console.info('[TP-interesse] uændret', new Date().toLocaleTimeString()); return; }
-      lastETag = h.headers.get('ETag') || null;
-      if (lastETag) localStorage.setItem('tpLastETag', lastETag);
-      return fetch(HTML_URL, { credentials: 'same-origin', headers: { Range: 'bytes=0-20000' } })
-        .then(r => r.text()).then(parseInterestHTML);
-    })
-    .catch(e => console.warn('[TP][ERR][INT][HEAD]', e));
+  .then(h => {
+    if (h.status === 304) { console.info('[TP-interesse] uændret', new Date().toLocaleTimeString()); return; }
+    lastETag = h.headers.get('ETag') || null;
+    if (lastETag) localStorage.setItem('tpLastETag', lastETag);
+    return fetch(HTML_URL, { credentials: 'same-origin', headers: { Range: 'bytes=0-20000' } })
+      .then(r => r.text()).then(parseInterestHTML);
+  })
+  .catch(e => console.warn('[TP][ERR][INT][HEAD]', e));
 }
-
 function parseInterestHTML(html) {
   if (!isLeader()) return;
   const doc   = new DOMParser().parseFromString(html, 'text/html');
   const boxes = Array.prototype.slice.call(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
   const c = boxes.reduce((s, el) => { const v = parseInt(el.textContent.trim(), 10); return s + (isNaN(v) ? 0 : v); }, 0);
-
   const stInt = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0});
   const en = localStorage.getItem('tpPushEnableInt') === 'true';
-
   if (c > stInt.count && c !== stInt.lastSent) {
     if (Date.now() - stInt.lastPush > SUPPRESS_MS && takeLock()) {
       const m = '👀 ' + c + ' vikar(er) har vist interesse for ledige vagter';
-      if (en) sendPushover(m);
-      showToastOnce('int', m);
+      if (en) sendPushover(m); showToastOnce('int', m);
       stInt.lastPush = Date.now(); stInt.lastSent = c;
-    } else { stInt.lastSent = c; }
-  } else if (c < stInt.count) { stInt.lastPush = 0; }
-
+    } else stInt.lastSent = c;
+  } else if (c < stInt.count) stInt.lastPush = 0;
   stInt.count = c; saveJsonIfLeader(ST_INT_KEY, stInt);
   console.info('[TP-interesse]', c, new Date().toLocaleTimeString());
 }
 
 /*──────── 6) LEADER-ELECTION ────────*/
 function now() { return Date.now(); }
-function getLeader() {
-  try { return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null'); }
-  catch (_) { return null; }
-}
+function getLeader() { try { return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null'); } catch (_) { return null; } }
 function setLeader(obj) { localStorage.setItem(LEADER_KEY, JSON.stringify(obj)); }
+function isLeader() { const L = getLeader(); return !!(L && L.id === TAB_ID && L.until > now()); }
+function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.until || 0) <= t) { setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); if (isLeader()) console.info('[TP][LEADER] Denne fane er nu leder:', TAB_ID);} }
+function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
+window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*noop*/} });
 
-function isLeader() {
-  const L = getLeader();
-  return !!(L && L.id === TAB_ID && L.until > now());
-}
-function tryBecomeLeader() {
-  const L = getLeader();
-  const t = now();
-  if (!L || (L.until || 0) <= t) {
-    setLeader({ id: TAB_ID, until: t + LEASE_MS, ts: t });
-    if (isLeader()) console.info('[TP][LEADER] Denne fane er nu leder:', TAB_ID);
-  }
-}
-function heartbeatIfLeader() {
-  if (!isLeader()) return;
-  const t = now();
-  setLeader({ id: TAB_ID, until: t + LEASE_MS, ts: t });
-}
-window.addEventListener('storage', function (e) {
-  if (e.key === LEADER_KEY) { /* optional debug */ }
-});
-
-/*──────── 6b) CALLER-POP (central telefonbog) ────────*/
+/*──────── 6b) CALLER-POP (CSV → vikar_id) ────────*/
 function normPhone(raw) {
   const digits = String(raw||'').replace(/\D/g,'').replace(/^0+/, '').replace(/^45/, '');
   return digits.length >= 8 ? digits.slice(-8) : '';
@@ -251,62 +191,47 @@ function gmGET(url) {
     });
   });
 }
-// tolerant CSV-parser (dansk/engelsk kolonnenavne)
+// CSV (dansk/engelsk headere)
 function parsePhonebookCSV(text) {
   const map = new Map();
   if (!text) return map;
   const lines = text.split(/\r?\n/).filter(Boolean);
   if (!lines.length) return map;
-
   const header = lines.shift().split(',').map(h => h.trim().toLowerCase());
   const idxId = header.findIndex(h => /^(vikar[_ ]?id|id)$/.test(h));
   const idxPh = header.findIndex(h => /^(phone|telefon|mobil|cellphone|mobile)$/.test(h));
   if (idxId < 0 || idxPh < 0) return map;
-
   for (const ln of lines) {
     const cols = ln.split(',').map(c => c.trim());
-    const id = cols[idxId] || '';
-    const ph = cols[idxPh] || '';
-    if (id && ph) {
-      const p8 = normPhone(ph);
-      if (p8) map.set(p8, id);
-    }
+    const id = cols[idxId] || ''; const ph = cols[idxPh] || '';
+    if (id && ph) { const p8 = normPhone(ph); if (p8) map.set(p8, id); }
   }
   return map;
 }
 async function callerPopIfNeeded() {
   try {
     const q = new URLSearchParams(location.search);
-    const raw = q.get('tp_caller');
-    if (!raw) return;
-
+    const raw = q.get('tp_caller'); if (!raw) return;
     const cleaned = String(raw).replace(/\*1500$/, '');
     const phone8 = normPhone(cleaned);
     if (!phone8) { showToast('Ukendt nummer: ' + raw); return; }
-
     const csv = await gmGET(RAW_PHONEBOOK);
     const map = parsePhonebookCSV(csv);
     const id = map.get(phone8);
     if (!id) { showToast('Ukendt nummer: ' + phone8); return; }
-
     const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(id)}#stamoplysninger`;
-    showToast('Åbner vikar …');
-    location.assign(url);
-  } catch (e) {
-    console.warn('[TP][CALLER]', e);
-    showToast('Kan ikke hente telefonbog lige nu.');
-  }
+    showToast('Åbner vikar …'); location.assign(url);
+  } catch (e) { console.warn('[TP][CALLER]', e); showToast('Kan ikke hente telefonbog lige nu.'); }
 }
 
-/*──────── 6c) GITHUB API (upload CSV) ────────*/
-// Base64 UTF-8
+/*──────── 6c) GITHUB API (upload) ────────*/
 function b64encodeUtf8(str) {
   const bytes = new TextEncoder().encode(str);
-  let bin = '';
-  bytes.forEach(b=>bin += String.fromCharCode(b));
-  return btoa(bin);
+  let bin=''; bytes.forEach(b=>bin+=String.fromCharCode(b)); return btoa(bin);
 }
-// GET file sha (returns {sha, exists})
+function b64encodeBytes(u8) {
+  let bin=''; for (let i=0;i<u8.length;i++) bin+=String.fromCharCode(u8[i]); return btoa(bin);
+}
 function ghGetSha(owner, repo, path, ref) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`;
   const token = (GM_getValue('tpGitPAT') || '').trim();
@@ -319,19 +244,14 @@ function ghGetSha(owner, repo, path, ref) {
         'X-GitHub-Api-Version': '2022-11-28'
       },
       onload: r => {
-        if (r.status === 200) {
-          try { const js = JSON.parse(r.responseText); resolve({ sha: js.sha, exists: true }); } catch(e){ resolve({ sha:null, exists:true }); }
-        } else if (r.status === 404) {
-          resolve({ sha: null, exists: false });
-        } else {
-          reject(new Error('GitHub GET sha: HTTP '+r.status));
-        }
+        if (r.status === 200) { try { const js = JSON.parse(r.responseText); resolve({ sha: js.sha, exists: true }); } catch(_) { resolve({ sha:null, exists:true }); } }
+        else if (r.status === 404) resolve({ sha:null, exists:false });
+        else reject(new Error('GitHub GET sha: HTTP '+r.status));
       },
       onerror: e => reject(e)
     });
   });
 }
-// PUT file (create/update)
 function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`;
   const token = (GM_getValue('tpGitPAT') || '').trim();
@@ -344,25 +264,36 @@ function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
         'X-GitHub-Api-Version': '2022-11-28',
         'Content-Type': 'application/json;charset=UTF-8'
       },
-      data: JSON.stringify({
-        message,
-        content: base64Content,
-        branch,
-        ...(sha ? { sha } : {})
-      }),
-      onload: r => {
-        if (r.status === 201 || r.status === 200) {
-          resolve(r.responseText);
-        } else {
-          reject(new Error('GitHub PUT: HTTP '+r.status+' '+(r.responseText||'')));
-        }
-      },
+      data: JSON.stringify({ message, content: base64Content, branch, ...(sha ? { sha } : {}) }),
+      onload: r => { (r.status===200 || r.status===201) ? resolve(r.responseText) : reject(new Error('GitHub PUT: HTTP '+r.status+' '+(r.responseText||''))); },
       onerror: e => reject(e)
     });
   });
 }
 
-/*──────── 7) UI (panel m. toggles + gear; gear-menu med token+test+telefonbog) ────────*/
+/*──────── 6d) SERVER-EXCEL (hurtigste komplette synk) ────────*/
+// Henter den officielle Excel-eksport (inkl. vikar_id, navn, telefon, mobil)
+function gmGETArrayBuffer(url) {
+  return new Promise((resolve, reject) => {
+    GM_xmlhttpRequest({
+      method: 'GET', url, responseType: 'arraybuffer',
+      onload: r => (r.status>=200 && r.status<300) ? resolve(r.response) : reject(new Error('HTTP '+r.status)),
+      onerror: e => reject(e)
+    });
+  });
+}
+async function fetchExcelAndUpload() {
+  // Endpoint: printvikarcustom('excel') åbner denne URL
+  const excelUrl = `${location.origin}/index.php?page=print_vikar_list_custom_excel&id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag&sortBy=`;
+  const ab = await gmGETArrayBuffer(excelUrl);
+  const u8 = new Uint8Array(ab);
+  const b64 = b64encodeBytes(u8);
+  const { sha } = await ghGetSha(PB_OWNER, PB_REPO, PB_XLSX, PB_BRANCH);
+  const msg = 'sync: fetch server Excel → ' + PB_XLSX + ' via TM';
+  await ghPutFile(PB_OWNER, PB_REPO, PB_XLSX, b64, msg, sha, PB_BRANCH);
+}
+
+/*──────── 7) UI (panel + gear) ────────*/
 function injectUI() {
   const d = document.createElement('div');
   d.id = 'tpPanel';
@@ -375,17 +306,15 @@ function injectUI() {
     '</div>';
   document.body.appendChild(d);
 
-  var m = d.querySelector('#m'), i = d.querySelector('#i');
+  const m = d.querySelector('#m'), i = d.querySelector('#i');
   m.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
   i.checked = localStorage.getItem('tpPushEnableInt') === 'true';
-  m.onchange = function () { localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false'); };
-  i.onchange = function () { localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false'); };
+  m.onchange = () => localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false');
+  i.onchange = () => localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false');
 
   // Tandhjul
   const gear = document.createElement('div');
-  gear.id = 'tpGear';
-  gear.setAttribute('title', 'Indstillinger');
-  gear.innerHTML = '⚙️';
+  gear.id = 'tpGear'; gear.title = 'Indstillinger'; gear.innerHTML = '⚙️';
   Object.assign(gear.style, {
     position:'fixed', right:'12px', bottom: (8 + d.offsetHeight + 10) + 'px',
     width:'22px', height:'22px', lineHeight:'22px', textAlign:'center',
@@ -404,17 +333,16 @@ function injectUI() {
     Object.assign(menu.style, {
       position:'fixed', zIndex:2147483647, background:'#fff', border:'1px solid #ccc',
       borderRadius:'8px', boxShadow:'0 2px 12px rgba(0,0,0,.25)', fontSize:'12px',
-      fontFamily:'sans-serif', padding:'10px', width:'320px'
+      fontFamily:'sans-serif', padding:'10px', width:'340px'
     });
     menu.innerHTML =
       '<div style="font-weight:700;margin-bottom:6px">Indstillinger</div>' +
       '<div style="margin-bottom:10px">' +
         '<div style="font-weight:600;margin-bottom:4px">Pushover USER-token</div>' +
-        '<input id="tpUserKeyMenu" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" ' +
-          'style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
+        '<input id="tpUserKeyMenu" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
         '<div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
           '<button id="tpSaveUserKeyMenu" style="padding:4px 8px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer">Gem</button>' +
-          '<a href="https://pushover.net/" target="_blank" rel="noopener" style="color:#06c;text-decoration:none">Sådan finder du USER-token</a>' +
+          '<a href="https://pushover.net/" target="_blank" rel="noopener" style="color:#06c;text-decoration:none">Guide til USER-token</a>' +
         '</div>' +
       '</div>' +
       '<div style="border-top:1px solid #eee;margin:8px 0"></div>' +
@@ -422,91 +350,102 @@ function injectUI() {
       '<div id="tpLeaderHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
       '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
       '<div style="font-weight:700;margin-bottom:6px">Telefonbog (admin)</div>' +
-      '<div style="margin-bottom:6px;font-size:12px;color:#444">Repo: '+PB_OWNER+'/'+PB_REPO+' • Branch: '+PB_BRANCH+' • Fil: '+PB_PATH+'</div>' +
+      '<div style="margin-bottom:6px;font-size:12px;color:#444">Repo: '+PB_OWNER+'/'+PB_REPO+' • Branch: '+PB_BRANCH+' • Filer: '+PB_CSV+' / '+PB_XLSX+'</div>' +
       '<div style="margin-bottom:6px">' +
-        '<div style="font-weight:600;margin-bottom:4px">GitHub PAT (fine-grained, kun dette repo)</div>' +
-        '<input id="tpGitPAT" type="password" placeholder="ghp_… eller fine-grained" ' +
-          'style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
+        '<div style="font-weight:600;margin-bottom:4px">GitHub PAT (fine-grained, kun dette repo • Contents: RW)</div>' +
+        '<input id="tpGitPAT" type="password" placeholder="ghp_… eller fine-grained" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
         '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">' +
           '<input id="tpCSVFile" type="file" accept=".csv" style="flex:1"/>' +
-          '<button id="tpUploadCSV" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Upload til GitHub</button>' +
+          '<button id="tpUploadCSV" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Upload CSV → GitHub</button>' +
         '</div>' +
-        '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
-          '<input id="tpTestPhone" type="text" placeholder="Test nummer (fx 22 44 66 88)" ' +
-            'style="flex:1;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
-          '<button id="tpLookupPhone" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Slå op</button>' +
+        '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
+          '<button id="tpFetchExcelUpload" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">⚡ Hent Excel fra server + Upload</button>' +
+          '<button id="tpScrapeUpload" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">📥 Generér fra siden + Upload (CSV)</button>' +
+        '</div>' +
+        '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
+          '<input id="tpTestPhone" type="text" placeholder="Test nummer (fx 22 44 66 88)" style="flex:1;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
+          '<button id="tpLookupPhone" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Slå op i CSV</button>' +
         '</div>' +
         '<div id="tpPBHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
       '</div>';
     document.body.appendChild(menu);
 
-    // Pushover-del
+    // Pushover
     const inp  = menu.querySelector('#tpUserKeyMenu');
     const save = menu.querySelector('#tpSaveUserKeyMenu');
     const test = menu.querySelector('#tpTestPushoverBtn');
     const hint = menu.querySelector('#tpLeaderHint');
-
-    function refreshLeaderHint(){ hint.textContent = (isLeader() ? 'Denne fane er LEADER for push.' : 'Denne fane er ikke leader. En anden fane sender push.'); }
-    refreshLeaderHint();
     inp.value = getUserKey();
-    function saveUserKey() { const v = (inp.value || '').trim(); GM_setValue('tpUserKey', v); showToast('Pushover USER-token gemt.'); }
-    save.addEventListener('click', saveUserKey);
-    inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); saveUserKey(); } });
-    test.addEventListener('click', function () { tpTestPushoverBoth(); menu.style.display = 'none'; });
-    window.addEventListener('storage', function (e) { if (e.key === LEADER_KEY) refreshLeaderHint(); });
+    function refreshLeaderHint(){ hint.textContent = (isLeader() ? 'Denne fane er LEADER for push.' : 'Ikke leader – en anden fane sender push.'); }
+    refreshLeaderHint();
+    save.addEventListener('click', () => { GM_setValue('tpUserKey', (inp.value||'').trim()); showToast('USER-token gemt.'); });
+    inp.addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); GM_setValue('tpUserKey',(inp.value||'').trim()); showToast('USER-token gemt.'); }});
+    test.addEventListener('click', () => { tpTestPushoverBoth(); menu.style.display='none'; });
+    window.addEventListener('storage', e => { if (e.key===LEADER_KEY) refreshLeaderHint(); });
 
-    // Telefonbog-del
+    // Telefonbog
     const pat  = menu.querySelector('#tpGitPAT');
     const file = menu.querySelector('#tpCSVFile');
     const up   = menu.querySelector('#tpUploadCSV');
+    const scUp = menu.querySelector('#tpScrapeUpload');
+    const exUp = menu.querySelector('#tpFetchExcelUpload');
     const tIn  = menu.querySelector('#tpTestPhone');
     const tBtn = menu.querySelector('#tpLookupPhone');
     const pbh  = menu.querySelector('#tpPBHint');
-
     pat.value = (GM_getValue('tpGitPAT') || '');
-    pat.addEventListener('change', ()=> GM_setValue('tpGitPAT', pat.value || ''));
+    pat.addEventListener('change', () => GM_setValue('tpGitPAT', pat.value || ''));
 
     up.addEventListener('click', async () => {
       try {
-        const token = (pat.value||'').trim();
-        if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
+        const token = (pat.value||'').trim(); if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
         if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
-
         const text = await file.files[0].text();
         const base64 = b64encodeUtf8(text);
+        pbh.textContent = 'Uploader CSV…';
+        const { sha } = await ghGetSha(PB_OWNER, PB_REPO, PB_CSV, PB_BRANCH);
+        await ghPutFile(PB_OWNER, PB_REPO, PB_CSV, base64, 'sync: upload CSV via TM', sha, PB_BRANCH);
+        pbh.textContent = 'CSV uploadet. RAW opdateres om få sek.';
+        showToast('CSV uploadet.');
+      } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
+    });
 
-        pbh.textContent = 'Uploader…';
-        const { sha, exists } = await ghGetSha(PB_OWNER, PB_REPO, PB_PATH, PB_BRANCH);
-        const msg = 'sync: update ' + PB_PATH + ' via TM';
-        await ghPutFile(PB_OWNER, PB_REPO, PB_PATH, base64, msg, sha, PB_BRANCH);
+    scUp.addEventListener('click', async () => {
+      try {
+        const token = (pat.value||'').trim(); if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
+        if (!/page=vikarlist/.test(location.search) && !/page=vikarlist/.test(location.href)) { showToast('Gå til Vikaroversigt først.'); return; }
+        pbh.textContent = 'Scraper tabel → CSV …';
+        const csv = scrapeVikarListToCSV();
+        pbh.textContent = 'Uploader CSV …';
+        const base64 = b64encodeUtf8(csv);
+        const { sha } = await ghGetSha(PB_OWNER, PB_REPO, PB_CSV, PB_BRANCH);
+        await ghPutFile(PB_OWNER, PB_REPO, PB_CSV, base64, 'sync: scrape vikar-liste → CSV via TM', sha, PB_BRANCH);
+        pbh.textContent = 'CSV uploadet. RAW opdateres om få sek.';
+        showToast('CSV uploadet.');
+      } catch (e) { console.warn('[TP][PB][SCRAPE-UPLOAD]', e); pbh.textContent = 'Fejl: ' + (e&&e.message?e.message:e); showToast('Fejl – se konsol.'); }
+    });
 
-        pbh.textContent = 'Upload OK. RAW opdateres typisk inden for få sekunder.';
-        showToast('Telefonbog uploadet.');
-      } catch (e) {
-        console.warn('[TP][PB][UPLOAD]', e);
-        pbh.textContent = 'Fejl ved upload: ' + (e && e.message ? e.message : e);
-        showToast('Fejl ved upload – se konsol.');
-      }
+    exUp.addEventListener('click', async () => {
+      try {
+        const token = (pat.value||'').trim(); if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
+        pbh.textContent = 'Henter Excel fra server …';
+        const t0 = Date.now();
+        await fetchExcelAndUpload();
+        const ms = Date.now()-t0;
+        pbh.textContent = `Excel uploadet som ${PB_XLSX} (${ms} ms).`;
+        showToast('Excel uploadet (komplet liste).');
+      } catch (e) { console.warn('[TP][PB][EXCEL-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel upload.'; showToast('Fejl – se konsol.'); }
     });
 
     tBtn.addEventListener('click', async () => {
       try {
-        const raw = (tIn.value || '').trim();
-        const p8 = normPhone(raw);
+        const raw = (tIn.value||'').trim(); const p8 = normPhone(raw);
         if (!p8) { pbh.textContent = 'Ugyldigt nummer.'; return; }
-        pbh.textContent = 'Slår op…';
+        pbh.textContent = 'Slår op i CSV…';
         const csv = await gmGET(RAW_PHONEBOOK);
         const map = parsePhonebookCSV(csv);
         const id = map.get(p8);
-        if (id) {
-          pbh.textContent = `Match: ${p8} → vikar_id=${id}`;
-        } else {
-          pbh.textContent = `Ingen match for ${p8}.`;
-        }
-      } catch(e) {
-        console.warn('[TP][PB][LOOKUP]', e);
-        pbh.textContent = 'Fejl ved opslag.';
-      }
+        pbh.textContent = id ? `Match: ${p8} → vikar_id=${id}` : `Ingen match for ${p8}.`;
+      } catch(e) { console.warn('[TP][PB][LOOKUP]', e); pbh.textContent = 'Fejl ved opslag.'; }
     });
 
     return menu;
@@ -521,66 +460,85 @@ function injectUI() {
   }
   gear.addEventListener('click', toggleMenu);
 
-  document.addEventListener('mousedown', function (e) {
-    const mnu = menu;
-    if (mnu && e.target !== mnu && !mnu.contains(e.target) && e.target !== gear) mnu.style.display = 'none';
+  document.addEventListener('mousedown', e => {
+    if (menu && e.target !== menu && !menu.contains(e.target) && e.target !== gear) menu.style.display = 'none';
   });
-
-  console.debug('[TP][DBG] ui init', { panel: true, gear: true });
 }
 function ensureFullyVisible(el){
-  const r = el.getBoundingClientClientRect ? el.getBoundingClientRect() : el.getBoundingClient ? el.getBoundingClient() : el.getBoundingClientRect();
-  // fallback hvis metode ikke findes
-  const rr = r || { right: window.innerWidth-6, bottom: window.innerHeight-6, left: 6, top: 6 };
+  const r = el.getBoundingClientRect();
   let dx = 0, dy = 0;
-  if (rr.right > window.innerWidth) dx = window.innerWidth - rr.right - 6;
-  if (rr.bottom > window.innerHeight) dy = window.innerHeight - rr.bottom - 6;
-  if (rr.left < 0) dx = 6 - rr.left;
-  if (rr.top < 0) dy = 6 - rr.top;
-  if (dx || dy) el.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
+  if (r.right > window.innerWidth)  dx = window.innerWidth - r.right - 6;
+  if (r.bottom > window.innerHeight) dy = window.innerHeight - r.bottom - 6;
+  if (r.left < 0)  dx = 6 - r.left;
+  if (r.top  < 0)  dy = 6 - r.top;
+  if (dx || dy) el.style.transform = `translate(${dx}px,${dy}px)`;
 }
 
-/* Test-knap (sender uanset leader) */
-function tpTestPushoverBoth(){
-  const userKey = getUserKey();
-  if (!userKey) { showToast('Indsæt din USER-token i ⚙️-menuen før test.'); return; }
-  const ts = new Date().toLocaleTimeString();
-  const m1 = '🧪 [TEST] Besked-kanal OK — ' + ts;
-  const m2 = '🧪 [TEST] Interesse-kanal OK — ' + ts;
-  console.info('[TP][TEST] sender Pushover m1:', m1);
-  sendPushover(m1);
-  setTimeout(function () { console.info('[TP][TEST] sender Pushover m2:', m2); sendPushover(m2); }, 800);
-  showToast('Sendte Pushover-test (Besked + Interesse). Tjek Pushover.');
+/*──────── 7b) DOM → CSV (til caller-pop) ────────*/
+function _txt(n){ return (n && (n.innerText || n.textContent) || '').trim(); }
+function _findHeaderIdxs(tbl){
+  const ths = Array.from(tbl.querySelectorAll('thead th, tr th'));
+  const names = ths.map(th => _txt(th).toLowerCase());
+  const idx = {
+    id:   names.findIndex(t => /(vikar.*nr|vikar[_\s-]*id|id)/.test(t)),
+    name: names.findIndex(t => /(navn|name)/.test(t)),
+    tel:  names.findIndex(t => /(telefon|mobil|phone|cell)/.test(t)),
+  };
+  return {ths, names, idx};
+}
+function _extractIdFromRow(tr){
+  const a = tr.querySelector('a[href*="showvikaroplysninger"][href*="vikar_id="]');
+  if (!a) return '';
+  const m = a.href.match(/[?&]vikar_id=(\d+)/);
+  return m ? m[1] : '';
+}
+function scrapeVikarListToCSV(){
+  const tables = Array.from(document.querySelectorAll('table'));
+  let best = null, score = -1, meta = null;
+  for (const t of tables){
+    const m = _findHeaderIdxs(t);
+    const hit = [m.idx.id>=0, m.idx.name>=0, m.idx.tel>=0].filter(Boolean).length;
+    if (hit > score){ best = t; score = hit; meta = m; }
+  }
+  if (!best || score < 2) throw new Error('Fandt ingen brugbar vikar-tabel (Navn + Telefon/Mobil skal være synlige).');
+  const { idx } = meta;
+  const rows = Array.from(best.querySelectorAll('tbody tr')).filter(tr => tr.querySelector('td'));
+  const out = [];
+  for (const tr of rows){
+    const tds = Array.from(tr.querySelectorAll('td'));
+    const id   = idx.id>=0   ? _txt(tds[idx.id])   : _extractIdFromRow(tr);
+    const name = idx.name>=0 ? _txt(tds[idx.name]) : '';
+    let phone  = idx.tel>=0  ? _txt(tds[idx.tel])  : '';
+    const p8 = normPhone(phone);
+    out.push({ id:(id||'').trim(), name:name.trim(), phone: p8 || phone });
+  }
+  const seen = new Set();
+  const rowsClean = out.filter(r => r.id && r.phone && !seen.has(r.phone) && seen.add(r.phone));
+  let csv = 'vikar_id,name,phone\n';
+  for (const r of rowsClean){
+    const safeName = (r.name||'').replace(/"/g,'""');
+    csv += `${r.id},"${safeName}",${r.phone}\n`;
+  }
+  if (rowsClean.length === 0) throw new Error('Ingen rækker fundet – udvid visning/kolonner.');
+  return csv;
 }
 
 /*──────── 8) STARTUP ────────*/
-document.addEventListener('click', function (e) {
+document.addEventListener('click', e => {
   const a = e.target.closest && e.target.closest('a');
   if (a && /Beskeder/.test(a.textContent || '')) {
-    if (isLeader()) {
-      const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
-      stMsg.lastPush = stMsg.lastSent = 0;
-      saveJsonIfLeader(ST_MSG_KEY, stMsg);
-    }
+    if (isLeader()) { const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0}); stMsg.lastPush = stMsg.lastSent = 0; saveJsonIfLeader(ST_MSG_KEY, stMsg); }
   }
 });
-
-// Leader init + loops
 tryBecomeLeader();
 setInterval(heartbeatIfLeader, HEARTBEAT_MS);
 setInterval(tryBecomeLeader, HEARTBEAT_MS + 1200);
-
-// Caller-pop (hurtigt redirect hvis match)
 callerPopIfNeeded().catch(()=>{});
-
-// Pollers (no-op hvis ikke leader)
 pollMessages(); pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
-
-// UI
 injectUI();
-console.info('[TP] kører version 6.59');
+console.info('[TP] kører version 6.60');
 
 /*──────── 9) HOVER “Intet Svar” (auto-gem) ────────*/
 (function () {
@@ -620,9 +578,7 @@ console.info('[TP] kører version 6.59');
         if (ta) {
           if (!ta.value.trim()) ta.value = 'Intet Svar';
           var frm = ta.closest('form');
-          var saveBtn = frm && Array.prototype.find.call(frm.querySelectorAll('input[type="button"]'), function (b) {
-            return /Gem registrering/i.test(b.value || '');
-          });
+          var saveBtn = frm && Array.prototype.find.call(frm.querySelectorAll('input[type="button"]'), function (b) { return /Gem registrering/i.test(b.value || ''); });
           if (saveBtn) {
             setTimeout(function () {
               try { saveBtn.click(); } catch (_) {}
