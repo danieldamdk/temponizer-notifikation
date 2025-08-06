@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      6.58
-// @description  6.57-stil + caller-pop fra central telefonbog. Push ved nye beskeder/interesse (leader på tværs af faner), hover-menu “Intet Svar” (auto), ETag-optimering. APP-token fastlåst. USER-token i GM storage. Testknap i ⚙️.
+// @version      6.59
+// @description  6.57-stil + telefonbog (caller-pop) + GitHub-synk af CSV. Push ved nye beskeder/interesse (leader på tværs af faner), hover-menu “Intet Svar” (auto), ETag-optimering. APP-token fastlåst. USER-token i GM storage. Testknapper i ⚙️.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -10,6 +10,7 @@
 // @grant        unsafeWindow
 // @connect      api.pushover.net
 // @connect      raw.githubusercontent.com
+// @connect      api.github.com
 // @run-at       document-idle
 // @updateURL    https://github.com/danieldamdk/temponizer-notifikation/raw/refs/heads/main/temponizer.user.js
 // @downloadURL  https://github.com/danieldamdk/temponizer-notifikation/raw/refs/heads/main/temponizer.user.js
@@ -23,12 +24,16 @@ const LOCK_MS     = SUPPRESS_MS + 5000;
 
 // Cross-tab leader (én fane styrer push)
 const LEADER_KEY = 'tpLeaderV1';
-const HEARTBEAT_MS = 5000;         // hvor tit leder forlænger sit “lease”
-const LEASE_MS     = 15000;        // gyldighed for lederskab
+const HEARTBEAT_MS = 5000;
+const LEASE_MS     = 15000;
 const TAB_ID = (crypto && crypto.randomUUID ? crypto.randomUUID() : ('tab-' + Math.random().toString(36).slice(2) + Date.now()));
 
-// Caller-pop: central telefonbog (RAW CSV i dit repo)
-const RAW_PHONEBOOK = 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/refs/heads/main/vikarer.csv';
+// Telefonbog (central CSV i dit repo)
+const PB_OWNER  = 'danieldamdk';
+const PB_REPO   = 'temponizer-notifikation';
+const PB_BRANCH = 'main';
+const PB_PATH   = 'vikarer.csv';
+const RAW_PHONEBOOK = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_PATH}`;
 
 /*──────── 1a) MIGRATION til GM storage ────────*/
 (function migrateUserKeyToGM(){
@@ -123,7 +128,7 @@ function loadJson(key, fallback) {
   catch (_) { return JSON.parse(JSON.stringify(fallback)); }
 }
 function saveJsonIfLeader(key, obj) {
-  if (!isLeader()) return;   // kritisk: kun leder må skrive
+  if (!isLeader()) return;
   localStorage.setItem(key, JSON.stringify(obj));
 }
 function takeLock() {
@@ -152,9 +157,7 @@ function pollMessages() {
         } else {
           stMsg.lastSent = n;
         }
-      } else if (n < stMsg.count) {
-        stMsg.lastPush = 0;
-      }
+      } else if (n < stMsg.count) { stMsg.lastPush = 0; }
 
       stMsg.count = n;
       saveJsonIfLeader(ST_MSG_KEY, stMsg);
@@ -198,12 +201,8 @@ function parseInterestHTML(html) {
       if (en) sendPushover(m);
       showToastOnce('int', m);
       stInt.lastPush = Date.now(); stInt.lastSent = c;
-    } else {
-      stInt.lastSent = c;
-    }
-  } else if (c < stInt.count) {
-    stInt.lastPush = 0;
-  }
+    } else { stInt.lastSent = c; }
+  } else if (c < stInt.count) { stInt.lastPush = 0; }
 
   stInt.count = c; saveJsonIfLeader(ST_INT_KEY, stInt);
   console.info('[TP-interesse]', c, new Date().toLocaleTimeString());
@@ -235,9 +234,7 @@ function heartbeatIfLeader() {
   setLeader({ id: TAB_ID, until: t + LEASE_MS, ts: t });
 }
 window.addEventListener('storage', function (e) {
-  if (e.key === LEADER_KEY) {
-    // evt. debug
-  }
+  if (e.key === LEADER_KEY) { /* optional debug */ }
 });
 
 /*──────── 6b) CALLER-POP (central telefonbog) ────────*/
@@ -254,20 +251,26 @@ function gmGET(url) {
     });
   });
 }
+// tolerant CSV-parser (dansk/engelsk kolonnenavne)
 function parsePhonebookCSV(text) {
-  // forventer: vikar_id,name,phone\n...
   const map = new Map();
   if (!text) return map;
   const lines = text.split(/\r?\n/).filter(Boolean);
   if (!lines.length) return map;
-  const header = lines.shift().split(',');
-  const idxId = header.findIndex(h=>/^vikar_id$/i.test(h));
-  const idxPh = header.findIndex(h=>/^phone$/i.test(h));
+
+  const header = lines.shift().split(',').map(h => h.trim().toLowerCase());
+  const idxId = header.findIndex(h => /^(vikar[_ ]?id|id)$/.test(h));
+  const idxPh = header.findIndex(h => /^(phone|telefon|mobil|cellphone|mobile)$/.test(h));
+  if (idxId < 0 || idxPh < 0) return map;
+
   for (const ln of lines) {
-    const cols = ln.split(',');
-    const id = (cols[idxId]||'').trim();
-    const ph = (cols[idxPh]||'').trim();
-    if (id && ph) map.set(ph, id);
+    const cols = ln.split(',').map(c => c.trim());
+    const id = cols[idxId] || '';
+    const ph = cols[idxPh] || '';
+    if (id && ph) {
+      const p8 = normPhone(ph);
+      if (p8) map.set(p8, id);
+    }
   }
   return map;
 }
@@ -276,13 +279,16 @@ async function callerPopIfNeeded() {
     const q = new URLSearchParams(location.search);
     const raw = q.get('tp_caller');
     if (!raw) return;
-    if (!raw.endsWith('*1500')) return; // kun indgående – som jeres flow
-    const phone8 = normPhone(raw.slice(0, -5));
+
+    const cleaned = String(raw).replace(/\*1500$/, '');
+    const phone8 = normPhone(cleaned);
     if (!phone8) { showToast('Ukendt nummer: ' + raw); return; }
+
     const csv = await gmGET(RAW_PHONEBOOK);
     const map = parsePhonebookCSV(csv);
     const id = map.get(phone8);
     if (!id) { showToast('Ukendt nummer: ' + phone8); return; }
+
     const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(id)}#stamoplysninger`;
     showToast('Åbner vikar …');
     location.assign(url);
@@ -292,7 +298,71 @@ async function callerPopIfNeeded() {
   }
 }
 
-/*──────── 7) UI (panel m. toggles + gear; gear-menu har token+test) ────────*/
+/*──────── 6c) GITHUB API (upload CSV) ────────*/
+// Base64 UTF-8
+function b64encodeUtf8(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  bytes.forEach(b=>bin += String.fromCharCode(b));
+  return btoa(bin);
+}
+// GET file sha (returns {sha, exists})
+function ghGetSha(owner, repo, path, ref) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`;
+  const token = (GM_getValue('tpGitPAT') || '').trim();
+  return new Promise((resolve, reject) => {
+    GM_xmlhttpRequest({
+      method: 'GET', url,
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        ...(token ? {'Authorization': 'Bearer ' + token} : {}),
+        'X-GitHub-Api-Version': '2022-11-28'
+      },
+      onload: r => {
+        if (r.status === 200) {
+          try { const js = JSON.parse(r.responseText); resolve({ sha: js.sha, exists: true }); } catch(e){ resolve({ sha:null, exists:true }); }
+        } else if (r.status === 404) {
+          resolve({ sha: null, exists: false });
+        } else {
+          reject(new Error('GitHub GET sha: HTTP '+r.status));
+        }
+      },
+      onerror: e => reject(e)
+    });
+  });
+}
+// PUT file (create/update)
+function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`;
+  const token = (GM_getValue('tpGitPAT') || '').trim();
+  return new Promise((resolve, reject) => {
+    GM_xmlhttpRequest({
+      method: 'PUT', url,
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        ...(token ? {'Authorization': 'Bearer ' + token} : {}),
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Content-Type': 'application/json;charset=UTF-8'
+      },
+      data: JSON.stringify({
+        message,
+        content: base64Content,
+        branch,
+        ...(sha ? { sha } : {})
+      }),
+      onload: r => {
+        if (r.status === 201 || r.status === 200) {
+          resolve(r.responseText);
+        } else {
+          reject(new Error('GitHub PUT: HTTP '+r.status+' '+(r.responseText||'')));
+        }
+      },
+      onerror: e => reject(e)
+    });
+  });
+}
+
+/*──────── 7) UI (panel m. toggles + gear; gear-menu med token+test+telefonbog) ────────*/
 function injectUI() {
   const d = document.createElement('div');
   d.id = 'tpPanel';
@@ -334,11 +404,11 @@ function injectUI() {
     Object.assign(menu.style, {
       position:'fixed', zIndex:2147483647, background:'#fff', border:'1px solid #ccc',
       borderRadius:'8px', boxShadow:'0 2px 12px rgba(0,0,0,.25)', fontSize:'12px',
-      fontFamily:'sans-serif', padding:'8px', width:'280px'
+      fontFamily:'sans-serif', padding:'10px', width:'320px'
     });
     menu.innerHTML =
       '<div style="font-weight:700;margin-bottom:6px">Indstillinger</div>' +
-      '<div style="margin-bottom:8px">' +
+      '<div style="margin-bottom:10px">' +
         '<div style="font-weight:600;margin-bottom:4px">Pushover USER-token</div>' +
         '<input id="tpUserKeyMenu" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" ' +
           'style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
@@ -347,36 +417,96 @@ function injectUI() {
           '<a href="https://pushover.net/" target="_blank" rel="noopener" style="color:#06c;text-decoration:none">Sådan finder du USER-token</a>' +
         '</div>' +
       '</div>' +
-      '<div style="border-top:1px solid #eee;margin:6px 0"></div>' +
+      '<div style="border-top:1px solid #eee;margin:8px 0"></div>' +
       '<button id="tpTestPushoverBtn" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🧪 Test Pushover (Besked + Interesse)</button>' +
-      '<div id="tpLeaderHint" style="margin-top:8px;font-size:11px;color:#666"></div>';
+      '<div id="tpLeaderHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
+      '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
+      '<div style="font-weight:700;margin-bottom:6px">Telefonbog (admin)</div>' +
+      '<div style="margin-bottom:6px;font-size:12px;color:#444">Repo: '+PB_OWNER+'/'+PB_REPO+' • Branch: '+PB_BRANCH+' • Fil: '+PB_PATH+'</div>' +
+      '<div style="margin-bottom:6px">' +
+        '<div style="font-weight:600;margin-bottom:4px">GitHub PAT (fine-grained, kun dette repo)</div>' +
+        '<input id="tpGitPAT" type="password" placeholder="ghp_… eller fine-grained" ' +
+          'style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
+        '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">' +
+          '<input id="tpCSVFile" type="file" accept=".csv" style="flex:1"/>' +
+          '<button id="tpUploadCSV" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Upload til GitHub</button>' +
+        '</div>' +
+        '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
+          '<input id="tpTestPhone" type="text" placeholder="Test nummer (fx 22 44 66 88)" ' +
+            'style="flex:1;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
+          '<button id="tpLookupPhone" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Slå op</button>' +
+        '</div>' +
+        '<div id="tpPBHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
+      '</div>';
     document.body.appendChild(menu);
 
+    // Pushover-del
     const inp  = menu.querySelector('#tpUserKeyMenu');
     const save = menu.querySelector('#tpSaveUserKeyMenu');
     const test = menu.querySelector('#tpTestPushoverBtn');
     const hint = menu.querySelector('#tpLeaderHint');
 
-    function refreshLeaderHint(){
-      hint.textContent = (isLeader() ? 'Denne fane er LEADER for push.' : 'Denne fane er ikke leader. En anden fane sender push.');
-    }
+    function refreshLeaderHint(){ hint.textContent = (isLeader() ? 'Denne fane er LEADER for push.' : 'Denne fane er ikke leader. En anden fane sender push.'); }
     refreshLeaderHint();
-
     inp.value = getUserKey();
-    function saveUserKey() {
-      const v = (inp.value || '').trim();
-      GM_setValue('tpUserKey', v);
-      showToast('Pushover USER-token gemt.');
-    }
+    function saveUserKey() { const v = (inp.value || '').trim(); GM_setValue('tpUserKey', v); showToast('Pushover USER-token gemt.'); }
     save.addEventListener('click', saveUserKey);
     inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); saveUserKey(); } });
-    test.addEventListener('click', function () {
-      tpTestPushoverBoth();
-      menu.style.display = 'none';
+    test.addEventListener('click', function () { tpTestPushoverBoth(); menu.style.display = 'none'; });
+    window.addEventListener('storage', function (e) { if (e.key === LEADER_KEY) refreshLeaderHint(); });
+
+    // Telefonbog-del
+    const pat  = menu.querySelector('#tpGitPAT');
+    const file = menu.querySelector('#tpCSVFile');
+    const up   = menu.querySelector('#tpUploadCSV');
+    const tIn  = menu.querySelector('#tpTestPhone');
+    const tBtn = menu.querySelector('#tpLookupPhone');
+    const pbh  = menu.querySelector('#tpPBHint');
+
+    pat.value = (GM_getValue('tpGitPAT') || '');
+    pat.addEventListener('change', ()=> GM_setValue('tpGitPAT', pat.value || ''));
+
+    up.addEventListener('click', async () => {
+      try {
+        const token = (pat.value||'').trim();
+        if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
+        if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
+
+        const text = await file.files[0].text();
+        const base64 = b64encodeUtf8(text);
+
+        pbh.textContent = 'Uploader…';
+        const { sha, exists } = await ghGetSha(PB_OWNER, PB_REPO, PB_PATH, PB_BRANCH);
+        const msg = 'sync: update ' + PB_PATH + ' via TM';
+        await ghPutFile(PB_OWNER, PB_REPO, PB_PATH, base64, msg, sha, PB_BRANCH);
+
+        pbh.textContent = 'Upload OK. RAW opdateres typisk inden for få sekunder.';
+        showToast('Telefonbog uploadet.');
+      } catch (e) {
+        console.warn('[TP][PB][UPLOAD]', e);
+        pbh.textContent = 'Fejl ved upload: ' + (e && e.message ? e.message : e);
+        showToast('Fejl ved upload – se konsol.');
+      }
     });
 
-    window.addEventListener('storage', function (e) {
-      if (e.key === LEADER_KEY) refreshLeaderHint();
+    tBtn.addEventListener('click', async () => {
+      try {
+        const raw = (tIn.value || '').trim();
+        const p8 = normPhone(raw);
+        if (!p8) { pbh.textContent = 'Ugyldigt nummer.'; return; }
+        pbh.textContent = 'Slår op…';
+        const csv = await gmGET(RAW_PHONEBOOK);
+        const map = parsePhonebookCSV(csv);
+        const id = map.get(p8);
+        if (id) {
+          pbh.textContent = `Match: ${p8} → vikar_id=${id}`;
+        } else {
+          pbh.textContent = `Ingen match for ${p8}.`;
+        }
+      } catch(e) {
+        console.warn('[TP][PB][LOOKUP]', e);
+        pbh.textContent = 'Fejl ved opslag.';
+      }
     });
 
     return menu;
@@ -388,30 +518,29 @@ function injectUI() {
     mnu.style.right = (window.innerWidth - r.right) + 'px';
     mnu.style.bottom = (window.innerHeight - r.top + 6) + 'px';
     mnu.style.display = (mnu.style.display === 'block' ? 'none' : 'block');
-    const inp = mnu.querySelector('#tpUserKeyMenu');
-    if (inp) inp.value = getUserKey();
-    const hint = mnu.querySelector('#tpLeaderHint');
-    if (hint) hint.textContent = (isLeader() ? 'Denne fane er LEADER for push.' : 'Denne fane er ikke leader. En anden fane sender push.');
   }
   gear.addEventListener('click', toggleMenu);
 
   document.addEventListener('mousedown', function (e) {
-    if (menu && e.target !== menu && !menu.contains(e.target) && e.target !== gear) menu.style.display = 'none';
+    const mnu = menu;
+    if (mnu && e.target !== mnu && !mnu.contains(e.target) && e.target !== gear) mnu.style.display = 'none';
   });
 
   console.debug('[TP][DBG] ui init', { panel: true, gear: true });
 }
 function ensureFullyVisible(el){
-  const r = el.getBoundingClientRect();
+  const r = el.getBoundingClientClientRect ? el.getBoundingClientRect() : el.getBoundingClient ? el.getBoundingClient() : el.getBoundingClientRect();
+  // fallback hvis metode ikke findes
+  const rr = r || { right: window.innerWidth-6, bottom: window.innerHeight-6, left: 6, top: 6 };
   let dx = 0, dy = 0;
-  if (r.right > window.innerWidth) dx = window.innerWidth - r.right - 6;
-  if (r.bottom > window.innerHeight) dy = window.innerHeight - r.bottom - 6;
-  if (r.left < 0) dx = 6 - r.left;
-  if (r.top < 0) dy = 6 - r.top;
+  if (rr.right > window.innerWidth) dx = window.innerWidth - rr.right - 6;
+  if (rr.bottom > window.innerHeight) dy = window.innerHeight - rr.bottom - 6;
+  if (rr.left < 0) dx = 6 - rr.left;
+  if (rr.top < 0) dy = 6 - rr.top;
   if (dx || dy) el.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
 }
 
-/* Test-knap (sender uanset leader – manuel test må godt gå igennem) */
+/* Test-knap (sender uanset leader) */
 function tpTestPushoverBoth(){
   const userKey = getUserKey();
   if (!userKey) { showToast('Indsæt din USER-token i ⚙️-menuen før test.'); return; }
@@ -420,17 +549,14 @@ function tpTestPushoverBoth(){
   const m2 = '🧪 [TEST] Interesse-kanal OK — ' + ts;
   console.info('[TP][TEST] sender Pushover m1:', m1);
   sendPushover(m1);
-  setTimeout(function () {
-    console.info('[TP][TEST] sender Pushover m2:', m2);
-    sendPushover(m2);
-  }, 800);
+  setTimeout(function () { console.info('[TP][TEST] sender Pushover m2:', m2); sendPushover(m2); }, 800);
   showToast('Sendte Pushover-test (Besked + Interesse). Tjek Pushover.');
 }
 
 /*──────── 8) STARTUP ────────*/
 document.addEventListener('click', function (e) {
-  const a = e.target.closest('a');
-  if (a && /Beskeder/.test(a.textContent)) {
+  const a = e.target.closest && e.target.closest('a');
+  if (a && /Beskeder/.test(a.textContent || '')) {
     if (isLeader()) {
       const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
       stMsg.lastPush = stMsg.lastSent = 0;
@@ -444,17 +570,17 @@ tryBecomeLeader();
 setInterval(heartbeatIfLeader, HEARTBEAT_MS);
 setInterval(tryBecomeLeader, HEARTBEAT_MS + 1200);
 
-// Caller-pop kør tidligt (hurtigt redirect før UI/pollers gør noget tungt)
+// Caller-pop (hurtigt redirect hvis match)
 callerPopIfNeeded().catch(()=>{});
 
-// Pollers i alle faner (no-op hvis ikke leader)
+// Pollers (no-op hvis ikke leader)
 pollMessages(); pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 
 // UI
 injectUI();
-console.info('[TP] kører version 6.58');
+console.info('[TP] kører version 6.59');
 
 /*──────── 9) HOVER “Intet Svar” (auto-gem) ────────*/
 (function () {
