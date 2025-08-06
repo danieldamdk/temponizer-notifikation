@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      6.63
-// @description  Push (leader på tværs af faner), hover “Intet Svar”, ETag-optimering. Telefonbog: Excel→CSV (i browseren) + GitHub-synk. Caller-pop læser vikarer.csv fra repo. APP-token fastlåst, USER-token i GM storage. Testknapper i ⚙️.
+// @version      6.64
+// @description  Push (leader), hover “Intet Svar”, ETag-optimering. Telefonbog: Excel→CSV + GitHub-synk + JSON-map fallback (>1MB). Caller-pop læser CSV/JSON fra repo. APP-token fastlåst, USER-token i GM storage. Testknapper i ⚙️.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -36,7 +36,14 @@ const PB_REPO   = 'temponizer-notifikation';
 const PB_BRANCH = 'main';
 const PB_CSV    = 'vikarer.csv';
 const PB_XLSX   = 'vikarer.xlsx';
-const RAW_PHONEBOOK = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_CSV}`;
+
+// v6.64: JSON-map fallback + cache
+const PB_MAP   = 'vikarer.map.json';
+const RAW_PHONEBOOK     = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_CSV}`;
+const RAW_PHONEBOOK_MAP = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_MAP}`;
+const CSV_CACHE_KEY = 'tpCsvCacheV1'; // { text, etag, ts, len }
+const MAP_CACHE_KEY = 'tpMapCacheV1'; // { text, etag, ts, len }
+const RAW_MAX_BYTES = 1_000_000;      // 1MB grænse for CSV før vi vælger JSON-map
 
 /*──────── 1a) MIGRATION ────────*/
 (function migrateUserKeyToGM(){
@@ -178,11 +185,7 @@ function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.unti
 function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
 window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*noop*/} });
 
-/*──────── 6b) CALLER-POP (CSV → vikar_id/navn) ────────*/
-function normPhone(raw) {
-  const digits = String(raw||'').replace(/\D/g,'').replace(/^0+/, '').replace(/^45/, '');
-  return digits.length >= 8 ? digits.slice(-8) : '';
-}
+/*──────── 6a) HTTP helpers (v6.64 HEAD/ETag-cache) ────────*/
 function gmGET(url) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
@@ -200,6 +203,61 @@ function gmGETArrayBuffer(url) {
       onerror: e => reject(e)
     });
   });
+}
+function headerPick(headersStr, name) {
+  const m = headersStr && headersStr.match(new RegExp('^' + name + ':\\s*(.+)$','im'));
+  return m ? m[1].trim() : null;
+}
+function gmHEAD(url) {
+  return new Promise((resolve, reject) => {
+    GM_xmlhttpRequest({
+      method: 'HEAD', url, timeout: 15000,
+      onload: r => resolve({ status: r.status, headers: r.responseHeaders || '' }),
+      ontimeout: () => reject(new Error('HEAD timeout')),
+      onerror:   e => reject(e)
+    });
+  });
+}
+function gmGETWithHeaders(url, headers={}) {
+  return new Promise((resolve, reject) => {
+    GM_xmlhttpRequest({
+      method: 'GET', url, headers,
+      onload: r => resolve({ status: r.status, text: r.responseText || '', headers: r.responseHeaders || '' }),
+      onerror: e => reject(e)
+    });
+  });
+}
+/** ETag-cache for tekst-resurser (RAW GitHub). Fallback til cache ved netfejl. */
+async function fetchTextWithETagCache(url, cacheKey) {
+  let cached = null;
+  try { cached = await GM_getValue(cacheKey, null); } catch(_) {}
+  try {
+    const h = await gmHEAD(url);
+    const etag = headerPick(h.headers, 'etag')?.replace(/^W\//,'') || null;
+    const len  = Number(headerPick(h.headers, 'content-length') || '0');
+    if (cached?.etag && etag && cached.etag === etag) {
+      return { text: cached.text, fromCache: true, etag, len };
+    }
+    const r = await gmGETWithHeaders(url, etag ? { 'If-None-Match': etag } : {});
+    if (r.status === 304 && cached) {
+      return { text: cached.text, fromCache: true, etag: cached.etag || etag, len };
+    }
+    if (r.status >= 200 && r.status < 300) {
+      const obj = { text: r.text, etag: etag || headerPick(r.headers,'etag') || null, ts: Date.now(), len };
+      try { await GM_setValue(cacheKey, obj); } catch(_) {}
+      return { text: obj.text, fromCache: false, etag: obj.etag, len };
+    }
+    throw new Error('HTTP ' + r.status);
+  } catch (e) {
+    if (cached?.text) return { text: cached.text, fromCache: true, etag: cached.etag || null, len: cached.len || 0 };
+    throw e;
+  }
+}
+
+/*──────── 6b) CALLER-POP (CSV/JSON → vikar_id/navn) ────────*/
+function normPhone(raw) {
+  const digits = String(raw||'').replace(/\D/g,'').replace(/^0+/, '').replace(/^45/, '');
+  return digits.length >= 8 ? digits.slice(-8) : '';
 }
 
 // Robust CSV parser (delimiter , eller ;, simple quotes)
@@ -259,6 +317,41 @@ function parsePhonebookCSV(text) {
   return map;
 }
 
+// v6.64: JSON-map parser + smart vælger mellem CSV/JSON m. ETag-cache
+function parsePhonebookJSON(text) {
+  const map = new Map();
+  if (!text) return map;
+  let obj = null;
+  try { obj = JSON.parse(text); } catch(_) { return map; }
+  for (const k of Object.keys(obj)) {
+    const p8 = normPhone(k);
+    if (!p8) continue;
+    const v = obj[k] || {};
+    if (v.id) map.set(p8, { id: String(v.id), name: String(v.name || '') });
+  }
+  return map;
+}
+/** Hent telefonbog: brug CSV hvis < 1MB, ellers JSON-map. Begge med ETag-cache. */
+async function getPhonebookMapSmart() {
+  try {
+    const csv = await fetchTextWithETagCache(RAW_PHONEBOOK, CSV_CACHE_KEY);
+    if (csv.len > RAW_MAX_BYTES) {
+      try {
+        const js = await fetchTextWithETagCache(RAW_PHONEBOOK_MAP, MAP_CACHE_KEY);
+        const map = parsePhonebookJSON(js.text);
+        if (map.size) return map;
+      } catch(_) { /* fallback til CSV */ }
+    }
+    return parsePhonebookCSV(csv.text);
+  } catch(e) {
+    // CSV fejlede; prøv JSON-map
+    const js = await fetchTextWithETagCache(RAW_PHONEBOOK_MAP, MAP_CACHE_KEY);
+    const map = parsePhonebookJSON(js.text);
+    if (map.size) return map;
+    throw e;
+  }
+}
+
 async function callerPopIfNeeded() {
   try {
     const q = new URLSearchParams(location.search);
@@ -266,8 +359,8 @@ async function callerPopIfNeeded() {
     const cleaned = String(raw).replace(/\*1500$/, '');
     const phone8 = normPhone(cleaned);
     if (!phone8) { showToast('Ukendt nummer: ' + raw); return; }
-    const csv = await gmGET(RAW_PHONEBOOK);
-    const map = parsePhonebookCSV(csv);
+
+    const map = await getPhonebookMapSmart();
     const rec = map.get(phone8);
     if (!rec) { showToast('Ingen match for: ' + phone8); return; }
     const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
@@ -348,11 +441,32 @@ function normalizePhonebookHeader(csv) {
   lines[0] = hdr.map(mapName).join(',');
   return lines.join('\n');
 }
+
+// v6.64: CSV → JSON-map (telefon → {id,name})
+function csvToPhoneMapJSON(csvText) {
+  const m = parsePhonebookCSV(csvText);
+  const obj = {};
+  Array.from(m.entries())
+    .sort(([a],[b]) => a.localeCompare(b))
+    .forEach(([k, v]) => { obj[k] = { id: v.id, name: v.name }; });
+  return JSON.stringify(obj, null, 2);
+}
+
 async function fetchExcelAsCSVAndUpload() {
   const text = await fetchExcelAsCSVText();
   const base64 = b64encodeUtf8(text);
   const { sha } = await ghGetSha(PB_OWNER, PB_REPO, PB_CSV, PB_BRANCH);
   await ghPutFile(PB_OWNER, PB_REPO, PB_CSV, base64, 'sync: Excel→CSV via TM', sha, PB_BRANCH);
+
+  // v6.64: generér & upload JSON-map
+  try {
+    const json = csvToPhoneMapJSON(text);
+    const base64j = b64encodeUtf8(json);
+    const meta = await ghGetSha(PB_OWNER, PB_REPO, PB_MAP, PB_BRANCH);
+    await ghPutFile(PB_OWNER, PB_REPO, PB_MAP, base64j, 'sync: regenerate vikarer.map.json', meta.sha, PB_BRANCH);
+  } catch(e) {
+    console.warn('[TP][PB][MAP-UPLOAD]', e);
+  }
 }
 async function fetchExcelAndUploadRawXLSX() {
   const excelUrl = `${location.origin}/index.php?page=print_vikar_list_custom_excel&id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag&sortBy=`;
@@ -420,7 +534,7 @@ function injectUI() {
       '<div id="tpLeaderHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
       '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
       '<div style="font-weight:700;margin-bottom:6px">Telefonbog (admin)</div>' +
-      '<div style="margin-bottom:6px;font-size:12px;color:#444">Repo: '+PB_OWNER+'/'+PB_REPO+' • Branch: '+PB_BRANCH+' • Filer: '+PB_CSV+' / '+PB_XLSX+'</div>' +
+      '<div style="margin-bottom:6px;font-size:12px;color:#444">Repo: '+PB_OWNER+'/'+PB_REPO+' • Branch: '+PB_BRANCH+' • Filer: '+PB_CSV+' / '+PB_XLSX+' / '+PB_MAP+'</div>' +
       '<div style="margin-bottom:6px">' +
         '<div style="font-weight:600;margin-bottom:4px">GitHub PAT (fine-grained, Contents: RW til dette repo)</div>' +
         '<input id="tpGitPAT" type="password" placeholder="ghp_… eller fine-grained" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
@@ -434,7 +548,7 @@ function injectUI() {
         '</div>' +
         '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
           '<input id="tpTestPhone" type="text" placeholder="Test nummer (fx 22 44 66 88)" style="flex:1;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
-          '<button id="tpLookupPhone" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Slå op i CSV</button>' +
+          '<button id="tpLookupPhone" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Slå op</button>' +
         '</div>' +
         '<div id="tpPBHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
       '</div>';
@@ -475,7 +589,14 @@ function injectUI() {
         pbh.textContent = 'Uploader CSV…';
         const { sha } = await ghGetSha(PB_OWNER, PB_REPO, PB_CSV, PB_BRANCH);
         await ghPutFile(PB_OWNER, PB_REPO, PB_CSV, base64, 'sync: upload CSV via TM', sha, PB_BRANCH);
-        pbh.textContent = 'CSV uploadet. RAW opdateres om få sek.';
+        // v6.64: generér & upload JSON-map
+        try {
+          const json = csvToPhoneMapJSON(text);
+          const base64j = b64encodeUtf8(json);
+          const meta = await ghGetSha(PB_OWNER, PB_REPO, PB_MAP, PB_BRANCH);
+          await ghPutFile(PB_OWNER, PB_REPO, PB_MAP, base64j, 'sync: regenerate vikarer.map.json', meta.sha, PB_BRANCH);
+        } catch(e) { console.warn('[TP][PB][MAP-UPLOAD]', e); }
+        pbh.textContent = 'CSV (og JSON-map) uploadet. RAW opdateres om få sek.';
         showToast('CSV uploadet.');
       } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
     });
@@ -504,16 +625,15 @@ function injectUI() {
       } catch (e) { console.warn('[TP][PB][EXCEL-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel upload.'; showToast('Fejl – se konsol.'); }
     });
 
-    // TEST: vis navn + åbn stamoplysninger i NY fane
+    // TEST: slå op → åbner NY fane ved match
     tBtn.addEventListener('click', async () => {
       try {
         const raw = (tIn.value||'').trim();
         const p8 = normPhone(raw);
         if (!p8) { pbh.textContent = 'Ugyldigt nummer.'; return; }
 
-        pbh.textContent = 'Slår op i CSV…';
-        const csv = await gmGET(RAW_PHONEBOOK);
-        const map = parsePhonebookCSV(csv);
+        pbh.textContent = 'Slår op i telefonbog…';
+        const map = await getPhonebookMapSmart();
         const rec = map.get(p8);
 
         if (!rec) {
@@ -582,7 +702,7 @@ pollMessages(); pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 injectUI();
-console.info('[TP] kører version 6.63');
+console.info('[TP] kører version 6.64');
 
 /*──────── 9) HOVER “Intet Svar” (auto-gem) ────────*/
 (function () {
