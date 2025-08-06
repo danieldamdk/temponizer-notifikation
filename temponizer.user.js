@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Notifikationer + “Intet svar” + Caller-pop + Telefonbog (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.0
+// @version      7.01
 // @description  Pushover (leder på tværs af faner) + toast + “Intet svar” (auto) + telefonbog-synk/Caller-pop. Stabil auto-update via GitHub.
 // @match        https://ajourcare.temponizer.dk/*
 // @run-at       document-idle
@@ -581,44 +581,45 @@
     }).observe(document.body, { childList:true, subtree:true });
   })();
 
-/*──────────────────── 9. INIT ────────────────────*/
+/*──────────────────── 9. INIT (robust) ────────────────────*/
 function init(){
   try {
-    dbg('ui init', { gear: true, panel: true });
-    injectUI();
-
+    injectUI();                     // injicér UI med det samme
     // start pollere
     pollMessages(); pollInterest();
     setInterval(pollMessages, APP.POLL_MS);
     setInterval(pollInterest, APP.POLL_MS);
-
     log('kører version', APP.VERSION);
-
-    // fallback: hvis noget (CSS/DOM) forsinker, så prøv igen kort efter
-    setTimeout(() => { if (!document.getElementById('tpUi')) injectUI(); }, 600);
   } catch (e) {
     console.error('[TP] init-fejl:', e);
   }
-
-  // lille perf-måling
-  try {
-    const t0 = performance.now();
-    setTimeout(()=> {
-      const dt = performance.now() - t0;
-      console.log('SCRIPT RUN TIME['+document.title.replaceAll('"','$1')+']: ' + dt + ' ms');
-    }, 0);
-  } catch(_){}
 }
 
-// Kør init uanset hvornår scriptet indlæses
-if (document.readyState === 'complete' || document.readyState === 'interactive') {
-  // DOM er allerede klar – kør nu
-  init();
-} else {
-  // DOM ikke klar endnu – lyt én gang
-  document.addEventListener('DOMContentLoaded', init, { once: true });
-}
-// Ekstra sikkerhed: kør også ved window.load, hvis noget forsinkes
+// Kør init nu, eller så snart body er tilgængelig
+(function ensureInit(){
+  if (document.body) {
+    init();
+  } else {
+    // hvis body ikke findes endnu, vent mikro-tid og prøv igen
+    const t = setInterval(() => {
+      if (document.body) { clearInterval(t); init(); }
+    }, 50);
+    // hard fallback efter 2 sek.
+    setTimeout(() => { try { init(); } catch(_){} }, 2000);
+  }
+})();
+
+// Ekstra sikkerhed: kør også ved DOMContentLoaded / load, hvis noget blev forsinket
+document.addEventListener('DOMContentLoaded', () => {
+  if (!document.getElementById('tpUi')) init();
+}, { once:true });
 window.addEventListener('load', () => {
   if (!document.getElementById('tpUi')) init();
-}, { once: true });
+}, { once:true });
+
+/* (valgfrit) livline: hvis noget CSS/overlay fjerner UI, re-inject hver 2. sek, men kun hvis mangler */
+setInterval(() => {
+  if (!document.getElementById('tpUi')) {
+    try { injectUI(); } catch(_){}
+  }
+}, 2000);
