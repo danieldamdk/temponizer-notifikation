@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      6.65.1
-// @description  Push (leader), hover “Intet Svar”, ETag-optimering. Telefonbog: Excel→CSV + GitHub-synk + JSON-map fallback (>1MB). Caller-pop læser CSV/JSON fra repo. Robust Excel-download (med/uden dato-filter) og beskyttelse mod tom upload. ⚙️ har test + cache-rydning.
+// @version      6.66
+// @description  Classic som v6.63: Caller-pop og test slår op i RAW CSV. Robust Excel→CSV (vælg bedste sheet + fallback uden dato-filter) og beskyttelse mod tom upload. Push + interesse, leader på tværs af faner, hover “Intet Svar”.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /*──────── 1) KONFIG ────────*/
-const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
+const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7'; // ADMIN-FASTLÅST
 const POLL_MS     = 30000;
 const SUPPRESS_MS = 45000;
 const LOCK_MS     = SUPPRESS_MS + 5000;
@@ -36,14 +36,7 @@ const PB_REPO   = 'temponizer-notifikation';
 const PB_BRANCH = 'main';
 const PB_CSV    = 'vikarer.csv';
 const PB_XLSX   = 'vikarer.xlsx';
-const PB_MAP    = 'vikarer.map.json';
-
-const RAW_PHONEBOOK     = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_CSV}`;
-const RAW_PHONEBOOK_MAP = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_MAP}`;
-
-const CSV_CACHE_KEY = 'tpCsvCacheV1'; // { text, etag, ts, len }
-const MAP_CACHE_KEY = 'tpMapCacheV1'; // { text, etag, ts, len }
-const RAW_MAX_BYTES = 1_000_000;      // vælg JSON-map over CSV hvis CSV > 1MB
+const RAW_PHONEBOOK = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_CSV}`;
 
 /*──────── 1a) MIGRATION ────────*/
 (function migrateUserKeyToGM(){
@@ -185,7 +178,7 @@ function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.unti
 function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
 window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*noop*/} });
 
-/*──────── 6a) HTTP helpers + ETag-cache ────────*/
+/*──────── 6a) HTTP helpers ────────*/
 function gmGET(url) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
@@ -204,63 +197,14 @@ function gmGETArrayBuffer(url) {
     });
   });
 }
-function headerPick(headersStr, name) {
-  const m = headersStr && headersStr.match(new RegExp('^' + name + ':\\s*(.+)$','im'));
-  return m ? m[1].trim() : null;
-}
-function gmHEAD(url) {
-  return new Promise((resolve, reject) => {
-    GM_xmlhttpRequest({
-      method: 'HEAD', url, timeout: 15000,
-      onload: r => resolve({ status: r.status, headers: r.responseHeaders || '' }),
-      ontimeout: () => reject(new Error('HEAD timeout')),
-      onerror:   e => reject(e)
-    });
-  });
-}
-function gmGETWithHeaders(url, headers={}) {
-  return new Promise((resolve, reject) => {
-    GM_xmlhttpRequest({
-      method: 'GET', url, headers,
-      onload: r => resolve({ status: r.status, text: r.responseText || '', headers: r.responseHeaders || '' }),
-      onerror: e => reject(e)
-    });
-  });
-}
-/** ETag-cache for RAW GitHub – fallback til cache ved netfejl. */
-async function fetchTextWithETagCache(url, cacheKey) {
-  let cached = null;
-  try { cached = await GM_getValue(cacheKey, null); } catch(_) {}
-  try {
-    const h = await gmHEAD(url);
-    const etag = headerPick(h.headers, 'etag')?.replace(/^W\//,'') || null;
-    const len  = Number(headerPick(h.headers, 'content-length') || '0');
-    if (cached?.etag && etag && cached.etag === etag) {
-      return { text: cached.text, fromCache: true, etag, len };
-    }
-    const r = await gmGETWithHeaders(url, etag ? { 'If-None-Match': etag } : {});
-    if (r.status === 304 && cached) {
-      return { text: cached.text, fromCache: true, etag: cached.etag || etag, len };
-    }
-    if (r.status >= 200 && r.status < 300) {
-      const obj = { text: r.text, etag: etag || headerPick(r.headers,'etag') || null, ts: Date.now(), len };
-      try { await GM_setValue(cacheKey, obj); } catch(_) {}
-      return { text: obj.text, fromCache: false, etag: obj.etag, len };
-    }
-    throw new Error('HTTP ' + r.status);
-  } catch (e) {
-    if (cached?.text) return { text: cached.text, fromCache: true, etag: cached.etag || null, len: cached.len || 0 };
-    throw e;
-  }
-}
 
-/*──────── 6b) CALLER-POP (CSV/JSON) ────────*/
+/*──────── 6b) CALLER-POP (RAW CSV) ────────*/
 function normPhone(raw) {
   const digits = String(raw||'').replace(/\D/g,'').replace(/^0+/, '').replace(/^45/, '');
   return digits.length >= 8 ? digits.slice(-8) : '';
 }
 
-// Robust CSV parser (,/; + simple quotes)
+// Robust CSV parser (delimiter , eller ;, simple quotes)
 function parseCSV(text) {
   if (!text) return [];
   text = text.replace(/^\uFEFF/, '');
@@ -287,7 +231,7 @@ function parseCSV(text) {
   return rows.filter(r => r.length && r.some(x => x !== ''));
 }
 
-// CSV → Map(phone8 → {id,name})
+// Læs CSV → Map(phone8 → { id, name })
 function parsePhonebookCSV(text) {
   const map = new Map();
   const rows = parseCSV(text);
@@ -317,51 +261,6 @@ function parsePhonebookCSV(text) {
   return map;
 }
 
-// JSON-map → Map(phone8 → {id,name})
-function parsePhonebookJSON(text) {
-  const map = new Map();
-  if (!text) return map;
-  let obj = null;
-  try { obj = JSON.parse(text); } catch(_) { return map; }
-  for (const k of Object.keys(obj)) {
-    const p8 = normPhone(k);
-    if (!p8) continue;
-    const v = obj[k] || {};
-    if (v.id) map.set(p8, { id: String(v.id), name: String(v.name || '') });
-  }
-  return map;
-}
-
-/** Hent telefonbog: CSV hvis <1MB, ellers JSON-map. Fallback mellem kilder + ETag-cache. */
-async function getPhonebookMapSmart() {
-  try {
-    const csv = await fetchTextWithETagCache(RAW_PHONEBOOK, CSV_CACHE_KEY);
-    // Hvis CSV er tom/kun header, prøv JSON før parse – eller hvis stor fil
-    if ((csv.text || '').trim().split(/\r?\n/).filter(Boolean).length < 2 || csv.len > RAW_MAX_BYTES) {
-      try {
-        const js = await fetchTextWithETagCache(RAW_PHONEBOOK_MAP, MAP_CACHE_KEY);
-        const map = parsePhonebookJSON(js.text);
-        if (map.size) return map;
-      } catch(_) { /* fallback til CSV */ }
-    }
-    const mapCsv = parsePhonebookCSV(csv.text);
-    if (mapCsv.size) return mapCsv;
-    // CSV parsed tomt – prøv JSON som sidste chance
-    const js = await fetchTextWithETagCache(RAW_PHONEBOOK_MAP, MAP_CACHE_KEY);
-    const map = parsePhonebookJSON(js.text);
-    if (map.size) return map;
-    return mapCsv; // tom
-  } catch(e) {
-    // CSV fejlede; prøv JSON
-    try {
-      const js = await fetchTextWithETagCache(RAW_PHONEBOOK_MAP, MAP_CACHE_KEY);
-      const map = parsePhonebookJSON(js.text);
-      if (map.size) return map;
-    } catch(_) {}
-    throw e;
-  }
-}
-
 async function callerPopIfNeeded() {
   try {
     const q = new URLSearchParams(location.search);
@@ -369,17 +268,14 @@ async function callerPopIfNeeded() {
     const cleaned = String(raw).replace(/\*1500$/, '');
     const phone8 = normPhone(cleaned);
     if (!phone8) { showToast('Ukendt nummer: ' + raw); return; }
-
-    const map = await getPhonebookMapSmart();
+    const csv = await gmGET(RAW_PHONEBOOK);
+    const map = parsePhonebookCSV(csv);
     const rec = map.get(phone8);
     if (!rec) { showToast('Ingen match for: ' + phone8); return; }
     const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
     showToast(`Åbner vikar: ${rec.name || 'ukendt navn'} (${rec.id})`);
-    location.assign(url);
-  } catch (e) {
-    console.warn('[TP][CALLER]', e);
-    showToast('Kan ikke hente telefonbog lige nu.');
-  }
+    location.assign(url); // behold navigation i samme fane
+  } catch (e) { console.warn('[TP][CALLER]', e); showToast('Kan ikke hente telefonbog lige nu.'); }
 }
 
 /*──────── 6c) GITHUB API (upload) ────────*/
@@ -429,13 +325,44 @@ function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
   });
 }
 
-/*──────── 6d) EXCEL → CSV (robust; med/uden dato-filter) ────────*/
-// Hotfix v6.65.1: prøv både med og uden gdage_dato=i+dag
+/*──────── 6d) EXCEL → CSV (robust “classic”) ────────*/
+function normalizePhonebookHeader(csv) {
+  const lines = csv.split(/\r?\n/);
+  if (!lines.length) return csv;
+  const hdr = (lines[0] || '').split(',');
+  const mapName = (h) => {
+    const x = h.trim().toLowerCase();
+    if (/(vikar.*nr|vikar[_ ]?id|^id$)/.test(x)) return 'vikar_id';
+    if (/(navn|name)/.test(x)) return 'name';
+    if (/(^telefon$|phone(?!.*cell)|tlf)/.test(x)) return 'phone';
+    if (/(mobil|cellphone|mobile)/.test(x)) return 'cellphone';
+    return h.trim(); // behold original hvis ukendt
+  };
+  lines[0] = hdr.map(mapName).join(',');
+  return lines.join('\n');
+}
+
+// Vælg det sheet med flest datalinjer (≥1)
+function pickBestSheetCSV(wb) {
+  let best = { rows: 0, csv: '' };
+  for (const name of wb.SheetNames) {
+    const sheet = wb.Sheets[name];
+    let csv = XLSX.utils.sheet_to_csv(sheet, { FS: ',', RS: '\n' });
+    csv = normalizePhonebookHeader(csv);
+    const lines = csv.trim().split(/\r?\n/).filter(Boolean);
+    const dataRows = Math.max(0, lines.length - 1);
+    console.info('[TP][PB] Sheet:', name, 'rows:', dataRows);
+    if (dataRows > best.rows) best = { rows: dataRows, csv };
+  }
+  return best.rows >= 1 ? best.csv : null;
+}
+
+// Hent Excel (med/uden dato-filter), vælg bedste sheet, kræv min. header+1
 async function fetchExcelAsCSVText() {
   const base = `${location.origin}/index.php?page=print_vikar_list_custom_excel&id=true&name=true&phone=true&cellphone=true&sortBy=`;
   const urls = [
-    base + '&gdage_dato=i+dag', // 1) som før (kan være tom)
-    base                         // 2) fallback: uden filter
+    base + '&gdage_dato=i+dag', // som 6.63 (kan være tom)
+    base                         // fallback: uden filter
   ];
 
   async function getAB(url) {
@@ -459,17 +386,14 @@ async function fetchExcelAsCSVText() {
       const wb = XLSX.read(ab, { type: 'array' });
       if (!wb.SheetNames || wb.SheetNames.length === 0) throw new Error('Excel indeholder ingen ark');
 
-      const sheet = wb.Sheets[wb.SheetNames[0]];
-      let csv = XLSX.utils.sheet_to_csv(sheet, { FS: ',', RS: '\n' });
-      csv = normalizePhonebookHeader(csv);
-
-      const lines = csv.trim().split(/\r?\n/).filter(Boolean);
-      if (lines.length >= 2) {
-        console.info('[TP][PB] Excel→CSV OK fra', excelUrl, 'rækker:', lines.length - 1);
+      const csv = pickBestSheetCSV(wb);
+      if (csv) {
+        const totalLines = csv.trim().split(/\r?\n/).filter(Boolean).length;
+        console.info('[TP][PB] Excel→CSV OK fra', excelUrl, 'rækker:', totalLines - 1);
         return csv;
       } else {
-        console.warn('[TP][PB] Excel→CSV tom fra', excelUrl, '(kun header)');
-        lastError = new Error('CSV tom fra ' + excelUrl);
+        console.warn('[TP][PB] Ingen data fundet i nogen sheets for', excelUrl);
+        lastError = new Error('Alle sheets var tomme (kun headers)');
       }
     } catch (e) {
       console.warn('[TP][PB] Excel→CSV fejl', e);
@@ -479,48 +403,15 @@ async function fetchExcelAsCSVText() {
   throw new Error('Excel→CSV gav ingen rækker (prøvede både med og uden dato-filter): ' + (lastError ? lastError.message : 'ukendt fejl'));
 }
 
-function normalizePhonebookHeader(csv) {
-  const lines = csv.split(/\r?\n/);
-  if (!lines.length) return csv;
-  const hdr = (lines[0] || '').split(',');
-  const mapName = (h) => {
-    const x = h.trim().toLowerCase();
-    if (/(vikar.*nr|vikar[_ ]?id|^id$)/.test(x)) return 'vikar_id';
-    if (/(navn|name)/.test(x)) return 'name';
-    if (/(^telefon$|phone(?!.*cell)|tlf)/.test(x)) return 'phone';
-    if (/(mobil|cellphone|mobile)/.test(x)) return 'cellphone';
-    return h.trim();
-  };
-  lines[0] = hdr.map(mapName).join(',');
-  return lines.join('\n');
-}
-
-// CSV → JSON-map
-function csvToPhoneMapJSON(csvText) {
-  const m = parsePhonebookCSV(csvText);
-  const obj = {};
-  Array.from(m.entries())
-    .sort(([a],[b]) => a.localeCompare(b))
-    .forEach(([k, v]) => { obj[k] = { id: v.id, name: v.name }; });
-  return JSON.stringify(obj, null, 2);
-}
-
-// Excel→CSV + upload (tom-beskyttelse) + JSON-map
+// Excel→CSV + upload (stopper hvis tom)
 async function fetchExcelAsCSVAndUpload() {
-  const text = await fetchExcelAsCSVText(); // kaster fejl hvis tom
+  const text = await fetchExcelAsCSVText(); // kaster hvis tom
+  const lines = (text || '').trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2) throw new Error('CSV ser tom ud efter konvertering');
+
   const base64 = b64encodeUtf8(text);
   const { sha } = await ghGetSha(PB_OWNER, PB_REPO, PB_CSV, PB_BRANCH);
   await ghPutFile(PB_OWNER, PB_REPO, PB_CSV, base64, 'sync: Excel→CSV via TM', sha, PB_BRANCH);
-
-  // JSON-map
-  try {
-    const json = csvToPhoneMapJSON(text);
-    const base64j = b64encodeUtf8(json);
-    const meta = await ghGetSha(PB_OWNER, PB_REPO, PB_MAP, PB_BRANCH);
-    await ghPutFile(PB_OWNER, PB_REPO, PB_MAP, base64j, 'sync: regenerate vikarer.map.json', meta.sha, PB_BRANCH);
-  } catch(e) {
-    console.warn('[TP][PB][MAP-UPLOAD]', e);
-  }
 }
 
 // Kun rå XLSX (valgfrit)
@@ -574,7 +465,7 @@ function injectUI() {
     Object.assign(menu.style, {
       position:'fixed', zIndex:2147483647, background:'#fff', border:'1px solid #ccc',
       borderRadius:'8px', boxShadow:'0 2px 12px rgba(0,0,0,.25)', fontSize:'12px',
-      fontFamily:'sans-serif', padding:'10px', width:'380px'
+      fontFamily:'sans-serif', padding:'10px', width:'360px'
     });
     menu.innerHTML =
       '<div style="font-weight:700;margin-bottom:6px">Indstillinger</div>' +
@@ -591,7 +482,7 @@ function injectUI() {
       '<div id="tpLeaderHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
       '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
       '<div style="font-weight:700;margin-bottom:6px">Telefonbog (admin)</div>' +
-      '<div style="margin-bottom:6px;font-size:12px;color:#444">Repo: '+PB_OWNER+'/'+PB_REPO+' • Branch: '+PB_BRANCH+' • Filer: '+PB_CSV+' / '+PB_XLSX+' / '+PB_MAP+'</div>' +
+      '<div style="margin-bottom:6px;font-size:12px;color:#444">Repo: '+PB_OWNER+'/'+PB_REPO+' • Branch: '+PB_BRANCH+' • Filer: '+PB_CSV+' / '+PB_XLSX+'</div>' +
       '<div style="margin-bottom:6px">' +
         '<div style="font-weight:600;margin-bottom:4px">GitHub PAT (fine-grained, Contents: RW til dette repo)</div>' +
         '<input id="tpGitPAT" type="password" placeholder="ghp_… eller fine-grained" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
@@ -605,7 +496,7 @@ function injectUI() {
         '</div>' +
         '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
           '<input id="tpTestPhone" type="text" placeholder="Test nummer (fx 22 44 66 88)" style="flex:1;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
-          '<button id="tpLookupPhone" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Slå op</button>' +
+          '<button id="tpLookupPhone" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Slå op i CSV</button>' +
         '</div>' +
         '<div id="tpPBHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
       '</div>';
@@ -637,7 +528,7 @@ function injectUI() {
     pat.value = (GM_getValue('tpGitPAT') || '');
     pat.addEventListener('change', () => GM_setValue('tpGitPAT', pat.value || ''));
 
-    // Upload manuel CSV (med tom-beskyttelse)
+    // Upload manuel CSV (stop hvis tom)
     up.addEventListener('click', async () => {
       try {
         const token = (pat.value||'').trim(); if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
@@ -653,25 +544,16 @@ function injectUI() {
         pbh.textContent = 'Uploader CSV…';
         const { sha } = await ghGetSha(PB_OWNER, PB_REPO, PB_CSV, PB_BRANCH);
         await ghPutFile(PB_OWNER, PB_REPO, PB_CSV, base64, 'sync: upload CSV via TM', sha, PB_BRANCH);
-
-        // JSON-map
-        try {
-          const json = csvToPhoneMapJSON(text);
-          const base64j = b64encodeUtf8(json);
-          const meta = await ghGetSha(PB_OWNER, PB_REPO, PB_MAP, PB_BRANCH);
-          await ghPutFile(PB_OWNER, PB_REPO, PB_MAP, base64j, 'sync: regenerate vikarer.map.json', meta.sha, PB_BRANCH);
-        } catch(e) { console.warn('[TP][PB][MAP-UPLOAD]', e); }
-
-        pbh.textContent = 'CSV (og JSON-map) uploadet. RAW opdateres om få sek.';
+        pbh.textContent = 'CSV uploadet. RAW opdateres om få sek.';
         showToast('CSV uploadet.');
       } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
     });
 
-    // Excel→CSV + Upload (robust; med/uden dato-filter)
+    // Excel→CSV + Upload (robust; classic adfærd)
     csvUp.addEventListener('click', async () => {
       try {
         const token = (pat.value||'').trim(); if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
-        pbh.textContent = 'Henter Excel, konverterer til CSV og uploader …';
+        pbh.textContent = 'Henter Excel, vælger bedste ark og uploader CSV …';
         const t0 = Date.now();
         await fetchExcelAsCSVAndUpload(); // kaster hvis tom ⇒ ingen upload
         const ms = Date.now()-t0;
@@ -680,7 +562,7 @@ function injectUI() {
       } catch (e) { console.warn('[TP][PB][EXCEL→CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel→CSV upload: ' + (e&&e.message?e.message:''); showToast('Fejl – se konsol.'); }
     });
 
-    // Rå XLSX
+    // Rå XLSX (valgfri komplet liste)
     exUp.addEventListener('click', async () => {
       try {
         const token = (pat.value||'').trim(); if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
@@ -693,15 +575,16 @@ function injectUI() {
       } catch (e) { console.warn('[TP][PB][EXCEL-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel upload.'; showToast('Fejl – se konsol.'); }
     });
 
-    // TEST: opslag (smart CSV/JSON)
+    // TEST: vis navn + åbn stamoplysninger i NY fane (RAW CSV)
     tBtn.addEventListener('click', async () => {
       try {
         const raw = (tIn.value||'').trim();
         const p8 = normPhone(raw);
         if (!p8) { pbh.textContent = 'Ugyldigt nummer.'; return; }
 
-        pbh.textContent = 'Slår op i telefonbog…';
-        const map = await getPhonebookMapSmart();
+        pbh.textContent = 'Slår op i CSV…';
+        const csv = await gmGET(RAW_PHONEBOOK);
+        const map = parsePhonebookCSV(csv);
         const rec = map.get(p8);
 
         if (!rec) {
@@ -711,28 +594,12 @@ function injectUI() {
 
         pbh.textContent = `Match: ${p8} → ${rec.name || '(uden navn)'} (vikar_id=${rec.id})`;
         const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
-        window.open(url, '_blank', 'noopener');
+        window.open(url, '_blank', 'noopener'); // ny fane i testflowet
       } catch(e) {
         console.warn('[TP][PB][LOOKUP]', e);
         pbh.textContent = 'Fejl ved opslag.';
       }
     });
-
-    // 🧹 Ryd cache-knap
-    const clearBtn = document.createElement('button');
-    clearBtn.textContent = '🧹 Ryd telefonbogs-cache';
-    clearBtn.style.cssText = 'margin-top:8px;padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer';
-    clearBtn.addEventListener('click', async () => {
-      try {
-        await GM_setValue(CSV_CACHE_KEY, null);
-        await GM_setValue(MAP_CACHE_KEY, null);
-        pbh.textContent = 'Cache ryddet.';
-        showToast('Telefonbogs-cache ryddet.');
-      } catch (e) {
-        pbh.textContent = 'Kunne ikke rydde cache.';
-      }
-    });
-    menu.appendChild(clearBtn);
 
     return menu;
   }
@@ -786,7 +653,7 @@ pollMessages(); pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 injectUI();
-console.info('[TP] kører version 6.65.1');
+console.info('[TP] kører version 6.66');
 
 /*──────── 9) HOVER “Intet Svar” (auto-gem) ────────*/
 (function () {
