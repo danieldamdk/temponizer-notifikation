@@ -581,8 +581,9 @@
     }).observe(document.body, { childList:true, subtree:true });
   })();
 
-  /*──────────────────── 9. INIT ────────────────────*/
-  function init(){
+/*──────────────────── 9. INIT ────────────────────*/
+function init(){
+  try {
     dbg('ui init', { gear: true, panel: true });
     injectUI();
 
@@ -593,15 +594,31 @@
 
     log('kører version', APP.VERSION);
 
-    // måltid ;-)
-    try {
-      const t0 = performance.now();
-      setTimeout(()=> {
-        const dt = performance.now() - t0;
-        console.log('SCRIPT RUN TIME['+document.title.replaceAll('"','$1')+']: ' + dt + ' ms');
-      }, 0);
-    } catch(_){}
+    // fallback: hvis noget (CSS/DOM) forsinker, så prøv igen kort efter
+    setTimeout(() => { if (!document.getElementById('tpUi')) injectUI(); }, 600);
+  } catch (e) {
+    console.error('[TP] init-fejl:', e);
   }
 
-  document.addEventListener('DOMContentLoaded', init);
-})();
+  // lille perf-måling
+  try {
+    const t0 = performance.now();
+    setTimeout(()=> {
+      const dt = performance.now() - t0;
+      console.log('SCRIPT RUN TIME['+document.title.replaceAll('"','$1')+']: ' + dt + ' ms');
+    }, 0);
+  } catch(_){}
+}
+
+// Kør init uanset hvornår scriptet indlæses
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+  // DOM er allerede klar – kør nu
+  init();
+} else {
+  // DOM ikke klar endnu – lyt én gang
+  document.addEventListener('DOMContentLoaded', init, { once: true });
+}
+// Ekstra sikkerhed: kør også ved window.load, hvis noget forsinkes
+window.addEventListener('load', () => {
+  if (!document.getElementById('tpUi')) init();
+}, { once: true });
