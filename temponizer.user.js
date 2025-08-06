@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      6.65
-// @description  Push (leader), hover “Intet Svar”, ETag-optimering. Telefonbog: Excel→CSV + GitHub-synk + JSON-map fallback (>1MB). Caller-pop læser CSV/JSON fra repo. Robust Excel-download og beskyttelse mod tom upload. ⚙️ har test + cache-rydning.
+// @version      6.65.1
+// @description  Push (leader), hover “Intet Svar”, ETag-optimering. Telefonbog: Excel→CSV + GitHub-synk + JSON-map fallback (>1MB). Caller-pop læser CSV/JSON fra repo. Robust Excel-download (med/uden dato-filter) og beskyttelse mod tom upload. ⚙️ har test + cache-rydning.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -336,7 +336,7 @@ function parsePhonebookJSON(text) {
 async function getPhonebookMapSmart() {
   try {
     const csv = await fetchTextWithETagCache(RAW_PHONEBOOK, CSV_CACHE_KEY);
-    // Hvis CSV er tom/kun header, prøv JSON før parse
+    // Hvis CSV er tom/kun header, prøv JSON før parse – eller hvis stor fil
     if ((csv.text || '').trim().split(/\r?\n/).filter(Boolean).length < 2 || csv.len > RAW_MAX_BYTES) {
       try {
         const js = await fetchTextWithETagCache(RAW_PHONEBOOK_MAP, MAP_CACHE_KEY);
@@ -429,35 +429,54 @@ function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
   });
 }
 
-/*──────── 6d) EXCEL → CSV (robust) ────────*/
+/*──────── 6d) EXCEL → CSV (robust; med/uden dato-filter) ────────*/
+// Hotfix v6.65.1: prøv både med og uden gdage_dato=i+dag
 async function fetchExcelAsCSVText() {
-  const excelUrl = `${location.origin}/index.php?page=print_vikar_list_custom_excel&id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag&sortBy=`;
+  const base = `${location.origin}/index.php?page=print_vikar_list_custom_excel&id=true&name=true&phone=true&cellphone=true&sortBy=`;
+  const urls = [
+    base + '&gdage_dato=i+dag', // 1) som før (kan være tom)
+    base                         // 2) fallback: uden filter
+  ];
 
-  // 1) fetch med session-cookies
-  let ab = null;
-  try {
-    const r = await fetch(excelUrl, { credentials: 'include' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    ab = await r.arrayBuffer();
-  } catch (_) {
-    // 2) Fallback til GM
-    ab = await gmGETArrayBuffer(excelUrl);
+  async function getAB(url) {
+    try {
+      const r = await fetch(url, { credentials: 'include' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const ab = await r.arrayBuffer();
+      if (!ab || ab.byteLength < 200) throw new Error('Excel-download for lille (' + (ab ? ab.byteLength : 0) + ' bytes)');
+      return ab;
+    } catch (_) {
+      const ab = await gmGETArrayBuffer(url);
+      if (!ab || ab.byteLength < 200) throw new Error('Excel-download for lille (' + (ab ? ab.byteLength : 0) + ' bytes)');
+      return ab;
+    }
   }
 
-  if (!ab || ab.byteLength < 200) {
-    throw new Error('Excel-download var for lille (' + (ab ? ab.byteLength : 0) + ' bytes)');
+  let lastError = null;
+  for (const excelUrl of urls) {
+    try {
+      const ab = await getAB(excelUrl);
+      const wb = XLSX.read(ab, { type: 'array' });
+      if (!wb.SheetNames || wb.SheetNames.length === 0) throw new Error('Excel indeholder ingen ark');
+
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      let csv = XLSX.utils.sheet_to_csv(sheet, { FS: ',', RS: '\n' });
+      csv = normalizePhonebookHeader(csv);
+
+      const lines = csv.trim().split(/\r?\n/).filter(Boolean);
+      if (lines.length >= 2) {
+        console.info('[TP][PB] Excel→CSV OK fra', excelUrl, 'rækker:', lines.length - 1);
+        return csv;
+      } else {
+        console.warn('[TP][PB] Excel→CSV tom fra', excelUrl, '(kun header)');
+        lastError = new Error('CSV tom fra ' + excelUrl);
+      }
+    } catch (e) {
+      console.warn('[TP][PB] Excel→CSV fejl', e);
+      lastError = e;
+    }
   }
-
-  const wb = XLSX.read(ab, { type: 'array' });
-  if (!wb.SheetNames || wb.SheetNames.length === 0) throw new Error('Excel indeholder ingen ark');
-
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  let csv = XLSX.utils.sheet_to_csv(sheet, { FS: ',', RS: '\n' });
-  csv = normalizePhonebookHeader(csv);
-
-  const lines = csv.trim().split(/\r?\n/).filter(Boolean);
-  if (lines.length < 2) throw new Error('CSV ser tom ud efter konvertering (kun ' + lines.length + ' linje)');
-  return csv;
+  throw new Error('Excel→CSV gav ingen rækker (prøvede både med og uden dato-filter): ' + (lastError ? lastError.message : 'ukendt fejl'));
 }
 
 function normalizePhonebookHeader(csv) {
@@ -486,7 +505,7 @@ function csvToPhoneMapJSON(csvText) {
   return JSON.stringify(obj, null, 2);
 }
 
-// Excel→CSV + upload (med tom-beskyttelse) + JSON-map
+// Excel→CSV + upload (tom-beskyttelse) + JSON-map
 async function fetchExcelAsCSVAndUpload() {
   const text = await fetchExcelAsCSVText(); // kaster fejl hvis tom
   const base64 = b64encodeUtf8(text);
@@ -504,7 +523,7 @@ async function fetchExcelAsCSVAndUpload() {
   }
 }
 
-// Kun rå XLSX (ingen map) – valgfrit
+// Kun rå XLSX (valgfrit)
 async function fetchExcelAndUploadRawXLSX() {
   const excelUrl = `${location.origin}/index.php?page=print_vikar_list_custom_excel&id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag&sortBy=`;
   const ab = await gmGETArrayBuffer(excelUrl);
@@ -648,7 +667,7 @@ function injectUI() {
       } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
     });
 
-    // Excel→CSV + Upload (robust)
+    // Excel→CSV + Upload (robust; med/uden dato-filter)
     csvUp.addEventListener('click', async () => {
       try {
         const token = (pat.value||'').trim(); if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
@@ -767,7 +786,7 @@ pollMessages(); pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 injectUI();
-console.info('[TP] kører version 6.65');
+console.info('[TP] kører version 6.65.1');
 
 /*──────── 9) HOVER “Intet Svar” (auto-gem) ────────*/
 (function () {
