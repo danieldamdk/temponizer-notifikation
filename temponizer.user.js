@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      6.62
-// @description  Push (leader på tværs af faner), hover “Intet Svar”, ETag-optimering. Telefonbog: Excel→CSV (i browseren) + GitHub-synk. Caller-pop læser vikarer.csv fra repo. APP-token fastlåst, USER-token i GM storage. Testknap i ⚙️.
+// @version      6.63
+// @description  Push (leader på tværs af faner), hover “Intet Svar”, ETag-optimering. Telefonbog: Excel→CSV (i browseren) + GitHub-synk. Caller-pop læser vikarer.csv fra repo. APP-token fastlåst, USER-token i GM storage. Testknapper i ⚙️.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -178,7 +178,7 @@ function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.unti
 function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
 window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*noop*/} });
 
-/*──────── 6b) CALLER-POP (CSV → vikar_id) ────────*/
+/*──────── 6b) CALLER-POP (CSV → vikar_id/navn) ────────*/
 function normPhone(raw) {
   const digits = String(raw||'').replace(/\D/g,'').replace(/^0+/, '').replace(/^45/, '');
   return digits.length >= 8 ? digits.slice(-8) : '';
@@ -229,25 +229,31 @@ function parseCSV(text) {
   return rows.filter(r => r.length && r.some(x => x !== ''));
 }
 
-// Læs CSV → Map(phone8 → id), inkluder både 'Telefon' og 'Mobil'
+// Læs CSV → Map(phone8 → { id, name })
 function parsePhonebookCSV(text) {
   const map = new Map();
   const rows = parseCSV(text);
   if (!rows.length) return map;
+
   const header = rows[0].map(h => h.toLowerCase());
-  const idxId = header.findIndex(h => /(vikar.*nr|vikar[_ ]?id|^id$)/.test(h));
+  const idxId   = header.findIndex(h => /(vikar.*nr|vikar[_ ]?id|^id$)/.test(h));
+  const idxName = header.findIndex(h => /(navn|name)/.test(h));
   const phoneCols = header
-    .map((h, idx) => ({h, idx}))
+    .map((h, idx) => ({ h, idx }))
     .filter(x => /(telefon|mobil|cellphone|mobile|phone)/.test(x.h));
+
   if (idxId < 0 || phoneCols.length === 0) return map;
+
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
-    const id = (row[idxId] || '').trim();
+    const id   = (row[idxId]   || '').trim();
+    const name = idxName >= 0 ? (row[idxName] || '').trim() : '';
     if (!id) continue;
+
     for (const pc of phoneCols) {
       const val = (row[pc.idx] || '').trim();
       const p8 = normPhone(val);
-      if (p8) map.set(p8, id);
+      if (p8) map.set(p8, { id, name });
     }
   }
   return map;
@@ -262,10 +268,11 @@ async function callerPopIfNeeded() {
     if (!phone8) { showToast('Ukendt nummer: ' + raw); return; }
     const csv = await gmGET(RAW_PHONEBOOK);
     const map = parsePhonebookCSV(csv);
-    const id = map.get(phone8);
-    if (!id) { showToast('Ingen match for: ' + phone8); return; }
-    const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(id)}#stamoplysninger`;
-    showToast('Åbner vikar …'); location.assign(url);
+    const rec = map.get(phone8);
+    if (!rec) { showToast('Ingen match for: ' + phone8); return; }
+    const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
+    showToast(`Åbner vikar: ${rec.name || 'ukendt navn'} (${rec.id})`);
+    location.assign(url); // behold navigation i samme fane for caller-pop
   } catch (e) { console.warn('[TP][CALLER]', e); showToast('Kan ikke hente telefonbog lige nu.'); }
 }
 
@@ -497,16 +504,30 @@ function injectUI() {
       } catch (e) { console.warn('[TP][PB][EXCEL-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel upload.'; showToast('Fejl – se konsol.'); }
     });
 
+    // TEST: vis navn + åbn stamoplysninger i NY fane
     tBtn.addEventListener('click', async () => {
       try {
-        const raw = (tIn.value||'').trim(); const p8 = normPhone(raw);
+        const raw = (tIn.value||'').trim();
+        const p8 = normPhone(raw);
         if (!p8) { pbh.textContent = 'Ugyldigt nummer.'; return; }
+
         pbh.textContent = 'Slår op i CSV…';
         const csv = await gmGET(RAW_PHONEBOOK);
         const map = parsePhonebookCSV(csv);
-        const id = map.get(p8);
-        pbh.textContent = id ? `Match: ${p8} → vikar_id=${id}` : `Ingen match for ${p8}.`;
-      } catch(e) { console.warn('[TP][PB][LOOKUP]', e); pbh.textContent = 'Fejl ved opslag.'; }
+        const rec = map.get(p8);
+
+        if (!rec) {
+          pbh.textContent = `Ingen match for ${p8}.`;
+          return;
+        }
+
+        pbh.textContent = `Match: ${p8} → ${rec.name || '(uden navn)'} (vikar_id=${rec.id})`;
+        const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
+        window.open(url, '_blank', 'noopener'); // ny fane i testflowet
+      } catch(e) {
+        console.warn('[TP][PB][LOOKUP]', e);
+        pbh.textContent = 'Fejl ved opslag.';
+      }
     });
 
     return menu;
@@ -561,7 +582,7 @@ pollMessages(); pollInterest();
 setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 injectUI();
-console.info('[TP] kører version 6.62');
+console.info('[TP] kører version 6.63');
 
 /*──────── 9) HOVER “Intet Svar” (auto-gem) ────────*/
 (function () {
