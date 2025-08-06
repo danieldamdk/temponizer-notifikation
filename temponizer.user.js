@@ -2,7 +2,7 @@
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
 // @version      6.67
-// @description  Som 6.63 (RAW CSV lookup). Automatiseret download→konverter→upload med GET/POST-fallback og valg af bedste XLSX-ark. Uploader kun ved reelle rækker; ellers bevares eksisterende CSV. Push + interesse (leader), hover “Intet Svar”.
+// @description  Som 6.63 (RAW CSV lookup). Automatiseret download→konverter→upload med session-warmup (vikarlist_get), GET/POST-fallback og valg af bedste XLSX-ark. Uploader kun ved reelle rækker; ellers bevares eksisterende CSV. Push + interesse (leader), hover “Intet Svar”.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -179,15 +179,28 @@ function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLead
 window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*noop*/} });
 
 /*──────── 6a) HTTP helpers ────────*/
+function commonAjaxHeaders() {
+  const h = {
+    'X-Requested-With': 'XMLHttpRequest',
+    'Referer': location.href
+  };
+  const token = getCsrfToken();
+  if (token) h['x-csrf-token'] = token;
+  return h;
+}
+function getCsrfToken() {
+  const m = document.querySelector('meta[name="csrf-token"]');
+  if (m && m.content) return m.content.trim();
+  const i = document.querySelector('input[name="csrf-token"], input[name="csrf_token"], input[name="token"]');
+  if (i && i.value) return i.value.trim();
+  return '';
+}
 function gmGET(url) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
       method: 'GET',
       url,
-      headers: {
-        'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel;q=0.9, */*;q=0.8',
-        'Referer': location.href
-      },
+      headers: { ...commonAjaxHeaders() },
       onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
       onerror: e => reject(e)
     });
@@ -199,11 +212,20 @@ function gmGETArrayBuffer(url) {
       method: 'GET',
       url,
       responseType: 'arraybuffer',
-      headers: {
-        'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel;q=0.9, */*;q=0.8',
-        'Referer': location.href
-      },
+      headers: { ...commonAjaxHeaders(), 'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel;q=0.9,*/*;q=0.8' },
       onload: r => (r.status>=200 && r.status<300) ? resolve(r.response) : reject(new Error('HTTP '+r.status)),
+      onerror: e => reject(e)
+    });
+  });
+}
+function gmPOST(url, body) {
+  return new Promise((resolve, reject) => {
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url,
+      headers: { ...commonAjaxHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
+      data: body,
+      onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
       onerror: e => reject(e)
     });
   });
@@ -214,11 +236,7 @@ function gmPOSTArrayBuffer(url, body) {
       method: 'POST',
       url,
       responseType: 'arraybuffer',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel;q=0.9, */*;q=0.8',
-        'Referer': location.href
-      },
+      headers: { ...commonAjaxHeaders(), 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel;q=0.9,*/*;q=0.8' },
       data: body,
       onload: r => (r.status>=200 && r.status<300) ? resolve(r.response) : reject(new Error('HTTP '+r.status)),
       onerror: e => reject(e)
@@ -237,7 +255,7 @@ function parseCSV(text) {
   if (!text) return [];
   text = text.replace(/^\uFEFF/, '');
   const firstLine = (text.split(/\r?\n/)[0] || '');
-  const delim = (firstLine.indexOf(';') > firstLine.indexOf(',')) ? ';' : (firstLine.includes(';') ? ';' : ',');
+  const delim = (firstLine.indexOf(';') > -1 && (firstLine.indexOf(',') === -1 || firstLine.indexOf(';') < firstLine.indexOf(','))) ? ';' : ',';
   const rows = [];
   let i = 0, field = '', row = [], inQuotes = false;
   while (i < text.length) {
@@ -382,6 +400,73 @@ function pickBestSheetCSV(wb) {
   }
   return best.rows >= 1 ? best.csv : null;
 }
+
+/* *** VIGTIGT NYT: Session-warmup før eksport *** */
+function fmtTodayDK() {
+  const d = new Date();
+  const dd = String(d.getDate()).padStart(2,'0');
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const yyyy = d.getFullYear();
+  return `${dd}.${mm}.${yyyy}`;
+}
+async function warmUpVikarListSession() {
+  // Minimal payload baseret på det du så i devtools, så printlisten faktisk får rækker
+  const today = encodeURIComponent(fmtTodayDK());
+  const body =
+    'page=vikarlist_get' +
+    '&ajax=true' +
+    '&showheader=true' +
+    '&printlist=true' +
+    '&fieldset_filtre=closed' +
+    '&fieldset_aktivitet=closed' +
+    '&kunder_id=0' +
+    '&kunde_afdeling_id=' +
+    '&arbejdssteder_id=' +
+    '&searchFromUrl=false' +
+    '&query=' +
+    '&query_vikar_nr=' +
+    '&postnummer_fra=' +
+    '&postnummer_til=' +
+    '&fetchIds=' +
+    '&days_to_birthday=2' +
+    '&vagtonskeridag_dato=i+dag' +
+    '&vagtoenskeridag_starttidspunkt=' +
+    '&vagtoenskeridag_sluttidspunkt=' +
+    '&vagtoenskeridag_dag=true' +
+    '&vagtoenskeridag_aften=true' +
+    '&vagtoenskeridag_nat=true' +
+    '&vagtoenskeridag_heledag=true' +
+    '&ansaettelsesdato_datofra=' +
+    '&ansaettelsesdato_datotil=' +
+    '&ingenvagterfra=' +
+    '&ingenvagtertil=' +
+    '&medvagterfra=' +
+    '&medvagtertil=' +
+    '&medgodkendtevagterfra=' +
+    '&medgodkendtevagtertil=' +
+    '&afholdte_dato=' + today +
+    '&ingenvagtoenskerfra=' +
+    '&ingenvagtoenskertil=' +
+    '&sex=both' +
+    '&kontor_id=-1' +
+    '&udbetalingsmetode=-1' +
+    '&loenkorsel_id=0' +
+    '&kunde_radius_search=0' +
+    '&vikar_rolle=0' +
+    '&booking_grupper_id=-1' +
+    '&kunder_sel_width=400' +
+    '&kunder_sel_id=0' +
+    '&kunder_select_search=' +
+    '&kunder_id_0=0' +
+    '&vagterfra=' +
+    '&vagtertil=' +
+    '&list_uddannelse_id_all=true' +
+    '&uddannelse_gyldig=' + today +
+    '&kompetencegyldig=' + today;
+
+  await gmPOST(`${location.origin}/index.php`, body);
+}
+
 async function tryExcelGET(params) {
   const url = `${location.origin}/index.php?page=print_vikar_list_custom_excel&sortBy=&${params}`;
   const ab = await gmGETArrayBuffer(url);
@@ -393,6 +478,9 @@ async function tryExcelPOST(params) {
   return ab;
 }
 async function fetchExcelAsCSVText() {
+  // Varm sessionen op først, så serveren har en "printlist" med rækker
+  try { await warmUpVikarListSession(); } catch (e) { console.warn('[TP][PB] warmUp fejlede (fortsætter alligevel):', e); }
+
   // Forsøg i denne rækkefølge: GET (med dato) → GET (uden) → POST (med) → POST (uden)
   const tries = [
     { fn: tryExcelGET,  params: 'id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag' },
@@ -404,7 +492,7 @@ async function fetchExcelAsCSVText() {
   for (const t of tries) {
     try {
       const ab = await t.fn(t.params);
-      if (!ab || ab.byteLength < 128) { lastInfo = 'too small'; continue; }
+      if (!ab || ab.byteLength < 256) { lastInfo = 'too small'; continue; }
       const wb = XLSX.read(ab, { type: 'array' });
       if (!wb.SheetNames || wb.SheetNames.length === 0) { lastInfo = 'no sheets'; continue; }
       const csv = pickBestSheetCSV(wb);
@@ -421,7 +509,6 @@ async function fetchExcelAsCSVText() {
 async function fetchExcelAsCSVAndUpload() {
   const text = await fetchExcelAsCSVText();         // kan være null ved header-only
   if (!text) {
-    // Bevar eksisterende CSV i repo, så caller-pop ikke går i stykker
     showToastOnce('csv', 'Temponizer gav ingen rækker – beholdt eksisterende CSV (ingen upload).');
     return;
   }
@@ -436,7 +523,6 @@ async function fetchExcelAsCSVAndUpload() {
   showToastOnce('csvok', 'CSV uploadet (Excel→CSV).');
 }
 async function fetchExcelAndUploadRawXLSX() {
-  // Beholder denne som i 6.63 (knappen er i UI), men bruges kun hvis du klikker den.
   const url = `${location.origin}/index.php?page=print_vikar_list_custom_excel&id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag&sortBy=`;
   const ab = await gmGETArrayBuffer(url);
   const u8 = new Uint8Array(ab);
@@ -548,7 +634,7 @@ function injectUI() {
     pat.value = (GM_getValue('tpGitPAT') || '');
     pat.addEventListener('change', () => GM_setValue('tpGitPAT', pat.value || ''));
 
-    // Manuel CSV (som i 6.63)
+    // Manuel CSV
     up.addEventListener('click', async () => {
       try {
         const token = (pat.value||'').trim(); if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
@@ -563,18 +649,18 @@ function injectUI() {
       } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
     });
 
-    // Auto: Excel → CSV → Upload (robust og fuldautomatisk)
+    // Auto: Excel → CSV → Upload
     csvUp.addEventListener('click', async () => {
       try {
-        pbh.textContent = 'Henter Excel (GET/POST), vælger bedste ark og uploader CSV …';
+        pbh.textContent = 'Henter Excel (warmup + GET/POST), vælger bedst ark og uploader CSV …';
         const t0 = Date.now();
-        await fetchExcelAsCSVAndUpload(); // ingen manuel intervention
+        await fetchExcelAsCSVAndUpload();
         const ms = Date.now()-t0;
         pbh.textContent = `Færdig på ${ms} ms.`;
       } catch (e) { console.warn('[TP][PB][EXCEL→CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel→CSV upload.'; showToast('Fejl – se konsol.'); }
     });
 
-    // Rå XLSX (som i 6.63 — valgfri)
+    // Rå XLSX
     exUp.addEventListener('click', async () => {
       try {
         pbh.textContent = 'Henter Excel fra server …';
@@ -586,7 +672,7 @@ function injectUI() {
       } catch (e) { console.warn('[TP][PB][EXCEL-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel upload.'; showToast('Fejl – se konsol.'); }
     });
 
-    // TEST lookup (RAW CSV) — som 6.63
+    // TEST lookup
     tBtn.addEventListener('click', async () => {
       try {
         const raw = (tIn.value||'').trim();
