@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.14
-// @description  Push (leader+suppression), toast (Smart/Force DOM, max 1 OS på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + aktivér/deaktiver) uden popup i hovedpanelet. Gear i header. Ingen timestamp/refresh i SMS-UI.
+// @version      7.9.15
+// @description  Push (leader+suppression), toast (Smart/Force DOM, max 1 OS på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + aktivér/deaktiver) uden popup i hovedpanelet. Gear i header. Interesse-poller tvinger let GET jævnligt (no-cache).
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -22,7 +22,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.14';
+const TP_VERSION = '7.9.15';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -187,28 +187,63 @@ function pollMessages() {
     .catch(e => console.warn('[TP][ERR][MSG]', e));
 }
 
+/* Interesse – HEAD + tvungen let GET jævnligt (no-cache) */
 const HTML_URL = location.origin + '/index.php?page=freevagter';
 let lastETag = localStorage.getItem('tpLastETag') || null;
+const INT_FORCE_GET_MS = 120000; // tving fuld GET mindst hver 2 min
+let lastInterestFullParse = Number(localStorage.getItem('tpIntLastFull') || 0);
+
 function pollInterest() {
   if (!isLeader()) return;
-  fetch(HTML_URL, { method: 'HEAD', credentials: 'same-origin', headers: lastETag ? { 'If-None-Match': lastETag } : {} })
+
+  const forceGet = (Date.now() - lastInterestFullParse) > INT_FORCE_GET_MS;
+
+  fetch(HTML_URL, {
+    method: 'HEAD',
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: {
+      ...(lastETag ? { 'If-None-Match': lastETag } : {}),
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache'
+    }
+  })
   .then(h => {
-    if (h.status === 304) { console.info('[TP-interesse] uændret', new Date().toLocaleTimeString()); return; }
-    lastETag = h.headers.get('ETag') || null;
+    const et = h.headers.get('ETag') || null;
+    const etChanged = et && et !== lastETag;
+    lastETag = et;
     if (lastETag) localStorage.setItem('tpLastETag', lastETag);
-    return fetch(HTML_URL, { credentials: 'same-origin', headers: { Range: 'bytes=0-20000' } }).then(r => r.text()).then(parseInterestHTML);
+
+    if (h.status !== 304 || etChanged || forceGet) {
+      return fetch(HTML_URL, {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: { Range: 'bytes=0-20000', 'Cache-Control':'no-cache', 'Pragma':'no-cache' }
+      }).then(r => r.text()).then(parseInterestHTML);
+    } else {
+      console.info('[TP-interesse] 304 (skipper) •', new Date().toLocaleTimeString());
+    }
   })
   .catch(e => {
     console.warn('[TP][ERR][INT][HEAD]', e);
-    fetch(HTML_URL, { credentials: 'same-origin', headers: { Range: 'bytes=0-20000' } })
-      .then(r => r.text()).then(parseInterestHTML).catch(err => console.warn('[TP][ERR][INT][GET]', err));
+    fetch(HTML_URL, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: { Range: 'bytes=0-20000', 'Cache-Control':'no-cache', 'Pragma':'no-cache' }
+    }).then(r => r.text()).then(parseInterestHTML)
+     .catch(err => console.warn('[TP][ERR][INT][GET]', err));
   });
 }
+
 function parseInterestHTML(html) {
   if (!isLeader()) return;
   const doc   = new DOMParser().parseFromString(html, 'text/html');
   const boxes = Array.prototype.slice.call(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
   const c = boxes.reduce((s, el) => { const v = parseInt(el.textContent.trim(), 10); return s + (isNaN(v) ? 0 : v); }, 0);
+
+  lastInterestFullParse = Date.now();
+  localStorage.setItem('tpIntLastFull', String(lastInterestFullParse));
+
   const stInt = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0});
   const en = localStorage.getItem('tpPushEnableInt') === 'true';
   if (c > stInt.count && c !== stInt.lastSent) {
@@ -229,7 +264,7 @@ function now() { return Date.now(); }
 function getLeader() { try { return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null'); } catch (_) { return null; } }
 function setLeader(obj) { localStorage.setItem(LEADER_KEY, JSON.stringify(obj)); }
 function isLeader() { const L = getLeader(); return !!(L && L.id === TAB_ID && L.until > now()); }
-function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.until || 0) <= t) { setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); if (isLeader()) console.info('[TP][LEADER] Denne fane er nu leder:', TAB_ID);} }
+function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.until || 0) <= t) { setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); if (isLeader()) console.info('[TP][LEADER] Denne fane er nu leader:', TAB_ID);} }
 function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
 window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*no-op*/} });
 
@@ -919,7 +954,8 @@ function injectUI() {
   }
   d.querySelector('#tpGearBtn').addEventListener('click', toggleMenu);
   document.addEventListener('mousedown', e => {
-    if (menu && menu.style.display === 'block' && e.target !== menu && !menu.contains(e.target) && e.target !== d.querySelector('#tpGearBtn')) menu.style.display = 'none';
+    const gearBtn = d.querySelector('#tpGearBtn');
+    if (menu && menu.style.display === 'block' && e.target !== menu && !menu.contains(e.target) && e.target !== gearBtn) menu.style.display = 'none';
   });
   window.addEventListener('resize', () => { ensureFullyVisible(d); if (menu && menu.style.display === 'block') positionMenu(menu); });
 }
