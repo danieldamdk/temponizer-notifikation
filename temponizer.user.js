@@ -1,26 +1,27 @@
-// ==UserScript==
-// @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
-// @namespace    ajourcare.dk
-// @version      7.9.12
-// @description  Push (leader+suppression), toast (Smart/Force DOM, max 1 OS på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + aktivér/deaktiver) helt uden popup i hovedpanelet. Gear inde i panelets header; ingen popup/faneforsøg fra SMS-iframe.
-// @match        https://ajourcare.temponizer.dk/*
-// @grant        GM_xmlhttpRequest
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        unsafeWindow
-// @connect      api.pushover.net
-// @connect      raw.githubusercontent.com
-// @connect      api.github.com
-// @connect      ajourcare.temponizer.dk
-// @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
-// @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
-// @homepageURL  https://github.com/danieldamdk/temponizer-notifikation
-// @supportURL   https://github.com/danieldamdk/temponizer-notifikation/issues
-// @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
-// ==/UserScript==
+ // ==UserScript==
+ // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
+ // @namespace    ajourcare.dk
+ // @version      7.9.13
+ // @description  ...
+ // @match        https://ajourcare.temponizer.dk/*
+ // @grant        GM_xmlhttpRequest
+ // @grant        GM_getValue
+ // @grant        GM_setValue
+ // @grant        unsafeWindow
+ // @noframes
+ // @connect      api.pushover.net
+ // @connect      raw.githubusercontent.com
+ // @connect      api.github.com
+ // @connect      ajourcare.temponizer.dk
+ // @run-at       document-idle
+ // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
+ // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
+ // @homepageURL  https://github.com/danieldamdk/temponizer-notifikation
+ // @supportURL   https://github.com/danieldamdk/temponizer-notifikation/issues
+ // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
+ // ==/UserScript==
 
-const TP_VERSION = '7.9.12';
+const TP_VERSION = '7.9.13';
 
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
 const POLL_MS=30000,SUPPRESS_MS=45000,LOCK_MS=SUPPRESS_MS+5000;
