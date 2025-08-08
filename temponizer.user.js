@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.5
-// @description  Push (leader, suppression), toast (Smart: DOM når synlig, OS når skjult • max 1 OS), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS-notifikation (status + toggle) direkte i hovedpanelet.
+// @version      7.9.6
+// @description  Push (leader, suppression), toast (Smart: DOM når synlig, OS når skjult • max 1 OS), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + toggle) direkte i hovedpanelet.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -21,7 +21,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.5';
+const TP_VERSION = '7.9.6';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -103,7 +103,6 @@ function broadcastToast(type, msg) {
     localStorage.setItem(TOAST_EVT_KEY, JSON.stringify(ev));
   } catch (_) {}
 }
-// Non-leaders viser kun DOM-toast (så OS kun én gang fra leader)
 window.addEventListener('storage', e => {
   if (e.key !== TOAST_EVT_KEY || !e.newValue) return;
   try {
@@ -117,7 +116,7 @@ window.addEventListener('storage', e => {
   } catch (_) {}
 });
 
-/*──────── 2b) STATUS-BANNER (caller-pop debug) ────────*/
+/*──────── 2b) STATUS-BANNER ────────*/
 function tpBanner(msg, ms = 4000) {
   try {
     let el = document.getElementById('tpCallerBanner');
@@ -187,7 +186,7 @@ function pollMessages() {
           const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
           if (en) sendPushover(m);
           broadcastToast('msg', m);
-          showToastOnce('msg', m); // OS kun i leader
+          showToastOnce('msg', m);
           stMsg.lastPush = Date.now(); stMsg.lastSent = n;
         } else stMsg.lastSent = n;
       } else if (n < stMsg.count) { stMsg.lastPush = 0; }
@@ -232,7 +231,7 @@ function parseInterestHTML(html) {
       const m = '👀 ' + c + ' vikar(er) har vist interesse for ledige vagter';
       if (en) sendPushover(m);
       broadcastToast('int', m);
-      showToastOnce('int', m); // OS kun i leader
+      showToastOnce('int', m);
       stInt.lastPush = Date.now(); stInt.lastSent = c;
     } else stInt.lastSent = c;
   } else if (c < stInt.count) stInt.lastPush = 0;
@@ -294,13 +293,11 @@ function gmPOSTArrayBuffer(url, body) {
   });
 }
 
-/*──────── 6b) CALLER-POP (RAW CSV) ────────*/
+/*──────── 6b) CALLER-POP ────────*/
 function normPhone(raw) {
   const digits = String(raw||'').replace(/\D/g,'').replace(/^0+/, '').replace(/^45/, '');
   return digits.length >= 8 ? digits.slice(-8) : '';
 }
-
-// Delimiter-detektion
 function detectDelimiter(sample) {
   const lines = sample.split(/\r?\n/).slice(0, 5).filter(Boolean);
   let cComma = 0, cSemi = 0;
@@ -311,8 +308,6 @@ function detectDelimiter(sample) {
   }
   return cSemi > cComma ? ';' : ',';
 }
-
-// Simple CSV parser
 function parseCSV(text) {
   if (!text) return [];
   text = text.replace(/^\uFEFF/, '');
@@ -334,8 +329,6 @@ function parseCSV(text) {
   if (field.length || row.length) { row.push(field.trim()); rows.push(row); }
   return rows.filter(r => r.length && r.some(x => x !== ''));
 }
-
-// CSV → Map
 function parsePhonebookCSV(text) {
   const map = new Map();
   const rows = parseCSV(text);
@@ -361,8 +354,6 @@ function parsePhonebookCSV(text) {
   }
   return { map, header };
 }
-
-/* Inbound-only pop. ★ STRENGT kø-indgående (kræver *1500) + NUL FLASH ved alt andet. */
 async function callerPopIfNeeded() {
   try {
     const q = new URLSearchParams(location.search);
@@ -371,7 +362,7 @@ async function callerPopIfNeeded() {
 
     const rawStr = String(rawParam).trim();
 
-    // Skjul siden straks for at undgå "flash"
+    // Skjul siden straks (nul flash på ikke-køkald)
     const unsetHide = (() => {
       const html = document.documentElement;
       const old = html.style.visibility;
@@ -388,7 +379,6 @@ async function callerPopIfNeeded() {
       return;
     }
 
-    // Ægte køkald → unhide og fortsæt
     unsetHide();
 
     const digitsRaw = rawStr.replace(/\*1500\s*$/,'').replace(/[^\d+]/g, '');
@@ -399,7 +389,6 @@ async function callerPopIfNeeded() {
 
     if (!phone8) { tpBanner('Ukendt nummerformat: ' + rawStr, 5000); return; }
 
-    // Try RAW først, så cache
     let csvText = '';
     try {
       csvText = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now());
@@ -427,7 +416,7 @@ async function callerPopIfNeeded() {
   }
 }
 
-/*──────── 6c) GITHUB API (upload) ────────*/
+/*──────── 6c) GITHUB API ────────*/
 function b64encodeUtf8(str) {
   const bytes = new TextEncoder().encode(str);
   let bin=''; bytes.forEach(b=>bin+=String.fromCharCode(b)); return btoa(bin);
@@ -471,7 +460,7 @@ function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
   });
 }
 
-/*──────── 6d) EXCEL → CSV (auto) ────────*/
+/*──────── 6d) EXCEL → CSV ────────*/
 function normalizePhonebookHeader(csv) {
   const lines = csv.split(/\r?\n/);
   if (!lines.length) return csv;
@@ -545,7 +534,7 @@ async function fetchExcelAsCSVAndUpload() {
   showToastOnce('csvok', 'CSV uploadet (Excel→CSV).');
 }
 
-/*──────── 6e) SMS NOTIF (status + aktiver/deaktivér) ────────*/
+/*──────── 6e) SMS (status + aktiver/deaktivér) ────────*/
 const SMS_SETTINGS_URL = `${location.origin}/index.php?page=showmy_settings`;
 function isVisible(el) {
   if (!el) return false;
@@ -586,11 +575,9 @@ function createHiddenIframe(id, url) {
   try {
     const u = new URL(location.href);
     if (u.searchParams.get('page') !== 'showmy_settings') return;
-    const hash = (u.hash || '').toLowerCase();
-    const m = hash.match(/tp_sms_auto=(activate|deactivate)/);
+    const m = (u.hash || '').toLowerCase().match(/tp_sms_auto=(activate|deactivate)/);
     if (!m) return;
     const action = m[1];
-
     const doClick = () => {
       const doc = document;
       const link = action === 'activate'
@@ -611,6 +598,7 @@ function createHiddenIframe(id, url) {
 const sms = {
   _iframeId: 'tpSmsFrame',
   _last: null,
+
   refreshViaIframe(statusCb, errorCb) {
     try {
       const ifr = createHiddenIframe(this._iframeId, SMS_SETTINGS_URL + '&ts=' + Date.now());
@@ -626,6 +614,7 @@ const sms = {
       ifr.addEventListener('load', onLoad);
     } catch (e) { errorCb && errorCb(e); }
   },
+
   refreshViaXHR(statusCb, errorCb) {
     gmGET(SMS_SETTINGS_URL + '&t=' + Date.now())
       .then(html => {
@@ -636,38 +625,43 @@ const sms = {
       })
       .catch(e => errorCb && errorCb(e));
   },
+
+  _clickInIframeAndWait(selector, after) {
+    try {
+      const ifr = document.getElementById(this._iframeId);
+      if (!ifr || !ifr.contentDocument) return false;
+      const doc = ifr.contentDocument;
+      const a = doc.querySelector(selector);
+      if (!a) return false;
+      const onLoad = () => {
+        ifr.removeEventListener('load', onLoad);
+        after && after();
+      };
+      ifr.addEventListener('load', onLoad);
+      a.click();
+      // fallback hvis load ikke kommer (fx JS navigerer uden full reload)
+      setTimeout(() => { try { ifr.removeEventListener('load', onLoad); } catch(_){} after && after(); }, 7000);
+      return true;
+    } catch(_) { return false; }
+  },
+
   activate(uiBusy, statusCb) {
     const done = () => this.refresh(statusCb);
-    const ifr = document.getElementById(this._iframeId);
-    try {
-      if (ifr && ifr.contentDocument) {
-        const doc = ifr.contentDocument;
-        const a = doc.querySelector('#sms_notifikation_ikke_aktiv a');
-        if (a) { a.click(); setTimeout(done, 1200); return; }
-      }
-    } catch(_) {}
+    if (this._clickInIframeAndWait('#sms_notifikation_ikke_aktiv a', done)) return;
+    // fallback: mini-vindue
     uiBusy && uiBusy(true);
     const w = window.open(SMS_SETTINGS_URL + '#tp_sms_auto=activate', 'tpSmsActivate', 'width=520,height=420');
-    const timer = setInterval(() => {
-      if (!w || w.closed) { clearInterval(timer); uiBusy && uiBusy(false); done(); }
-    }, 500);
+    const timer = setInterval(() => { if (!w || w.closed) { clearInterval(timer); uiBusy && uiBusy(false); done(); } }, 500);
   },
+
   deactivate(uiBusy, statusCb) {
     const done = () => this.refresh(statusCb);
-    const ifr = document.getElementById(this._iframeId);
-    try {
-      if (ifr && ifr.contentDocument) {
-        const doc = ifr.contentDocument;
-        const a = doc.querySelector('#sms_notifikation_aktiv a');
-        if (a) { a.click(); setTimeout(done, 1200); return; }
-      }
-    } catch(_) {}
+    if (this._clickInIframeAndWait('#sms_notifikation_aktiv a', done)) return;
     uiBusy && uiBusy(true);
     const w = window.open(SMS_SETTINGS_URL + '#tp_sms_auto=deactivate', 'tpSmsDeactivate', 'width=520,height=420');
-    const timer = setInterval(() => {
-      if (!w || w.closed) { clearInterval(timer); uiBusy && uiBusy(false); done(); }
-    }, 500);
+    const timer = setInterval(() => { if (!w || w.closed) { clearInterval(timer); uiBusy && uiBusy(false); done(); } }, 500);
   },
+
   refresh(statusCb) {
     let did = false;
     const fallbackT = setTimeout(() => {
@@ -689,6 +683,7 @@ function makeDraggable(el, storageKey, handleSelector) {
   const handle = handleSelector ? el.querySelector(handleSelector) : el;
   if (!handle) return;
   handle.style.cursor = 'move';
+  handle.style.userSelect = 'none';
   let moving = false, startX = 0, startY = 0, baseLeft = 0, baseTop = 0;
 
   try {
@@ -744,22 +739,37 @@ function injectUI() {
 
   const d = document.createElement('div');
   d.id = 'tpPanel';
-  d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:2147483645;background:#f9f9f9;border:1px solid #ccc;padding:8px 10px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2);min-width:250px';
+  d.style.cssText = [
+    'position:fixed',
+    'top:12px',          // flyttet til top-right
+    'right:12px',
+    'z-index:2147483645',
+    'background:#f9f9f9',
+    'border:1px solid #ccc',
+    'padding:8px 10px',
+    'border-radius:6px',
+    'font-size:12px',
+    'font-family:sans-serif',
+    'box-shadow:1px 1px 5px rgba(0,0,0,.2)',
+    'width:300px',       // fast bredde for at undgå “resize”-fornemmelse
+    'resize:none'        // sikkerhed – ingen resize-håndtag
+  ].join(';');
   d.innerHTML =
-    '<div id="tpPanelHeader" style="font-weight:700;cursor:move">TP Notifikationer</div>' +
-    '<div style="margin-top:6px;display:flex;flex-direction:column;gap:4px">' +
+    '<div id="tpPanelHeader" style="font-weight:700;cursor:move;user-select:none">TP Notifikationer</div>' +
+    '<div style="margin-top:6px;display:flex;flex-direction:column;gap:6px">' +
       '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="m"> <span>Besked (Pushover)</span></label>' +
       '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="i"> <span>Interesse (Pushover)</span></label>' +
-      '<div id="smsRow" style="display:flex;align-items:center;gap:6px;">' +
-        '<label style="display:flex;align-items:center;gap:6px;flex:1;margin:0">' +
-          '<input type="checkbox" id="smsToggle" disabled> <span>SMS (Temponizer)</span>' +
-          '<span id="smsTag" style="font-size:11px;color:#666;">indlæser…</span>' +
+      '<div id="smsRow" style="display:flex;align-items:center;gap:6px;white-space:nowrap">' +
+        '<label style="display:flex;align-items:center;gap:6px;flex:1;min-width:0;margin:0">' +
+          '<input type="checkbox" id="smsToggle" disabled> <span>SMS</span>' +
+          '<span id="smsTag" style="font-size:11px;color:#666;overflow:hidden;text-overflow:ellipsis;">indlæser…</span>' +
         '</label>' +
-        '<button id="smsRefresh" title="Opdatér status" style="padding:2px 6px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer">↻</button>' +
+        '<button id="smsRefresh" title="Opdatér status" style="padding:2px 6px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer;flex:0 0 auto">↻</button>' +
       '</div>' +
     '</div>';
   document.body.appendChild(d);
   makeDraggable(d, 'tpPanelPos', '#tpPanelHeader');
+  ensureFullyVisible(d); // sørg for at hele panelet er på skærmen fra start
 
   const m = d.querySelector('#m'), i = d.querySelector('#i');
   m.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
@@ -767,15 +777,15 @@ function injectUI() {
   m.onchange = () => localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false');
   i.onchange = () => localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false');
 
-  // SMS UI (status + toggle)
+  // SMS UI
   const smsToggle  = d.querySelector('#smsToggle');
   const smsTag     = d.querySelector('#smsTag');
   const smsRefresh = d.querySelector('#smsRefresh');
 
   function smsSetBusy(on, text) {
-    smsToggle.disabled = true;
+    smsToggle.disabled  = true;
     smsRefresh.disabled = true;
-    smsTag.textContent = on ? (text || 'arbejder…') : smsTag.textContent;
+    if (on) smsTag.textContent = text || 'arbejder…';
   }
   function smsRender(st, viaXHR) {
     const time = new Date().toLocaleTimeString();
@@ -817,21 +827,20 @@ function injectUI() {
     const wantOn = smsToggle.checked;
     smsSetBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
     if (wantOn) {
-      sms.activate(smsSetBusy, (st, viaXHR) => { smsRender(st, viaXHR); showToast('SMS notifikation aktiveret (hvis muligt).'); });
+      sms.activate(smsSetBusy, (st, viaXHR) => { smsRender(st, viaXHR); showToast('SMS aktiveret (hvis muligt).'); });
     } else {
-      sms.deactivate(smsSetBusy, (st, viaXHR) => { smsRender(st, viaXHR); showToast('SMS notifikation deaktiveret.'); });
+      sms.deactivate(smsSetBusy, (st, viaXHR) => { smsRender(st, viaXHR); showToast('SMS deaktiveret.'); });
     }
   });
-  // Første load
   smsSetBusy(true, 'indlæser…');
   sms.refresh(smsRender);
 
-  // Tandhjul (indstillinger — uden SMS nu)
+  // Tandhjul (øvrige indstillinger)
   if (!document.getElementById('tpGear')) {
     const gear = document.createElement('div');
     gear.id = 'tpGear'; gear.title = 'Indstillinger'; gear.innerHTML = '⚙️';
     Object.assign(gear.style, {
-      position:'fixed', right:'12px', bottom: (8 + d.offsetHeight + 10) + 'px',
+      position:'fixed', right:'12px', top: (d.getBoundingClientRect().top + d.offsetHeight + 10) + 'px',
       width:'22px', height:'22px', lineHeight:'22px', textAlign:'center',
       background:'#fff', border:'1px solid #ccc', borderRadius:'50%',
       boxShadow:'0 1px 5px rgba(0,0,0,.2)', cursor:'pointer',
@@ -897,7 +906,6 @@ function injectUI() {
       // Pushover
       const inp  = menu.querySelector('#tpUserKeyMenu');
       const save = menu.querySelector('#tpSaveUserKeyMenu');
-      const hint = menu.querySelector('#tpLeaderHint'); // ikke vist længere, men behold mulighed
       inp.value = getUserKey();
       save.addEventListener('click', () => { GM_setValue('tpUserKey', (inp.value||'').trim()); showToast('USER-token gemt.'); });
       inp.addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); GM_setValue('tpUserKey',(inp.value||'').trim()); showToast('USER-token gemt.'); }});
@@ -914,7 +922,7 @@ function injectUI() {
       forceDom.onchange = () => { localStorage.setItem('tpForceDOMToast', forceDom.checked ? 'true' : 'false'); syncToggles('force'); };
       smart.onchange    = () => { localStorage.setItem('tpSmartToast',    smart.checked    ? 'true' : 'false'); syncToggles('smart'); };
 
-      // Telefonbog (PAT + CSV upload/drag/drop + test)
+      // Telefonbog widgets (samme som 7.9.5) — uændret for korthed
       const pat   = menu.querySelector('#tpGitPAT');
       const file  = menu.querySelector('#tpCSVFile');
       const up    = menu.querySelector('#tpUploadCSV');
@@ -1013,7 +1021,7 @@ function injectUI() {
       const mnu = buildMenu();
       const r = gear.getBoundingClientRect();
       mnu.style.right = (window.innerWidth - r.right) + 'px';
-      mnu.style.bottom = (window.innerHeight - r.top + 6) + 'px';
+      mnu.style.top = (r.bottom + 6) + 'px';
       mnu.style.display = (mnu.style.display === 'block' ? 'none' : 'block');
     }
     gear.addEventListener('click', toggleMenu);
@@ -1062,7 +1070,7 @@ setInterval(pollInterest, POLL_MS);
 injectUI();
 console.info('[TP] kører version', TP_VERSION);
 
-/*──────── 9) HOVER “Intet Svar” (auto-gem) ────────*/
+/*──────── 9) HOVER “Intet Svar” ────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
   function mkMenu() {
