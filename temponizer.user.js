@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.6
-// @description  Push (leader, suppression), toast, “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (nyt faneblad), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner og “Søg efter opdatering” i ⚙️.
+// @version      7.7
+// @description  Push (leader, suppression), toast (cross-tab + force DOM), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner og “Søg efter opdatering” i ⚙️.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.6';
+const TP_VERSION = '7.7';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -42,7 +42,7 @@ const RAW_PHONEBOOK = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/
 const CACHE_KEY_CSV = 'tpCSVCache';          // lokal fallback cache
 
 // Caller-pop
-const OPEN_NEW_TAB_ON_INBOUND = true;        // vigtigt: lader Communicator lukke sin egen fane uden at lukke vikar-vinduet
+const OPEN_NEW_TAB_ON_INBOUND = true;        // vikar åbnes i ny fane
 
 /*──────── 1a) MIGRATION ────────*/
 (function migrateUserKeyToGM(){
@@ -64,6 +64,7 @@ function showToastOnce(key, msg) {
   showToast(msg);
 }
 function showToast(msg) {
+  if (localStorage.getItem('tpForceDOMToast') === 'true') { showDOMToast(msg); return; }
   if (Notification.permission === 'granted') {
     try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
   } else if (Notification.permission !== 'denied') {
@@ -84,6 +85,27 @@ function showDOMToast(msg) {
   requestAnimationFrame(() => { el.style.opacity = 1; });
   setTimeout(() => { el.style.opacity = 0; setTimeout(() => { el.remove(); }, 350); }, 3800);
 }
+
+/*──────── 2a) CROSS-TAB TOAST BROADCAST ────────*/
+const TOAST_EVT_KEY = 'tpToastEventV1';
+function broadcastToast(type, msg) {
+  try {
+    const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, type, msg, ts: Date.now() };
+    localStorage.setItem(TOAST_EVT_KEY, JSON.stringify(ev));
+  } catch (_) {}
+}
+window.addEventListener('storage', e => {
+  if (e.key !== TOAST_EVT_KEY || !e.newValue) return;
+  try {
+    const ev = JSON.parse(e.newValue);
+    const seenKey = 'tpToastSeen_' + ev.id;
+    if (localStorage.getItem(seenKey)) return;
+    localStorage.setItem(seenKey, '1');
+    if (document.visibilityState === 'visible' || isLeader()) {
+      showToast(ev.msg);
+    }
+  } catch (_) {}
+});
 
 /*──────── 2b) STATUS-BANNER (caller-pop debug) ────────*/
 function tpBanner(msg, ms = 4000) {
@@ -153,7 +175,9 @@ function pollMessages() {
         const canPush = (Date.now() - stMsg.lastPush > SUPPRESS_MS) && takeLock();
         if (canPush) {
           const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
-          if (en) sendPushover(m); showToastOnce('msg', m);
+          if (en) sendPushover(m);
+          broadcastToast('msg', m);
+          showToastOnce('msg', m);
           stMsg.lastPush = Date.now(); stMsg.lastSent = n;
         } else stMsg.lastSent = n;
       } else if (n < stMsg.count) { stMsg.lastPush = 0; }
@@ -179,7 +203,13 @@ function pollInterest() {
     return fetch(HTML_URL, { credentials: 'same-origin', headers: { Range: 'bytes=0-20000' } })
       .then(r => r.text()).then(parseInterestHTML);
   })
-  .catch(e => console.warn('[TP][ERR][INT][HEAD]', e));
+  .catch(e => {
+    console.warn('[TP][ERR][INT][HEAD]', e);
+    // HEAD→GET fallback
+    fetch(HTML_URL, { credentials: 'same-origin', headers: { Range: 'bytes=0-20000' } })
+      .then(r => r.text()).then(parseInterestHTML)
+      .catch(err => console.warn('[TP][ERR][INT][GET]', err));
+  });
 }
 function parseInterestHTML(html) {
   if (!isLeader()) return;
@@ -191,7 +221,9 @@ function parseInterestHTML(html) {
   if (c > stInt.count && c !== stInt.lastSent) {
     if (Date.now() - stInt.lastPush > SUPPRESS_MS && takeLock()) {
       const m = '👀 ' + c + ' vikar(er) har vist interesse for ledige vagter';
-      if (en) sendPushover(m); showToastOnce('int', m);
+      if (en) sendPushover(m);
+      broadcastToast('int', m);
+      showToastOnce('int', m);
       stInt.lastPush = Date.now(); stInt.lastSent = c;
     } else stInt.lastSent = c;
   } else if (c < stInt.count) stInt.lastPush = 0;
@@ -259,12 +291,23 @@ function normPhone(raw) {
   return digits.length >= 8 ? digits.slice(-8) : '';
 }
 
+// Delimiter-detektion (ignorér tegn i citater)
+function detectDelimiter(sample) {
+  const lines = sample.split(/\r?\n/).slice(0, 5).filter(Boolean);
+  let cComma = 0, cSemi = 0;
+  for (const ln of lines) {
+    const stripped = ln.replace(/"[^"]*"/g, '');
+    cComma += (stripped.match(/,/g) || []).length;
+    cSemi  += (stripped.match(/;/g) || []).length;
+  }
+  return cSemi > cComma ? ';' : ',';
+}
+
 // Simple CSV parser
 function parseCSV(text) {
   if (!text) return [];
   text = text.replace(/^\uFEFF/, '');
-  const firstLine = (text.split(/\r?\n/)[0] || '');
-  const delim = (firstLine.indexOf(';') > firstLine.indexOf(',')) ? ';' : (firstLine.includes(';') ? ';' : ',');
+  const delim = detectDelimiter(text);
   const rows = [];
   let i = 0, field = '', row = [], inQuotes = false;
   while (i < text.length) {
@@ -293,7 +336,7 @@ function parsePhonebookCSV(text) {
   const idxId   = header.findIndex(h => /(vikar.*nr|vikar[_ ]?id|^id$)/.test(h));
   const idxName = header.findIndex(h => /(navn|name)/.test(h));
   const phoneCols = header.map((h, idx) => ({ h, idx }))
-                          .filter(x => /(telefon|mobil|cellphone|mobile|phone)/.test(x.h));
+                          .filter(x => /(telefon(?:nummer)?|tlf\.?|mobil|cell(?:phone)?|mobile|phone)/.test(x.h));
   if (idxId < 0 || phoneCols.length === 0) return { map, header };
 
   for (let r = 1; r < rows.length; r++) {
@@ -310,31 +353,47 @@ function parsePhonebookCSV(text) {
   return { map, header };
 }
 
-/* Inbound-only pop. Opens NEW TAB for match. Uses RAW → cache fallback. */
+/* Inbound-only pop. ★ STRENGT kø-indgående (kræver *1500) + NUL FLASH ved alt andet. */
 async function callerPopIfNeeded() {
   try {
     const q = new URLSearchParams(location.search);
     const rawParam = q.get('tp_caller');
     if (!rawParam) return; // normal pages
 
-    const dirParam = (q.get('tp_dir') || '').toLowerCase();
     const rawStr = String(rawParam).trim();
 
-    const isInbound = /\*1500\s*$/.test(rawStr) || dirParam === 'in';
-    if (!isInbound) {
-      console.info('[TP][CALLER] Outbound/unknown, ignoring.', { raw: rawStr, dir: dirParam });
-      return;
+    // Skjul siden straks for at undgå "flash"
+    const unsetHide = (() => {
+      const html = document.documentElement;
+      const old = html.style.visibility;
+      html.style.visibility = 'hidden';
+      return () => { html.style.visibility = old; };
+    })();
+
+    // Kun kø-indgående: kræv *1500 i slutningen
+    const isQueueInbound = /\*1500\s*$/.test(rawStr);
+
+    if (!isQueueInbound) {
+      tpBanner('Udgående/ikke-kø — lukker …', 900);
+      try { window.close(); } catch (_) {}
+      try { window.open('', '_self'); window.close(); } catch (_) {}
+      // Hvis browser nægter: ingen flash → navigér til blank
+      try { location.replace('about:blank'); } catch (_) {}
+      return; // behold skjult hvis vi ikke kunne lukke, da vi går til blank
     }
+
+    // Ægte køkald → unhide og fortsæt
+    unsetHide();
 
     const digitsRaw = rawStr.replace(/\*1500\s*$/,'').replace(/[^\d+]/g, '');
     const phone8 = normPhone(digitsRaw);
 
-    console.info('[TP][CALLER] Inbound', { raw: rawStr, dir: dirParam, digitsRaw, phone8 });
-    tpBanner('Indgående kald: ' + (phone8 || '—') + ' — slår op …', 2500);
+    console.info('[TP][CALLER] Inbound køkald', { raw: rawStr, digitsRaw, phone8 });
+    tpBanner('Indgående køkald: ' + (phone8 || '—') + ' — slår op …', 2500);
 
     if (!phone8) { tpBanner('Ukendt nummerformat: ' + rawStr, 5000); return; }
 
-    // Try RAW first (cache-buster), then cache
+    // Try RAW først, så cache
     let csvText = '';
     try {
       csvText = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now());
@@ -415,7 +474,7 @@ function normalizePhonebookHeader(csv) {
     const x = h.trim().toLowerCase();
     if (/(vikar.*nr|vikar[_ ]?id|^id$)/.test(x)) return 'vikar_id';
     if (/(navn|name)/.test(x)) return 'name';
-    if (/(^telefon$|phone(?!.*cell)|tlf)/.test(x)) return 'phone';
+    if (/(^telefon$|^telefonnummer$|phone(?!.*cell)|^tlf\.?$)/.test(x)) return 'phone';
     if (/(mobil|cellphone|mobile)/.test(x)) return 'cellphone';
     return h.trim();
   };
@@ -428,7 +487,7 @@ function pickBestSheetCSV(wb) {
     const sheet = wb.Sheets[name];
     let csv = XLSX.utils.sheet_to_csv(sheet, { FS: ',', RS: '\n' });
     csv = normalizePhonebookHeader(csv);
-    const lines = csv.trim().split(/\r?\n/).filter(Boolean);
+    const lines = csv.trim().split(/\r?\\n/).filter(Boolean);
     const dataRows = Math.max(0, lines.length - 1);
     console.info('[TP][PB] Sheet:', name, 'rows:', dataRows);
     if (dataRows > best.rows) best = { rows: dataRows, csv };
@@ -540,6 +599,7 @@ function injectUI() {
         '<div style="border-top:1px solid #eee;margin:8px 0"></div>' +
         '<button id="tpTestPushoverBtn" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🧪 Test Pushover (Besked + Interesse)</button>' +
         '<div id="tpLeaderHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
+        '<label style="display:block;margin-top:8px"><input type="checkbox" id="tpForceDomToast"> Brug altid skærm-toast (ikke OS-meddelelser)</label>' +
 
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
         '<div style="font-weight:700;margin-bottom:6px">Telefonbog</div>' +
@@ -572,6 +632,7 @@ function injectUI() {
       const save = menu.querySelector('#tpSaveUserKeyMenu');
       const test = menu.querySelector('#tpTestPushoverBtn');
       const hint = menu.querySelector('#tpLeaderHint');
+      const forceDom = menu.querySelector('#tpForceDomToast');
       inp.value = getUserKey();
       function refreshLeaderHint(){ hint.textContent = (isLeader() ? 'Denne fane er LEADER for push.' : 'Ikke leader – en anden fane sender push.'); }
       refreshLeaderHint();
@@ -579,6 +640,9 @@ function injectUI() {
       inp.addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); GM_setValue('tpUserKey',(inp.value||'').trim()); showToast('USER-token gemt.'); }});
       test.addEventListener('click', () => { tpTestPushoverBoth(); menu.style.display='none'; });
       window.addEventListener('storage', e => { if (e.key===LEADER_KEY) refreshLeaderHint(); });
+
+      forceDom.checked = localStorage.getItem('tpForceDOMToast') === 'true';
+      forceDom.onchange = () => localStorage.setItem('tpForceDOMToast', forceDom.checked ? 'true' : 'false');
 
       // Telefonbog
       const pat   = menu.querySelector('#tpGitPAT');
@@ -674,6 +738,10 @@ function injectUI() {
 
     document.addEventListener('mousedown', e => {
       const m = menu; if (m && e.target !== m && !m.contains(e.target) && e.target !== gear) m.style.display = 'none';
+    });
+
+    window.addEventListener('resize', () => {
+      ensureFullyVisible(gear);
     });
   }
 }
