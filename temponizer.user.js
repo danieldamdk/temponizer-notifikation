@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.6
+// @version      7.9.7
 // @description  Push (leader, suppression), toast (Smart: DOM når synlig, OS når skjult • max 1 OS), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + toggle) direkte i hovedpanelet.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -21,7 +21,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.6';
+const TP_VERSION = '7.9.7';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -42,8 +42,6 @@ const PB_BRANCH = 'main';
 const PB_CSV    = 'vikarer.csv';
 const RAW_PHONEBOOK = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_CSV}`;
 const CACHE_KEY_CSV = 'tpCSVCache';
-
-// Userscript RAW (samme som metadata)
 const SCRIPT_RAW_URL = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/temponizer.user.js`;
 
 // Caller-pop
@@ -71,7 +69,6 @@ function showToastOnce(key, msg) {
 function showToast(msg) {
   const forceDom = localStorage.getItem('tpForceDOMToast') === 'true';
   const smart    = localStorage.getItem('tpSmartToast') === 'true';
-
   if (forceDom) { showDOMToast(msg); return; }
   if (smart && document.visibilityState === 'visible') { showDOMToast(msg); return; }
   if (Notification.permission === 'granted') {
@@ -134,9 +131,7 @@ function tpBanner(msg, ms = 4000) {
     }
     el.textContent = msg;
     clearTimeout(el._t);
-    el._t = setTimeout(() => {
-      if (el) { el.style.opacity = '0'; setTimeout(() => el.remove(), 250); }
-    }, ms);
+    el._t = setTimeout(() => { if (el) { el.style.opacity = '0'; setTimeout(() => el.remove(), 250); } }, ms);
   } catch(_) {}
 }
 
@@ -151,10 +146,7 @@ function sendPushover(msg) {
     url: 'https://api.pushover.net/1/messages.json',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     data: body,
-    onerror: () => {
-      fetch('https://api.pushover.net/1/messages.json', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body })
-        .catch(console.warn);
-    }
+    onerror: () => { fetch('https://api.pushover.net/1/messages.json', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body }).catch(console.warn); }
   });
 }
 
@@ -195,28 +187,21 @@ function pollMessages() {
     })
     .catch(e => console.warn('[TP][ERR][MSG]', e));
 }
-
 const HTML_URL = location.origin + '/index.php?page=freevagter';
 let lastETag = localStorage.getItem('tpLastETag') || null;
-
 function pollInterest() {
   if (!isLeader()) return;
-  fetch(HTML_URL, {
-    method: 'HEAD', credentials: 'same-origin',
-    headers: lastETag ? { 'If-None-Match': lastETag } : {}
-  })
+  fetch(HTML_URL, { method: 'HEAD', credentials: 'same-origin', headers: lastETag ? { 'If-None-Match': lastETag } : {} })
   .then(h => {
     if (h.status === 304) { console.info('[TP-interesse] uændret', new Date().toLocaleTimeString()); return; }
     lastETag = h.headers.get('ETag') || null;
     if (lastETag) localStorage.setItem('tpLastETag', lastETag);
-    return fetch(HTML_URL, { credentials: 'same-origin', headers: { Range: 'bytes=0-20000' } })
-      .then(r => r.text()).then(parseInterestHTML);
+    return fetch(HTML_URL, { credentials: 'same-origin', headers: { Range: 'bytes=0-20000' } }).then(r => r.text()).then(parseInterestHTML);
   })
   .catch(e => {
     console.warn('[TP][ERR][INT][HEAD]', e);
     fetch(HTML_URL, { credentials: 'same-origin', headers: { Range: 'bytes=0-20000' } })
-      .then(r => r.text()).then(parseInterestHTML)
-      .catch(err => console.warn('[TP][ERR][INT][GET]', err));
+      .then(r => r.text()).then(parseInterestHTML).catch(err => console.warn('[TP][ERR][INT][GET]', err));
   });
 }
 function parseInterestHTML(html) {
@@ -333,14 +318,11 @@ function parsePhonebookCSV(text) {
   const map = new Map();
   const rows = parseCSV(text);
   if (!rows.length) return { map, header: [] };
-
   const header = rows[0].map(h => h.toLowerCase());
   const idxId   = header.findIndex(h => /(vikar.*nr|vikar[_ ]?id|^id$)/.test(h));
   const idxName = header.findIndex(h => /(navn|name)/.test(h));
-  const phoneCols = header.map((h, idx) => ({ h, idx }))
-                          .filter(x => /(telefon(?:nummer)?|^tlf\.?$|mobil|cell(?:phone)?|mobile|phone)/.test(x.h));
+  const phoneCols = header.map((h, idx) => ({ h, idx })).filter(x => /(telefon(?:nummer)?|^tlf\.?$|mobil|cell(?:phone)?|mobile|phone)/.test(x.h));
   if (idxId < 0 || phoneCols.length === 0) return { map, header };
-
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
     const id   = (row[idxId]   || '').trim();
@@ -362,12 +344,10 @@ async function callerPopIfNeeded() {
 
     const rawStr = String(rawParam).trim();
 
-    // Skjul siden straks (nul flash på ikke-køkald)
+    // Nul flash for ikke-køkald
     const unsetHide = (() => {
-      const html = document.documentElement;
-      const old = html.style.visibility;
-      html.style.visibility = 'hidden';
-      return () => { html.style.visibility = old; };
+      const html = document.documentElement; const old = html.style.visibility;
+      html.style.visibility = 'hidden'; return () => { html.style.visibility = old; };
     })();
 
     const isQueueInbound = /\*1500\s*$/.test(rawStr);
@@ -390,12 +370,8 @@ async function callerPopIfNeeded() {
     if (!phone8) { tpBanner('Ukendt nummerformat: ' + rawStr, 5000); return; }
 
     let csvText = '';
-    try {
-      csvText = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now());
-      if (csvText) GM_setValue(CACHE_KEY_CSV, csvText);
-    } catch(_) {}
+    try { csvText = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now()); if (csvText) GM_setValue(CACHE_KEY_CSV, csvText); } catch(_) {}
     if (!csvText) csvText = GM_getValue(CACHE_KEY_CSV) || '';
-
     if (!csvText) { tpBanner('Ingen telefonbog tilgængelig (RAW og cache tom).', 5000); return; }
 
     const { map } = parsePhonebookCSV(csvText);
@@ -404,12 +380,7 @@ async function callerPopIfNeeded() {
 
     const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
     tpBanner(`Match: ${rec.name || '(uden navn)'} (#${rec.id}) — åbner …`, 1800);
-
-    if (OPEN_NEW_TAB_ON_INBOUND) {
-      window.open(url, '_blank', 'noopener');
-    } else {
-      location.assign(url);
-    }
+    if (OPEN_NEW_TAB_ON_INBOUND) { window.open(url, '_blank', 'noopener'); } else { location.assign(url); }
   } catch (e) {
     console.warn('[TP][CALLER] error', e);
     tpBanner('Fejl under opslag — se konsol.', 5000);
@@ -417,26 +388,17 @@ async function callerPopIfNeeded() {
 }
 
 /*──────── 6c) GITHUB API ────────*/
-function b64encodeUtf8(str) {
-  const bytes = new TextEncoder().encode(str);
-  let bin=''; bytes.forEach(b=>bin+=String.fromCharCode(b)); return btoa(bin);
-}
+function b64encodeUtf8(str) { const bytes = new TextEncoder().encode(str); let bin=''; bytes.forEach(b=>bin+=String.fromCharCode(b)); return btoa(bin); }
 function ghGetSha(owner, repo, path, ref) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`;
   const token = (GM_getValue('tpGitPAT') || '').trim();
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
       method: 'GET', url,
-      headers: {
-        'Accept': 'application/vnd.github+json',
-        ...(token ? {'Authorization': 'Bearer ' + token} : {}),
-        'X-GitHub-Api-Version': '2022-11-28'
-      },
-      onload: r => {
-        if (r.status === 200) { try { const js = JSON.parse(r.responseText); resolve({ sha: js.sha, exists: true }); } catch(_) { resolve({ sha:null, exists:true }); } }
-        else if (r.status === 404) resolve({ sha:null, exists:false });
-        else reject(new Error('GitHub GET sha: HTTP '+r.status));
-      },
+      headers: { 'Accept': 'application/vnd.github+json', ...(token ? {'Authorization': 'Bearer ' + token} : {}), 'X-GitHub-Api-Version': '2022-11-28' },
+      onload: r => { if (r.status===200){ try{ const js=JSON.parse(r.responseText); resolve({ sha: js.sha, exists: true }); } catch(_){ resolve({ sha:null, exists:true }); } }
+                     else if (r.status===404) resolve({ sha:null, exists:false });
+                     else reject(new Error('GitHub GET sha: HTTP '+r.status)); },
       onerror: e => reject(e)
     });
   });
@@ -447,12 +409,7 @@ function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
       method: 'PUT', url,
-      headers: {
-        'Accept': 'application/vnd.github+json',
-        ...(token ? {'Authorization': 'Bearer ' + token} : {}),
-        'X-GitHub-Api-Version': '2022-11-28',
-        'Content-Type': 'application/json;charset=UTF-8'
-      },
+      headers: { 'Accept': 'application/vnd.github+json', ...(token ? {'Authorization': 'Bearer ' + token} : {}), 'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json;charset=UTF-8' },
       data: JSON.stringify({ message, content: base64Content, branch, ...(sha ? { sha } : {}) }),
       onload: r => { (r.status===200 || r.status===201) ? resolve(r.responseText) : reject(new Error('GitHub PUT: HTTP '+r.status+' '+(r.responseText||''))); },
       onerror: e => reject(e)
@@ -462,8 +419,7 @@ function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
 
 /*──────── 6d) EXCEL → CSV ────────*/
 function normalizePhonebookHeader(csv) {
-  const lines = csv.split(/\r?\n/);
-  if (!lines.length) return csv;
+  const lines = csv.split(/\r?\n/); if (!lines.length) return csv;
   const hdr = (lines[0] || '').split(',');
   const mapName = (h) => {
     const x = h.trim().toLowerCase();
@@ -534,179 +490,91 @@ async function fetchExcelAsCSVAndUpload() {
   showToastOnce('csvok', 'CSV uploadet (Excel→CSV).');
 }
 
-/*──────── 6e) SMS (status + aktiver/deaktivér) ────────*/
+/*──────── 6e) SMS (status + toggle, POPUP + POLL) ────────*/
 const SMS_SETTINGS_URL = `${location.origin}/index.php?page=showmy_settings`;
-function isVisible(el) {
-  if (!el) return false;
-  const cs = getComputedStyle(el);
-  return cs.display !== 'none' && cs.visibility !== 'hidden';
-}
+function isVisible(el) { if (!el) return false; const cs = getComputedStyle(el); return cs.display !== 'none' && cs.visibility !== 'hidden'; }
 function parseSmsStatusFromDoc(doc) {
   const elAktiv   = doc.getElementById('sms_notifikation_aktiv');
   const elInaktiv = doc.getElementById('sms_notifikation_ikke_aktiv');
   const elSysOff  = doc.getElementById('sms_notifikation_kan_ikke_aktiveres_system');
   const elNoMob   = doc.getElementById('sms_notifikation_kan_ikke_aktiveres_mobil');
-
   let state = 'unknown', phone = '';
-  if (isVisible(elAktiv))   state = 'active';
+  if (isVisible(elAktiv)) state = 'active';
   else if (isVisible(elInaktiv)) state = 'inactive';
-  else if (isVisible(elSysOff))  state = 'sys_off';
-  else if (isVisible(elNoMob))   state = 'no_mobile';
-
+  else if (isVisible(elSysOff)) state = 'sys_off';
+  else if (isVisible(elNoMob)) state = 'no_mobile';
   const txt = (elAktiv && isVisible(elAktiv) ? elAktiv.textContent : elInaktiv ? elInaktiv.textContent : '') || '';
   const digits = txt.replace(/\u00A0/g,' ').replace(/\s+/g,'').match(/\+?\d{6,}/g);
   if (digits && digits[0]) phone = digits[0];
-
   return { state, phone };
 }
-function createHiddenIframe(id, url) {
-  let ifr = document.getElementById(id);
-  if (!ifr) {
-    ifr = document.createElement('iframe');
-    ifr.id = id;
-    ifr.style.cssText = 'display:none;width:0;height:0;border:0;';
-    document.body.appendChild(ifr);
-  }
-  ifr.src = url;
-  return ifr;
+function parseSmsStatusFromHTML(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  return parseSmsStatusFromDoc(doc);
 }
-// Autopilot på settings-siden (klik & luk)
-(function smsAutopilot(){
-  try {
-    const u = new URL(location.href);
-    if (u.searchParams.get('page') !== 'showmy_settings') return;
-    const m = (u.hash || '').toLowerCase().match(/tp_sms_auto=(activate|deactivate)/);
-    if (!m) return;
-    const action = m[1];
-    const doClick = () => {
-      const doc = document;
-      const link = action === 'activate'
-        ? doc.querySelector('#sms_notifikation_ikke_aktiv a')
-        : doc.querySelector('#sms_notifikation_aktiv a');
-      if (link) link.click();
-      const targetSel = action === 'activate' ? '#sms_notifikation_aktiv' : '#sms_notifikation_ikke_aktiv';
-      const t0 = Date.now();
-      const iv = setInterval(() => {
-        const ok = isVisible(doc.querySelector(targetSel));
-        if (ok || Date.now() - t0 > 8000) { clearInterval(iv); try { window.close(); } catch(_) {} }
-      }, 400);
-    };
-    setTimeout(doClick, 300);
-  } catch(_) {}
-})();
+async function fetchSmsStatusHTML() { return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now()); }
+async function getSmsStatus() { try { const html = await fetchSmsStatusHTML(); return parseSmsStatusFromHTML(html); } catch { return { state:'unknown' }; } }
 
 const sms = {
-  _iframeId: 'tpSmsFrame',
+  _busy: false,
   _last: null,
-
-  refreshViaIframe(statusCb, errorCb) {
+  async refresh(cb) {
+    const st = await getSmsStatus();
+    this._last = st; cb && cb(st);
+  },
+  _openPopup(action) {
+    // action: 'activate' | 'deactivate'
+    return window.open(SMS_SETTINGS_URL + '#tp_sms_auto=' + action, 'tpSmsCtl', 'width=520,height=420');
+  },
+  async _pollUntil(desired, timeoutMs=10000, intervalMs=700) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      const st = await getSmsStatus();
+      this._last = st;
+      if (st.state === desired) return st;
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+    throw new Error('Timeout waiting for state=' + desired);
+  },
+  async setEnabled(wantOn, uiBusy, cb) {
+    if (this._busy) return;
+    this._busy = true;
+    uiBusy && uiBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
     try {
-      const ifr = createHiddenIframe(this._iframeId, SMS_SETTINGS_URL + '&ts=' + Date.now());
-      const onLoad = () => {
-        try {
-          const doc = ifr.contentDocument || ifr.contentWindow.document;
-          const st = parseSmsStatusFromDoc(doc);
-          this._last = st;
-          statusCb && statusCb(st);
-        } catch (e) { errorCb && errorCb(e); }
-        finally { ifr.removeEventListener('load', onLoad); }
-      };
-      ifr.addEventListener('load', onLoad);
-    } catch (e) { errorCb && errorCb(e); }
-  },
-
-  refreshViaXHR(statusCb, errorCb) {
-    gmGET(SMS_SETTINGS_URL + '&t=' + Date.now())
-      .then(html => {
-        const doc = new DOMParser().parseFromString(html, 'text/html');
-        const st = parseSmsStatusFromDoc(doc);
-        this._last = st;
-        statusCb && statusCb(st, /*xhrFallback*/true);
-      })
-      .catch(e => errorCb && errorCb(e));
-  },
-
-  _clickInIframeAndWait(selector, after) {
-    try {
-      const ifr = document.getElementById(this._iframeId);
-      if (!ifr || !ifr.contentDocument) return false;
-      const doc = ifr.contentDocument;
-      const a = doc.querySelector(selector);
-      if (!a) return false;
-      const onLoad = () => {
-        ifr.removeEventListener('load', onLoad);
-        after && after();
-      };
-      ifr.addEventListener('load', onLoad);
-      a.click();
-      // fallback hvis load ikke kommer (fx JS navigerer uden full reload)
-      setTimeout(() => { try { ifr.removeEventListener('load', onLoad); } catch(_){} after && after(); }, 7000);
-      return true;
-    } catch(_) { return false; }
-  },
-
-  activate(uiBusy, statusCb) {
-    const done = () => this.refresh(statusCb);
-    if (this._clickInIframeAndWait('#sms_notifikation_ikke_aktiv a', done)) return;
-    // fallback: mini-vindue
-    uiBusy && uiBusy(true);
-    const w = window.open(SMS_SETTINGS_URL + '#tp_sms_auto=activate', 'tpSmsActivate', 'width=520,height=420');
-    const timer = setInterval(() => { if (!w || w.closed) { clearInterval(timer); uiBusy && uiBusy(false); done(); } }, 500);
-  },
-
-  deactivate(uiBusy, statusCb) {
-    const done = () => this.refresh(statusCb);
-    if (this._clickInIframeAndWait('#sms_notifikation_aktiv a', done)) return;
-    uiBusy && uiBusy(true);
-    const w = window.open(SMS_SETTINGS_URL + '#tp_sms_auto=deactivate', 'tpSmsDeactivate', 'width=520,height=420');
-    const timer = setInterval(() => { if (!w || w.closed) { clearInterval(timer); uiBusy && uiBusy(false); done(); } }, 500);
-  },
-
-  refresh(statusCb) {
-    let did = false;
-    const fallbackT = setTimeout(() => {
-      if (did) return;
-      did = true;
-      this.refreshViaXHR(statusCb, () => statusCb && statusCb({ state:'unknown' }, true));
-    }, 2000);
-    this.refreshViaIframe((st) => {
-      if (did) return;
-      did = true;
-      clearTimeout(fallbackT);
-      statusCb && statusCb(st);
-    }, () => {/* fallback via timer */});
+      const pop = this._openPopup(wantOn ? 'activate' : 'deactivate');
+      let st;
+      try {
+        st = await this._pollUntil(wantOn ? 'active' : 'inactive');
+      } finally {
+        try { if (pop && !pop.closed) pop.close(); } catch(_) {}
+      }
+      cb && cb(st);
+      showToast(wantOn ? 'SMS aktiveret.' : 'SMS deaktiveret.');
+    } catch (e) {
+      showToast('Kunne ikke ' + (wantOn ? 'aktivere' : 'deaktivere') + ' SMS (timeout).');
+      // Efter fejl, opdatér til server-sandhed
+      const st = await getSmsStatus(); this._last = st; cb && cb(st);
+    } finally {
+      this._busy = false;
+      uiBusy && uiBusy(false);
+    }
   }
 };
 
-/*──────── 7) DRAGGABLE HELPERS ────────*/
+/*──────── 7) DRAGGABLE ────────*/
 function makeDraggable(el, storageKey, handleSelector) {
   const handle = handleSelector ? el.querySelector(handleSelector) : el;
   if (!handle) return;
-  handle.style.cursor = 'move';
-  handle.style.userSelect = 'none';
-  let moving = false, startX = 0, startY = 0, baseLeft = 0, baseTop = 0;
-
-  try {
-    const pos = JSON.parse(localStorage.getItem(storageKey) || 'null');
-    if (pos) {
-      el.style.left = pos.left + 'px';
-      el.style.top = pos.top + 'px';
-      el.style.right = 'auto';
-      el.style.bottom = 'auto';
-      el.style.position = 'fixed';
-    }
+  handle.style.cursor = 'move'; handle.style.userSelect = 'none';
+  let moving = false, startX=0, startY=0, baseLeft=0, baseTop=0;
+  try { const pos = JSON.parse(localStorage.getItem(storageKey) || 'null');
+    if (pos) { el.style.left = pos.left+'px'; el.style.top = pos.top+'px'; el.style.right='auto'; el.style.bottom='auto'; el.style.position='fixed'; }
   } catch(_) {}
-
   const down = e => {
-    const p = e.touches ? e.touches[0] : e;
-    moving = true;
-    const r = el.getBoundingClientRect();
-    startX = p.clientX; startY = p.clientY;
-    baseLeft = r.left; baseTop = r.top;
-    document.addEventListener('mousemove', move);
-    document.addEventListener('mouseup', up);
-    document.addEventListener('touchmove', move, {passive:false});
-    document.addEventListener('touchend', up);
+    const p = e.touches ? e.touches[0] : e; moving = true;
+    const r = el.getBoundingClientRect(); startX=p.clientX; startY=p.clientY; baseLeft=r.left; baseTop=r.top;
+    document.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
+    document.addEventListener('touchmove', move, {passive:false}); document.addEventListener('touchend', up);
     e.preventDefault();
   };
   const move = e => {
@@ -714,45 +582,35 @@ function makeDraggable(el, storageKey, handleSelector) {
     const p = e.touches ? e.touches[0] : e;
     const nx = Math.min(window.innerWidth - el.offsetWidth - 4, Math.max(4, baseLeft + (p.clientX - startX)));
     const ny = Math.min(window.innerHeight - el.offsetHeight - 4, Math.max(4, baseTop  + (p.clientY - startY)));
-    el.style.left = nx + 'px';
-    el.style.top  = ny + 'px';
-    el.style.right = 'auto'; el.style.bottom = 'auto';
-    el.style.position = 'fixed';
-    localStorage.setItem(storageKey, JSON.stringify({left:nx, top:ny}));
-    e.preventDefault();
+    el.style.left = nx+'px'; el.style.top = ny+'px'; el.style.right='auto'; el.style.bottom='auto'; el.style.position='fixed';
+    localStorage.setItem(storageKey, JSON.stringify({left:nx, top:ny})); e.preventDefault();
   };
   const up = () => {
     moving = false;
-    document.removeEventListener('mousemove', move);
-    document.removeEventListener('mouseup', up);
-    document.removeEventListener('touchmove', move);
-    document.removeEventListener('touchend', up);
+    document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up);
+    document.removeEventListener('touchmove', move); document.removeEventListener('touchend', up);
   };
-
-  handle.addEventListener('mousedown', down);
-  handle.addEventListener('touchstart', down, {passive:false});
+  handle.addEventListener('mousedown', down); handle.addEventListener('touchstart', down, {passive:false});
 }
 
-/*──────── 7) UI (panel + gear) ────────*/
+/*──────── 7) UI ────────*/
+function ensureFullyVisible(el){
+  const r = el.getBoundingClientRect(); let dx=0, dy=0;
+  if (r.right > window.innerWidth)  dx = window.innerWidth - r.right - 6;
+  if (r.bottom > window.innerHeight) dy = window.innerHeight - r.bottom - 6;
+  if (r.left < 0)  dx = 6 - r.left;
+  if (r.top  < 0)  dy = 6 - r.top;
+  if (dx || dy) el.style.transform = `translate(${dx}px,${dy}px)`;
+}
 function injectUI() {
   if (document.getElementById('tpPanel')) return;
-
   const d = document.createElement('div');
   d.id = 'tpPanel';
   d.style.cssText = [
-    'position:fixed',
-    'top:12px',          // flyttet til top-right
-    'right:12px',
-    'z-index:2147483645',
-    'background:#f9f9f9',
-    'border:1px solid #ccc',
-    'padding:8px 10px',
-    'border-radius:6px',
-    'font-size:12px',
-    'font-family:sans-serif',
-    'box-shadow:1px 1px 5px rgba(0,0,0,.2)',
-    'width:300px',       // fast bredde for at undgå “resize”-fornemmelse
-    'resize:none'        // sikkerhed – ingen resize-håndtag
+    'position:fixed','top:12px','right:12px','z-index:2147483645',
+    'background:#f9f9f9','border:1px solid #ccc','padding:8px 10px',
+    'border-radius:6px','font-size:12px','font-family:sans-serif',
+    'box-shadow:1px 1px 5px rgba(0,0,0,.2)','width:300px','resize:none'
   ].join(';');
   d.innerHTML =
     '<div id="tpPanelHeader" style="font-weight:700;cursor:move;user-select:none">TP Notifikationer</div>' +
@@ -769,7 +627,7 @@ function injectUI() {
     '</div>';
   document.body.appendChild(d);
   makeDraggable(d, 'tpPanelPos', '#tpPanelHeader');
-  ensureFullyVisible(d); // sørg for at hele panelet er på skærmen fra start
+  ensureFullyVisible(d);
 
   const m = d.querySelector('#m'), i = d.querySelector('#i');
   m.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
@@ -782,60 +640,36 @@ function injectUI() {
   const smsTag     = d.querySelector('#smsTag');
   const smsRefresh = d.querySelector('#smsRefresh');
 
-  function smsSetBusy(on, text) {
-    smsToggle.disabled  = true;
-    smsRefresh.disabled = true;
-    if (on) smsTag.textContent = text || 'arbejder…';
-  }
-  function smsRender(st, viaXHR) {
+  function smsSetBusy(on, text) { smsToggle.disabled = true; smsRefresh.disabled = true; if (on) smsTag.textContent = text || 'arbejder…'; }
+  function smsRender(st) {
     const time = new Date().toLocaleTimeString();
-    const mark = (txt, color) => { smsTag.innerHTML = `<span style="color:${color};font-weight:600">${txt}</span> <span style="color:#888;font-size:11px">• ${viaXHR ? 'XHR' : 'iframe'} • ${time}</span>`; };
+    const mark = (txt, color) => { smsTag.innerHTML = `<span style="color:${color};font-weight:600">${txt}</span> <span style="color:#888;font-size:11px">• ${time}</span>`; };
     switch (st.state) {
-      case 'active':
-        smsToggle.checked = true;
-        smsToggle.disabled = false;
-        smsRefresh.disabled = false;
-        mark('Aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#090');
-        break;
-      case 'inactive':
-        smsToggle.checked = false;
-        smsToggle.disabled = false;
-        smsRefresh.disabled = false;
-        mark('Ikke aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#a00');
-        break;
-      case 'sys_off':
-        smsToggle.checked = false;
-        smsToggle.disabled = true;
-        smsRefresh.disabled = false;
-        mark('System slået fra', '#a00');
-        break;
-      case 'no_mobile':
-        smsToggle.checked = false;
-        smsToggle.disabled = true;
-        smsRefresh.disabled = false;
-        mark('Manglende mobil på login', '#a00');
-        break;
-      default:
-        smsToggle.checked = false;
-        smsToggle.disabled = false;
-        smsRefresh.disabled = false;
-        mark('Ukendt', '#666');
+      case 'active':   smsToggle.checked = true;  smsToggle.disabled=false; smsRefresh.disabled=false; mark('Aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#090'); break;
+      case 'inactive': smsToggle.checked = false; smsToggle.disabled=false; smsRefresh.disabled=false; mark('Ikke aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#a00'); break;
+      case 'sys_off':  smsToggle.checked = false; smsToggle.disabled=true;  smsRefresh.disabled=false; mark('System slået fra', '#a00'); break;
+      case 'no_mobile':smsToggle.checked = false; smsToggle.disabled=true;  smsRefresh.disabled=false; mark('Manglende mobil på login', '#a00'); break;
+      default:         smsToggle.checked = false; smsToggle.disabled=false; smsRefresh.disabled=false; mark('Ukendt', '#666');
     }
   }
-  smsRefresh.addEventListener('click', () => { smsSetBusy(true, 'opdaterer…'); sms.refresh(smsRender); });
-  smsToggle.addEventListener('change', () => {
-    const wantOn = smsToggle.checked;
-    smsSetBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
-    if (wantOn) {
-      sms.activate(smsSetBusy, (st, viaXHR) => { smsRender(st, viaXHR); showToast('SMS aktiveret (hvis muligt).'); });
-    } else {
-      sms.deactivate(smsSetBusy, (st, viaXHR) => { smsRender(st, viaXHR); showToast('SMS deaktiveret.'); });
-    }
-  });
-  smsSetBusy(true, 'indlæser…');
-  sms.refresh(smsRender);
 
-  // Tandhjul (øvrige indstillinger)
+  // Refresh-knap
+  smsRefresh.addEventListener('click', async () => { smsSetBusy(true, 'opdaterer…'); await sms.refresh(smsRender); });
+
+  // Toggle: brug sidst kendte status som sandhed, og vend først når server bekræfter
+  smsToggle.addEventListener('change', async () => {
+    const last = sms._last && sms._last.state;
+    const lastActive = last === 'active';
+    // Rul UI tilbage til faktisk kendt status, mens vi arbejder
+    smsToggle.checked = lastActive;
+    smsSetBusy(true, lastActive ? 'deaktiverer…' : 'aktiverer…');
+    await sms.setEnabled(!lastActive, smsSetBusy, smsRender);
+  });
+
+  // Første status
+  (async () => { smsSetBusy(true, 'indlæser…'); await sms.refresh(smsRender); })();
+
+  // Tandhjul (uændret fra 7.9.6)
   if (!document.getElementById('tpGear')) {
     const gear = document.createElement('div');
     gear.id = 'tpGear'; gear.title = 'Indstillinger'; gear.innerHTML = '⚙️';
@@ -843,8 +677,7 @@ function injectUI() {
       position:'fixed', right:'12px', top: (d.getBoundingClientRect().top + d.offsetHeight + 10) + 'px',
       width:'22px', height:'22px', lineHeight:'22px', textAlign:'center',
       background:'#fff', border:'1px solid #ccc', borderRadius:'50%',
-      boxShadow:'0 1px 5px rgba(0,0,0,.2)', cursor:'pointer',
-      zIndex:2147483647, userSelect:'none'
+      boxShadow:'0 1px 5px rgba(0,0,0,.2)', cursor:'pointer', zIndex:2147483647, userSelect:'none'
     });
     document.body.appendChild(gear);
     ensureFullyVisible(gear);
@@ -861,7 +694,6 @@ function injectUI() {
       });
       menu.innerHTML =
         '<div style="font-weight:700;margin-bottom:6px">Indstillinger</div>' +
-
         '<div style="margin-bottom:10px">' +
           '<div style="font-weight:600;margin-bottom:4px">Pushover USER-token</div>' +
           '<input id="tpUserKeyMenu" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
@@ -870,12 +702,10 @@ function injectUI() {
             '<a href="https://pushover.net/" target="_blank" rel="noopener" style="color:#06c;text-decoration:none">Guide til USER-token</a>' +
           '</div>' +
         '</div>' +
-
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
         '<div style="font-weight:700;margin-bottom:6px">Toast-indstillinger</div>' +
         '<label style="display:block;margin:4px 0"><input type="checkbox" id="tpForceDomToast"> Brug altid skærm-toast (ikke OS-meddelelser)</label>' +
         '<label style="display:block;margin:4px 0"><input type="checkbox" id="tpSmartToast"> Smart toast (DOM når synlig, OS når skjult)</label>' +
-
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
         '<div style="font-weight:700;margin-bottom:6px">Telefonbog</div>' +
         '<div style="margin-bottom:6px;font-size:12px;color:#444">CSV ligger i GitHub og bruges af opslag ved indgående kald.</div>' +
@@ -896,14 +726,12 @@ function injectUI() {
           '</div>' +
           '<div id="tpPBHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
         '</div>' +
-
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
         '<button id="tpCheckUpdate" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🔄 Søg efter opdatering</button>' +
-        '<div style="margin-top:6px;font-size:11px;color:#666">Kører v.'+TP_VERSION+'</div>'
-      ;
+        '<div style="margin-top:6px;font-size:11px;color:#666">Kører v.'+TP_VERSION+'</div>';
       document.body.appendChild(menu);
 
-      // Pushover
+      // Pushover-token
       const inp  = menu.querySelector('#tpUserKeyMenu');
       const save = menu.querySelector('#tpSaveUserKeyMenu');
       inp.value = getUserKey();
@@ -922,7 +750,7 @@ function injectUI() {
       forceDom.onchange = () => { localStorage.setItem('tpForceDOMToast', forceDom.checked ? 'true' : 'false'); syncToggles('force'); };
       smart.onchange    = () => { localStorage.setItem('tpSmartToast',    smart.checked    ? 'true' : 'false'); syncToggles('smart'); };
 
-      // Telefonbog widgets (samme som 7.9.5) — uændret for korthed
+      // Telefonbog (samme som før)
       const pat   = menu.querySelector('#tpGitPAT');
       const file  = menu.querySelector('#tpCSVFile');
       const up    = menu.querySelector('#tpUploadCSV');
@@ -948,11 +776,8 @@ function injectUI() {
         } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
       }
       up.addEventListener('click', async () => {
-        try {
-          if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
-          const text = await file.files[0].text();
-          await uploadCSVText(text);
-        } catch (e) { console.warn('[TP][PB][CSV-UPLOAD-BTN]', e); }
+        try { if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
+              const text = await file.files[0].text(); await uploadCSVText(text); } catch (e) { console.warn('[TP][PB][CSV-UPLOAD-BTN]', e); }
       });
       function setDropActive(on) { drop.style.borderColor = on ? '#2e7' : '#ccc'; drop.style.color = on ? '#2e7' : '#666'; }
       drop.addEventListener('dragover', e => { e.preventDefault(); setDropActive(true); });
@@ -961,33 +786,23 @@ function injectUI() {
       drop.addEventListener('drop', async e => {
         e.preventDefault(); setDropActive(false);
         const dt = e.dataTransfer; if (!dt || !dt.files || !dt.files[0]) return;
-        const f = dt.files[0];
-        if (!/\.csv$/i.test(f.name)) { showToast('Træk en .csv-fil ind.'); return; }
-        const text = await f.text();
-        await uploadCSVText(text);
+        const f = dt.files[0]; if (!/\.csv$/i.test(f.name)) { showToast('Træk en .csv-fil ind.'); return; }
+        const text = await f.text(); await uploadCSVText(text);
       });
 
       csvUp.addEventListener('click', async () => {
-        try {
-          pbh.textContent = 'Henter Excel (GET/POST), vælger bedste ark og uploader CSV …';
-          const t0 = Date.now();
-          await fetchExcelAsCSVAndUpload();
-          const ms = Date.now()-t0;
-          pbh.textContent = `Færdig på ${ms} ms.`;
-        } catch (e) { console.warn('[TP][PB][EXCEL→CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel→CSV upload.'; showToast('Fejl – se konsol.'); }
+        try { pbh.textContent = 'Henter Excel (GET/POST), vælger bedste ark og uploader CSV …';
+              const t0 = Date.now(); await fetchExcelAsCSVAndUpload();
+              pbh.textContent = `Færdig på ${Date.now()-t0} ms.`; }
+        catch (e) { console.warn('[TP][PB][EXCEL→CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel→CSV upload.'; showToast('Fejl – se konsol.'); }
       });
 
       tBtn.addEventListener('click', async () => {
         try {
-          const raw = (tIn.value||'').trim();
-          const p8 = normPhone(raw);
+          const raw = (tIn.value||'').trim(); const p8 = normPhone(raw);
           if (!p8) { pbh.textContent = 'Ugyldigt nummer.'; return; }
           pbh.textContent = 'Slår op i CSV…';
-          let csv = '';
-          try {
-            csv = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now());
-            if (csv) GM_setValue(CACHE_KEY_CSV, csv);
-          } catch(_) {}
+          let csv = ''; try { csv = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now()); if (csv) GM_setValue(CACHE_KEY_CSV, csv); } catch(_) {}
           if (!csv) csv = GM_getValue(CACHE_KEY_CSV) || '';
           const { map } = parsePhonebookCSV(csv);
           const rec = map.get(p8);
@@ -995,13 +810,10 @@ function injectUI() {
           pbh.textContent = `Match: ${p8} → ${rec.name || '(uden navn)'} (vikar_id=${rec.id})`;
           const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
           window.open(url, '_blank', 'noopener');
-        } catch(e) {
-          console.warn('[TP][PB][LOOKUP]', e);
-          pbh.textContent = 'Fejl ved opslag.';
-        }
+        } catch(e) { console.warn('[TP][PB][LOOKUP]', e); pbh.textContent = 'Fejl ved opslag.'; }
       });
 
-      // Manuelt update-tjek
+      // Update-check
       const chk = menu.querySelector('#tpCheckUpdate');
       chk.addEventListener('click', async () => {
         try {
@@ -1016,30 +828,17 @@ function injectUI() {
 
       return menu;
     }
-
     function toggleMenu() {
       const mnu = buildMenu();
       const r = gear.getBoundingClientRect();
       mnu.style.right = (window.innerWidth - r.right) + 'px';
-      mnu.style.top = (r.bottom + 6) + 'px';
+      mnu.style.top   = (r.bottom + 6) + 'px';
       mnu.style.display = (mnu.style.display === 'block' ? 'none' : 'block');
     }
     gear.addEventListener('click', toggleMenu);
-
-    document.addEventListener('mousedown', e => {
-      const m = menu; if (m && e.target !== m && !m.contains(e.target) && e.target !== gear) m.style.display = 'none';
-    });
+    document.addEventListener('mousedown', e => { const m = menu; if (m && e.target !== m && !m.contains(e.target) && e.target !== gear) m.style.display = 'none'; });
     window.addEventListener('resize', () => { ensureFullyVisible(gear); });
   }
-}
-function ensureFullyVisible(el){
-  const r = el.getBoundingClientRect();
-  let dx = 0, dy = 0;
-  if (r.right > window.innerWidth)  dx = window.innerWidth - r.right - 6;
-  if (r.bottom > window.innerHeight) dy = window.innerHeight - r.bottom - 6;
-  if (r.left < 0)  dx = 6 - r.left;
-  if (r.top  < 0)  dy = 6 - r.top;
-  if (dx || dy) el.style.transform = `translate(${dx}px,${dy}px)`;
 }
 
 /* Test-knap */
@@ -1047,9 +846,8 @@ function tpTestPushoverBoth(){
   const userKey = getUserKey();
   if (!userKey) { showToast('Indsæt din USER-token i ⚙️-menuen før test.'); return; }
   const ts = new Date().toLocaleTimeString();
-  const m1 = '🧪 [TEST] Besked-kanal OK — ' + ts;
-  const m2 = '🧪 [TEST] Interesse-kanal OK — ' + ts;
-  sendPushover(m1); setTimeout(() => sendPushover(m2), 800);
+  sendPushover('🧪 [TEST] Besked-kanal OK — ' + ts);
+  setTimeout(() => sendPushover('🧪 [TEST] Interesse-kanal OK — ' + ts), 800);
   showToast('Sendte Pushover-test (Besked + Interesse). Tjek Pushover.');
 }
 
@@ -1088,7 +886,6 @@ console.info('[TP] kører version', TP_VERSION);
   function show(el) { icon = el; var r = el.getBoundingClientRect(); var m = mkMenu(); m.style.left = r.left + 'px'; m.style.top = r.bottom + 4 + 'px'; m.style.display = 'block'; }
   function hide() { clearTimeout(hideT); hideT = setTimeout(function () { if (menu) menu.style.display = 'none'; icon = null; }, 120); }
   function findIcon(n) { while (n && n !== document) { if (n.getAttribute && n.getAttribute('title') === 'Registrer opkald til vikar') return n; n = n.parentNode; } return null; }
-
   document.addEventListener('mouseover', function (e) { var ic = findIcon(e.target); if (ic) show(ic); }, true);
   document.addEventListener('mousemove', function (e) {
     if (!menu || menu.style.display !== 'block') return;
@@ -1096,7 +893,6 @@ console.info('[TP] kører version', TP_VERSION);
     var overI = icon && (icon === e.target || icon.contains(e.target) || e.target.contains(icon));
     if (!overM && !overI) hide();
   }, true);
-
   new MutationObserver(function (ml) {
     if (!auto) return;
     ml.forEach(function (m) {
