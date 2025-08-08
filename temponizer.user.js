@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.9
-// @description  Push (leader+suppression), toast (Smart/Force DOM, max 1 OS på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + aktivér/deaktiver) direkte i hovedpanelet. Robuste UI-placeringer (panel, gear, menu).
+// @version      7.9.10
+// @description  Push (leader+suppression), toast (Smart/Force DOM, max 1 OS på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + aktivér/deaktiver) uden popup i hovedpanelet. Robuste UI-placeringer (panel, gear, menu), auto-bredde panel.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -21,7 +21,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.9';
+const TP_VERSION = '7.9.10';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -490,10 +490,10 @@ async function fetchExcelAsCSVAndUpload() {
   showToastOnce('csvok', 'CSV uploadet (Excel→CSV).');
 }
 
-/*──────── 6e) SMS (status + aktivér/deaktiver) ────────*/
+/*──────── 6e) SMS (status + aktivér/deaktiver) — helt uden popup ────────*/
 const SMS_SETTINGS_URL = `${location.origin}/index.php?page=showmy_settings`;
 
-// Stram parser: brug KUN inline display + linksignaturer (onclick/href)
+// Parser der kun stoler på inline display + link-signaturer
 function hasDisplayBlock(el) {
   if (!el) return false;
   const s = (el.getAttribute('style') || '').replace(/\s+/g,'').toLowerCase();
@@ -507,20 +507,15 @@ function parseSmsStatusFromDoc(doc) {
   const aktivShown   = hasDisplayBlock(elAktiv);
   const inaktivShown = hasDisplayBlock(elInaktiv);
 
-  // Link-signaturer (Temponizer bruger onclick="activate_cell_sms_notifikationer()" / deactivate_...)
   const hasDeactivateLink = !!(doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') ||
                                doc.querySelector('#sms_notifikation_aktiv a[href*="deactivate_cell_sms_notifikationer"]'));
   const hasActivateLink   = !!(doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') ||
                                doc.querySelector('#sms_notifikation_ikke_aktiv a[href*="activate_cell_sms_notifikationer"]'));
 
   let state = 'unknown', phone = '';
-
-  if (aktivShown || (!inaktivShown && hasDeactivateLink && !hasActivateLink)) {
-    state = 'active';
-  } else if (inaktivShown || (!aktivShown && hasActivateLink && !hasDeactivateLink)) {
-    state = 'inactive';
-  } else {
-    // Tekst-fallback, men kun hvis unik
+  if (aktivShown || (!inaktivShown && hasDeactivateLink && !hasActivateLink)) state = 'active';
+  else if (inaktivShown || (!aktivShown && hasActivateLink && !hasDeactivateLink)) state = 'inactive';
+  else {
     const txtA = (elAktiv?.textContent || '').toLowerCase();
     const txtI = (elInaktiv?.textContent || '').toLowerCase();
     const aHit = /er\s*aktiv/.test(txtA);
@@ -529,57 +524,82 @@ function parseSmsStatusFromDoc(doc) {
     else if (iHit && !aHit) state = 'inactive';
   }
 
-  const refTxt = state === 'active'
-    ? (elAktiv?.textContent || '')
-    : (elInaktiv?.textContent || '');
+  const refTxt = state === 'active' ? (elAktiv?.textContent || '') : (elInaktiv?.textContent || '');
   const m = refTxt.replace(/\u00A0/g,' ').match(/\+?\d[\d\s]{5,}/);
   if (m) phone = m[0].replace(/\s+/g,'');
 
   return { state, phone };
 }
-function parseSmsStatusFromHTML(html) {
-  const doc = new DOMParser().parseFromString(html, 'text/html');
-  return parseSmsStatusFromDoc(doc);
-}
-async function fetchSmsStatusHTML() {
-  return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now());
-}
+function parseSmsStatusFromHTML(html) { return parseSmsStatusFromDoc(new DOMParser().parseFromString(html, 'text/html')); }
+async function fetchSmsStatusHTML() { return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now()); }
 async function getSmsStatus() {
-  try {
-    const html = await fetchSmsStatusHTML();
-    return parseSmsStatusFromHTML(html);
-  } catch {
-    return { state: 'unknown' };
-  }
+  try { return parseSmsStatusFromHTML(await fetchSmsStatusHTML()); }
+  catch { return { state: 'unknown' }; }
 }
 
-// Autopilot på settings-siden (klik “Aktivér/Deaktiver” og luk)
-(function smsAutopilot(){
+// Skjult iframe-controller (ingen popup)
+async function ensureSmsFrameLoaded() {
+  let ifr = document.getElementById('tpSmsFrame');
+  if (!ifr) {
+    ifr = document.createElement('iframe');
+    ifr.id = 'tpSmsFrame';
+    Object.assign(ifr.style, { position:'fixed', left:'-10000px', top:'-10000px', width:'1px', height:'1px', opacity:'0', pointerEvents:'none', border:'0' });
+    document.body.appendChild(ifr);
+  }
+  const loadOnce = () => new Promise(res => { ifr.onload = () => res(); });
+  const wantUrl = SMS_SETTINGS_URL;
+  if (ifr.src !== wantUrl) { ifr.src = wantUrl; await loadOnce(); }
+  else if (!ifr.contentWindow || !ifr.contentDocument || !ifr.contentDocument.body) { ifr.src = wantUrl; await loadOnce(); }
+  return ifr;
+}
+function getIframeStatus(ifr) {
+  try { return parseSmsStatusFromDoc(ifr.contentDocument); }
+  catch { return { state:'unknown' }; }
+}
+function invokeIframeAction(ifr, wantOn) {
+  const win = ifr.contentWindow;
+  const doc = ifr.contentDocument;
   try {
-    const u = new URL(location.href);
-    if (u.searchParams.get('page') !== 'showmy_settings') return;
-    const m = (u.hash || '').toLowerCase().match(/tp_sms_auto=(activate|deactivate)/);
-    if (!m) return;
-    const action = m[1];
-    const doClick = () => {
-      const doc = document;
-      const link = action === 'activate'
-        ? (doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') ||
-           doc.querySelector('#sms_notifikation_ikke_aktiv a'))
-        : (doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') ||
-           doc.querySelector('#sms_notifikation_aktiv a'));
-      if (link) link.click();
-      const targetSel = action === 'activate' ? '#sms_notifikation_aktiv' : '#sms_notifikation_ikke_aktiv';
-      const t0 = Date.now();
-      const iv = setInterval(() => {
-        const target = doc.querySelector(targetSel);
-        const ok = target && hasDisplayBlock(target);
-        if (ok || Date.now() - t0 > 12000) { clearInterval(iv); try { window.close(); } catch(_) {} }
-      }, 500);
-    };
-    setTimeout(doClick, 300);
+    if (wantOn && typeof win.activate_cell_sms_notifikationer === 'function') { win.activate_cell_sms_notifikationer(); return true; }
+    if (!wantOn && typeof win.deactivate_cell_sms_notifikationer === 'function') { win.deactivate_cell_sms_notifikationer(); return true; }
   } catch(_) {}
-})();
+  // Fallback: klik på linket i iframen
+  try {
+    const link = wantOn
+      ? (doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_ikke_aktiv a'))
+      : (doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_aktiv a'));
+    if (link) { link.click(); return true; }
+  } catch(_) {}
+  return false;
+}
+async function toggleSmsInIframe(wantOn, timeoutMs=15000, pollMs=600) {
+  const ifr = await ensureSmsFrameLoaded();
+  // Før kald: hvis vi allerede er i ønsket state, no-op
+  let st0 = getIframeStatus(ifr);
+  if ((wantOn && st0.state === 'active') || (!wantOn && st0.state === 'inactive')) return st0;
+
+  // Invoke
+  const invoked = invokeIframeAction(ifr, wantOn);
+  if (!invoked) throw new Error('Kan ikke udløse aktivering/deaktivering i iframe.');
+
+  // Nogle gange navigerer Temponizer via JS → vent til load igen
+  const maybeReloaded = new Promise(res => { let done=false; ifr.addEventListener('load', () => { if (!done){ done=true; res(); } }, { once:true }); setTimeout(() => { if (!done) res(); }, 1200); });
+  await maybeReloaded;
+
+  // Poll efter ny state
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const st = getIframeStatus(ifr);
+    if (wantOn && st.state === 'active') return st;
+    if (!wantOn && st.state === 'inactive') return st;
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  // Sidste forsøg: force-reload og tjek igen
+  const reload = () => new Promise(res => { ifr.onload = () => res(); ifr.src = SMS_SETTINGS_URL + '&ts=' + Date.now(); });
+  await reload();
+  const stFinal = getIframeStatus(ifr);
+  return stFinal;
+}
 
 const sms = {
   _busy: false,
@@ -588,40 +608,22 @@ const sms = {
     const st = await getSmsStatus();
     this._last = st; cb && cb(st);
   },
-  _openPopup(action) {
-    // Diskret popup/fane – forsøg at placere off-screen
-    const features = [
-      'popup=yes','noopener','noreferrer',
-      'toolbar=no','location=no','status=no','menubar=no','scrollbars=no','resizable=no',
-      'width=320','height=320','left=-10000','top=-10000'
-    ].join(',');
-    const w = window.open(`${SMS_SETTINGS_URL}#tp_sms_auto=${action}`, 'tpSmsCtl', features);
-    try { window.focus(); } catch(_) {}
-    return w;
-  },
-  async _pollUntil(desired, timeoutMs=15000, intervalMs=600) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeoutMs) {
-      const st = await getSmsStatus();
-      this._last = st;
-      if (st.state === desired) return st;
-      await new Promise(r => setTimeout(r, intervalMs));
-    }
-    throw new Error('Timeout waiting for state=' + desired);
-  },
   async setEnabled(wantOn, uiBusy, cb) {
     if (this._busy) return;
     this._busy = true;
     uiBusy && uiBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
     try {
-      const pop = this._openPopup(wantOn ? 'activate' : 'deactivate');
-      let st;
-      try { st = await this._pollUntil(wantOn ? 'active' : 'inactive'); }
-      finally { try { if (pop && !pop.closed) pop.close(); } catch(_) {} }
+      const st = await toggleSmsInIframe(wantOn, 15000, 500);
+      this._last = st;
       cb && cb(st);
-      showToast(wantOn ? 'SMS aktiveret.' : 'SMS deaktiveret.');
+      if ((wantOn && st.state === 'active') || (!wantOn && st.state === 'inactive')) {
+        showToast(wantOn ? 'SMS aktiveret.' : 'SMS deaktiveret.');
+      } else {
+        showToast('Usikker SMS-status (timeout) – prøv at opdatere.');
+      }
     } catch (e) {
-      showToast('Kunne ikke ' + (wantOn ? 'aktivere' : 'deaktivere') + ' SMS (timeout).');
+      console.warn('[TP][SMS] setEnabled error', e);
+      showToast('Kunne ikke ændre SMS-status. Se konsol.');
       const st = await getSmsStatus(); this._last = st; cb && cb(st);
     } finally {
       this._busy = false;
@@ -661,8 +663,6 @@ function makeDraggable(el, storageKey, handleSelector) {
   };
   handle.addEventListener('mousedown', down); handle.addEventListener('touchstart', down, {passive:false});
 }
-
-// Ægte clamp (ingen transform)
 function ensureFullyVisible(el, margin = 8) {
   if (!el) return;
   el.style.transform = 'none';
@@ -692,17 +692,18 @@ function injectUI() {
     'position:fixed','top:12px','right:12px','z-index:2147483645',
     'background:#f9f9f9','border:1px solid #ccc','padding:8px 10px',
     'border-radius:6px','font-size:12px','font-family:sans-serif',
-    'box-shadow:1px 1px 5px rgba(0,0,0,.2)','width:300px','resize:none'
+    'box-shadow:1px 1px 5px rgba(0,0,0,.2)',
+    'display:inline-block','min-width:220px','max-width:340px','width:auto'
   ].join(';');
   d.innerHTML =
     '<div id="tpPanelHeader" style="font-weight:700;cursor:move;user-select:none">TP Notifikationer</div>' +
     '<div style="margin-top:6px;display:flex;flex-direction:column;gap:6px">' +
-      '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="m"> <span>Besked (Pushover)</span></label>' +
-      '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="i"> <span>Interesse (Pushover)</span></label>' +
+      '<label style="display:flex;align-items:center;gap:6px;white-space:nowrap;"><input type="checkbox" id="m"> <span>Besked (Pushover)</span></label>' +
+      '<label style="display:flex;align-items:center;gap:6px;white-space:nowrap;"><input type="checkbox" id="i"> <span>Interesse (Pushover)</span></label>' +
       // SMS som knap + status
-      '<div id="smsRow" style="display:flex;align-items:flex-start;gap:6px;white-space:nowrap">' +
+      '<div id="smsRow" style="display:flex;align-items:flex-start;gap:6px">' +
         '<div style="display:flex;flex-direction:column;gap:2px;flex:1;min-width:0">' +
-          '<div style="display:flex;align-items:center;gap:6px">' +
+          '<div style="display:flex;align-items:center;gap:6px;white-space:nowrap">' +
             '<strong>SMS</strong>' +
             '<span id="smsTag" style="font-size:11px;color:#666;overflow:hidden;text-overflow:ellipsis;">indlæser…</span>' +
           '</div>' +
@@ -730,8 +731,8 @@ function injectUI() {
   const smsRefresh = d.querySelector('#smsRefresh');
 
   function smsSetBusy(on, text) {
-    smsAction.disabled = true;
-    smsRefresh.disabled = true;
+    smsAction.disabled = on;
+    smsRefresh.disabled = on;
     if (on) smsTag.textContent = text || 'arbejder…';
   }
   function smsRender(st) {
@@ -749,13 +750,13 @@ function injectUI() {
       default:         smsAction.textContent = 'Aktivér';         mark('Ukendt', '#666');
     }
   }
-  smsRefresh.addEventListener('click', async () => { smsSetBusy(true, 'opdaterer…'); await sms.refresh(smsRender); });
+  smsRefresh.addEventListener('click', async () => { smsSetBusy(true, 'opdaterer…'); await sms.refresh(smsRender); smsSetBusy(false); });
   smsAction.addEventListener('click', async () => {
     const wantOn = (sms._last?.state !== 'active');
     smsSetBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
     await sms.setEnabled(wantOn, smsSetBusy, smsRender);
   });
-  (async () => { smsSetBusy(true, 'indlæser…'); await sms.refresh(smsRender); })();
+  (async () => { smsSetBusy(true, 'indlæser…'); await sms.refresh(smsRender); smsSetBusy(false); })();
 
   // ── Tandhjul
   if (!document.getElementById('tpGear')) {
@@ -930,7 +931,6 @@ function injectUI() {
     }
 
     function positionMenu(menu, gear) {
-      // midlertidigt synlig for at måle
       const oldDisp = menu.style.display;
       const oldVis  = menu.style.visibility;
       menu.style.visibility = 'hidden';
@@ -940,50 +940,34 @@ function injectUI() {
       const mw = menu.offsetWidth;
       const mh = menu.offsetHeight;
 
-      // Primært under gear
       let left = Math.round(gr.right - mw);
       let top  = Math.round(gr.bottom + 8);
+      if (top + mh > window.innerHeight - 8) top = Math.round(gr.top - mh - 8);
 
-      // Hvis ikke plads → placer over
-      if (top + mh > window.innerHeight - 8) {
-        top = Math.round(gr.top - mh - 8);
-      }
-
-      // Clamp
       if (left < 8) left = 8;
       if (left + mw > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - mw);
       if (top < 8) top = 8;
 
       Object.assign(menu.style, { position:'fixed', left:left+'px', top:top+'px', right:'auto', bottom:'auto' });
-
-      // gendan synlighed
       menu.style.visibility = oldVis || 'visible';
       menu.style.display    = oldDisp || 'block';
     }
 
     function toggleMenu() {
       const mnu = buildMenu();
-      if (mnu.style.display === 'block') {
-        mnu.style.display = 'none';
-        return;
-      }
+      if (mnu.style.display === 'block') { mnu.style.display = 'none'; return; }
       mnu.style.display = 'block';
       positionMenu(mnu, gear);
     }
     gear.addEventListener('click', toggleMenu);
 
-    // Luk menu ved klik udenfor
     document.addEventListener('mousedown', e => {
       const m = menu; if (m && m.style.display === 'block' && e.target !== m && !m.contains(e.target) && e.target !== gear) m.style.display = 'none';
     });
-
-    // Hold UI på skærmen ved resize
     window.addEventListener('resize', () => {
       ensureFullyVisible(d);
       ensureFullyVisible(gear);
-      if (menu && menu.style.display === 'block') {
-        positionMenu(menu, gear);
-      }
+      if (menu && menu.style.display === 'block') positionMenu(menu, gear);
     });
   }
 }
