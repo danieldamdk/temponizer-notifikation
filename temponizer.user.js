@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.15
-// @description  Push (leader+suppression), toast (Smart/Force DOM, max 1 OS på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + aktivér/deaktiver) uden popup i hovedpanelet. Gear i header. Interesse-poller tvinger let GET jævnligt (no-cache).
+// @version      7.9.16
+// @description  Push (leader+suppression), toast (Smart/Force DOM, max 1 OS på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + aktivér/deaktiver) uden popup i hovedpanelet. Gear i header. Interesse-poller tvinger let GET jævnligt (no-cache). Hurtigere besked-poll (15s) + non-leader hint til leader.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -22,11 +22,11 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.15';
+const TP_VERSION = '7.9.16';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
-const POLL_MS     = 30000;
+const POLL_MS     = 15000;   // <- 15s (hurtigere besked-poll)
 const SUPPRESS_MS = 45000;
 const LOCK_MS     = SUPPRESS_MS + 5000;
 
@@ -163,28 +163,55 @@ function takeLock() {
 }
 
 /*──────── 5) POLLERS ────────*/
+// — Besked: leader-hint så non-leaders kan trigge hurtig poll —
+const MSG_HINT_KEY = 'tpMsgHintV1';
+let msgHintLocalTs = 0;
+function hintLeaderNow() {
+  const now = Date.now();
+  if (now - msgHintLocalTs < 10000) return; // rate-limit 10s
+  msgHintLocalTs = now;
+  try { localStorage.setItem(MSG_HINT_KEY, String(now)); } catch (_) {}
+}
+window.addEventListener('storage', (e) => {
+  if (e.key === MSG_HINT_KEY && isLeader()) {
+    try { pollMessages(); } catch (_) {}
+  }
+});
+
+let _nlLastMsg = 0; // non-leader sidste set
 function pollMessages() {
-  if (!isLeader()) return;
-  fetch(MSG_URL + '&ts=' + Date.now(), { credentials: 'same-origin' })
-    .then(r => r.json())
-    .then(d => {
-      const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
-      const n  = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
-      const en = localStorage.getItem('tpPushEnableMsg') === 'true';
-      if (n > stMsg.count && n !== stMsg.lastSent) {
-        const canPush = (Date.now() - stMsg.lastPush > SUPPRESS_MS) && takeLock();
-        if (canPush) {
-          const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
-          if (en) sendPushover(m);
-          broadcastToast('msg', m);
-          showToastOnce('msg', m);
-          stMsg.lastPush = Date.now(); stMsg.lastSent = n;
-        } else stMsg.lastSent = n;
-      } else if (n < stMsg.count) { stMsg.lastPush = 0; }
-      stMsg.count = n; saveJsonIfLeader(ST_MSG_KEY, stMsg);
-      console.info('[TP-besked]', n, new Date().toLocaleTimeString());
-    })
-    .catch(e => console.warn('[TP][ERR][MSG]', e));
+  const isL = isLeader();
+  fetch(MSG_URL + '&ts=' + Date.now(), {
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: { 'Cache-Control':'no-cache', 'Pragma':'no-cache' }
+  })
+  .then(r => r.json())
+  .then(d => {
+    const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
+    const n  = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
+    const en = localStorage.getItem('tpPushEnableMsg') === 'true';
+
+    if (!isL) {
+      if (n > _nlLastMsg) hintLeaderNow(); // bed leader om at poll’e nu
+      _nlLastMsg = n;
+      return;
+    }
+
+    if (n > stMsg.count && n !== stMsg.lastSent) {
+      const canPush = (Date.now() - stMsg.lastPush > SUPPRESS_MS) && takeLock();
+      if (canPush) {
+        const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
+        if (en) sendPushover(m);
+        broadcastToast('msg', m);
+        showToastOnce('msg', m);
+        stMsg.lastPush = Date.now(); stMsg.lastSent = n;
+      } else stMsg.lastSent = n;
+    } else if (n < stMsg.count) { stMsg.lastPush = 0; }
+    stMsg.count = n; saveJsonIfLeader(ST_MSG_KEY, stMsg);
+    console.info('[TP-besked]', n, new Date().toLocaleTimeString());
+  })
+  .catch(e => console.warn('[TP][ERR][MSG]', e));
 }
 
 /* Interesse – HEAD + tvungen let GET jævnligt (no-cache) */
@@ -986,6 +1013,14 @@ setInterval(pollMessages, POLL_MS);
 setInterval(pollInterest, POLL_MS);
 injectUI();
 console.info('[TP] kører version', TP_VERSION);
+
+// Øjeblikkelig re-poll når fanen bliver synlig
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    if (isLeader()) { try { pollMessages(); } catch(_){} }
+    else { hintLeaderNow(); }
+  }
+});
 
 /*──────── 9) HOVER “Intet Svar” ────────*/
 (function () {
