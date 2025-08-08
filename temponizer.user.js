@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.8
+// @version      7.9.9
 // @description  Push (leader+suppression), toast (Smart/Force DOM, max 1 OS på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + aktivér/deaktiver) direkte i hovedpanelet. Robuste UI-placeringer (panel, gear, menu).
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -21,7 +21,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.8';
+const TP_VERSION = '7.9.9';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -493,40 +493,47 @@ async function fetchExcelAsCSVAndUpload() {
 /*──────── 6e) SMS (status + aktivér/deaktiver) ────────*/
 const SMS_SETTINGS_URL = `${location.origin}/index.php?page=showmy_settings`;
 
-// Robust parser der virker for XHR/DOMParser (ser på inline style + tekst)
-function isDisplayedAttr(el) {
+// Stram parser: brug KUN inline display + linksignaturer (onclick/href)
+function hasDisplayBlock(el) {
   if (!el) return false;
-  const s = (el.getAttribute('style') || '').toLowerCase();
-  if (s.includes('display:none')) return false;
+  const s = (el.getAttribute('style') || '').replace(/\s+/g,'').toLowerCase();
+  if (s.includes('display:none'))  return false;
   if (s.includes('display:block')) return true;
-  return !!(el.textContent && el.textContent.trim());
+  return false;
 }
 function parseSmsStatusFromDoc(doc) {
   const elAktiv   = doc.getElementById('sms_notifikation_aktiv');
   const elInaktiv = doc.getElementById('sms_notifikation_ikke_aktiv');
-  const elSysOff  = doc.getElementById('sms_notifikation_kan_ikke_aktiveres_system');
-  const elNoMob   = doc.getElementById('sms_notifikation_kan_ikke_aktiveres_mobil');
+  const aktivShown   = hasDisplayBlock(elAktiv);
+  const inaktivShown = hasDisplayBlock(elInaktiv);
+
+  // Link-signaturer (Temponizer bruger onclick="activate_cell_sms_notifikationer()" / deactivate_...)
+  const hasDeactivateLink = !!(doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') ||
+                               doc.querySelector('#sms_notifikation_aktiv a[href*="deactivate_cell_sms_notifikationer"]'));
+  const hasActivateLink   = !!(doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') ||
+                               doc.querySelector('#sms_notifikation_ikke_aktiv a[href*="activate_cell_sms_notifikationer"]'));
 
   let state = 'unknown', phone = '';
 
-  const txtAktiv   = (elAktiv   ? elAktiv.textContent   : '') || '';
-  const txtInaktiv = (elInaktiv ? elInaktiv.textContent : '') || '';
-  const txtSysOff  = (elSysOff  ? elSysOff.textContent  : '') || '';
-  const txtNoMob   = (elNoMob   ? elNoMob.textContent   : '') || '';
-
-  if (isDisplayedAttr(elAktiv) || /Er\s*aktiv/i.test(txtAktiv)) {
+  if (aktivShown || (!inaktivShown && hasDeactivateLink && !hasActivateLink)) {
     state = 'active';
-  } else if (isDisplayedAttr(elInaktiv) || /Er\s*ikke\s*aktiv/i.test(txtInaktiv)) {
+  } else if (inaktivShown || (!aktivShown && hasActivateLink && !hasDeactivateLink)) {
     state = 'inactive';
-  } else if (isDisplayedAttr(elSysOff) || /Kan ikke aktiveres.*system/i.test(txtSysOff)) {
-    state = 'sys_off';
-  } else if (isDisplayedAttr(elNoMob) || /ikke.*mobil/i.test(txtNoMob)) {
-    state = 'no_mobile';
+  } else {
+    // Tekst-fallback, men kun hvis unik
+    const txtA = (elAktiv?.textContent || '').toLowerCase();
+    const txtI = (elInaktiv?.textContent || '').toLowerCase();
+    const aHit = /er\s*aktiv/.test(txtA);
+    const iHit = /er\s*ikke\s*aktiv/.test(txtI);
+    if (aHit && !iHit) state = 'active';
+    else if (iHit && !aHit) state = 'inactive';
   }
 
-  const phoneText = state === 'active' ? txtAktiv : txtInaktiv;
-  const m = (phoneText || '').replace(/\u00A0/g,' ').match(/\+?\d[\d\s]{5,}/);
-  if (m && m[0]) phone = m[0].replace(/\s+/g,'');
+  const refTxt = state === 'active'
+    ? (elAktiv?.textContent || '')
+    : (elInaktiv?.textContent || '');
+  const m = refTxt.replace(/\u00A0/g,' ').match(/\+?\d[\d\s]{5,}/);
+  if (m) phone = m[0].replace(/\s+/g,'');
 
   return { state, phone };
 }
@@ -557,15 +564,17 @@ async function getSmsStatus() {
     const doClick = () => {
       const doc = document;
       const link = action === 'activate'
-        ? doc.querySelector('#sms_notifikation_ikke_aktiv a')
-        : doc.querySelector('#sms_notifikation_aktiv a');
+        ? (doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') ||
+           doc.querySelector('#sms_notifikation_ikke_aktiv a'))
+        : (doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') ||
+           doc.querySelector('#sms_notifikation_aktiv a'));
       if (link) link.click();
       const targetSel = action === 'activate' ? '#sms_notifikation_aktiv' : '#sms_notifikation_ikke_aktiv';
       const t0 = Date.now();
       const iv = setInterval(() => {
         const target = doc.querySelector(targetSel);
-        const ok = target && isDisplayedAttr(target);
-        if (ok || Date.now() - t0 > 10000) { clearInterval(iv); try { window.close(); } catch(_) {} }
+        const ok = target && hasDisplayBlock(target);
+        if (ok || Date.now() - t0 > 12000) { clearInterval(iv); try { window.close(); } catch(_) {} }
       }, 500);
     };
     setTimeout(doClick, 300);
@@ -580,9 +589,17 @@ const sms = {
     this._last = st; cb && cb(st);
   },
   _openPopup(action) {
-    return window.open(SMS_SETTINGS_URL + '#tp_sms_auto=' + action, 'tpSmsCtl', 'width=520,height=420');
+    // Diskret popup/fane – forsøg at placere off-screen
+    const features = [
+      'popup=yes','noopener','noreferrer',
+      'toolbar=no','location=no','status=no','menubar=no','scrollbars=no','resizable=no',
+      'width=320','height=320','left=-10000','top=-10000'
+    ].join(',');
+    const w = window.open(`${SMS_SETTINGS_URL}#tp_sms_auto=${action}`, 'tpSmsCtl', features);
+    try { window.focus(); } catch(_) {}
+    return w;
   },
-  async _pollUntil(desired, timeoutMs=12000, intervalMs=700) {
+  async _pollUntil(desired, timeoutMs=15000, intervalMs=600) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
       const st = await getSmsStatus();
@@ -725,11 +742,11 @@ function injectUI() {
     smsAction.disabled = false;
     smsRefresh.disabled = false;
     switch (st.state) {
-      case 'active':   smsAction.textContent = 'Deaktiver';     mark('Aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#090'); break;
-      case 'inactive': smsAction.textContent = 'Aktivér';       mark('Ikke aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#a00'); break;
-      case 'sys_off':  smsAction.textContent = 'Ikke muligt';   smsAction.disabled = true; mark('System slået fra', '#a00'); break;
+      case 'active':   smsAction.textContent = 'Deaktiver';       mark('Aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#090'); break;
+      case 'inactive': smsAction.textContent = 'Aktivér';         mark('Ikke aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#a00'); break;
+      case 'sys_off':  smsAction.textContent = 'Ikke muligt';     smsAction.disabled = true; mark('System slået fra', '#a00'); break;
       case 'no_mobile':smsAction.textContent = 'Kræver mobilnr.'; smsAction.disabled = true; mark('Manglende mobil på login', '#a00'); break;
-      default:         smsAction.textContent = 'Aktivér';       mark('Ukendt', '#666');
+      default:         smsAction.textContent = 'Aktivér';         mark('Ukendt', '#666');
     }
   }
   smsRefresh.addEventListener('click', async () => { smsSetBusy(true, 'opdaterer…'); await sms.refresh(smsRender); });
@@ -753,7 +770,7 @@ function injectUI() {
     });
     document.body.appendChild(gear);
 
-    // Placér gear lige under panelet (øverst-højre)
+    // Placér gear lige under panelet
     const panelRect = d.getBoundingClientRect();
     gear.style.left = (panelRect.right - gear.offsetWidth) + 'px';
     gear.style.top  = (panelRect.bottom + 10) + 'px';
