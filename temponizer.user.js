@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.7
-// @description  Push (leader, suppression), toast (Smart: DOM når synlig, OS når skjult • max 1 OS), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + toggle) direkte i hovedpanelet.
+// @version      7.9.8
+// @description  Push (leader+suppression), toast (Smart/Force DOM, max 1 OS på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + aktivér/deaktiver) direkte i hovedpanelet. Robuste UI-placeringer (panel, gear, menu).
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -21,7 +21,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.7';
+const TP_VERSION = '7.9.8';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -30,7 +30,7 @@ const SUPPRESS_MS = 45000;
 const LOCK_MS     = SUPPRESS_MS + 5000;
 
 // Cross-tab leader
-const LEADER_KEY = 'tpLeaderV1';
+const LEADER_KEY   = 'tpLeaderV1';
 const HEARTBEAT_MS = 5000;
 const LEASE_MS     = 15000;
 const TAB_ID = (crypto && crypto.randomUUID ? crypto.randomUUID() : ('tab-' + Math.random().toString(36).slice(2) + Date.now()));
@@ -108,7 +108,7 @@ window.addEventListener('storage', e => {
     if (localStorage.getItem(seenKey)) return;
     localStorage.setItem(seenKey, '1');
     if (!isLeader() && document.visibilityState === 'visible') {
-      showDOMToast(ev.msg);
+      showDOMToast(ev.msg); // kun DOM i non-leader
     }
   } catch (_) {}
 });
@@ -490,30 +490,87 @@ async function fetchExcelAsCSVAndUpload() {
   showToastOnce('csvok', 'CSV uploadet (Excel→CSV).');
 }
 
-/*──────── 6e) SMS (status + toggle, POPUP + POLL) ────────*/
+/*──────── 6e) SMS (status + aktivér/deaktiver) ────────*/
 const SMS_SETTINGS_URL = `${location.origin}/index.php?page=showmy_settings`;
-function isVisible(el) { if (!el) return false; const cs = getComputedStyle(el); return cs.display !== 'none' && cs.visibility !== 'hidden'; }
+
+// Robust parser der virker for XHR/DOMParser (ser på inline style + tekst)
+function isDisplayedAttr(el) {
+  if (!el) return false;
+  const s = (el.getAttribute('style') || '').toLowerCase();
+  if (s.includes('display:none')) return false;
+  if (s.includes('display:block')) return true;
+  return !!(el.textContent && el.textContent.trim());
+}
 function parseSmsStatusFromDoc(doc) {
   const elAktiv   = doc.getElementById('sms_notifikation_aktiv');
   const elInaktiv = doc.getElementById('sms_notifikation_ikke_aktiv');
   const elSysOff  = doc.getElementById('sms_notifikation_kan_ikke_aktiveres_system');
   const elNoMob   = doc.getElementById('sms_notifikation_kan_ikke_aktiveres_mobil');
+
   let state = 'unknown', phone = '';
-  if (isVisible(elAktiv)) state = 'active';
-  else if (isVisible(elInaktiv)) state = 'inactive';
-  else if (isVisible(elSysOff)) state = 'sys_off';
-  else if (isVisible(elNoMob)) state = 'no_mobile';
-  const txt = (elAktiv && isVisible(elAktiv) ? elAktiv.textContent : elInaktiv ? elInaktiv.textContent : '') || '';
-  const digits = txt.replace(/\u00A0/g,' ').replace(/\s+/g,'').match(/\+?\d{6,}/g);
-  if (digits && digits[0]) phone = digits[0];
+
+  const txtAktiv   = (elAktiv   ? elAktiv.textContent   : '') || '';
+  const txtInaktiv = (elInaktiv ? elInaktiv.textContent : '') || '';
+  const txtSysOff  = (elSysOff  ? elSysOff.textContent  : '') || '';
+  const txtNoMob   = (elNoMob   ? elNoMob.textContent   : '') || '';
+
+  if (isDisplayedAttr(elAktiv) || /Er\s*aktiv/i.test(txtAktiv)) {
+    state = 'active';
+  } else if (isDisplayedAttr(elInaktiv) || /Er\s*ikke\s*aktiv/i.test(txtInaktiv)) {
+    state = 'inactive';
+  } else if (isDisplayedAttr(elSysOff) || /Kan ikke aktiveres.*system/i.test(txtSysOff)) {
+    state = 'sys_off';
+  } else if (isDisplayedAttr(elNoMob) || /ikke.*mobil/i.test(txtNoMob)) {
+    state = 'no_mobile';
+  }
+
+  const phoneText = state === 'active' ? txtAktiv : txtInaktiv;
+  const m = (phoneText || '').replace(/\u00A0/g,' ').match(/\+?\d[\d\s]{5,}/);
+  if (m && m[0]) phone = m[0].replace(/\s+/g,'');
+
   return { state, phone };
 }
 function parseSmsStatusFromHTML(html) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
   return parseSmsStatusFromDoc(doc);
 }
-async function fetchSmsStatusHTML() { return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now()); }
-async function getSmsStatus() { try { const html = await fetchSmsStatusHTML(); return parseSmsStatusFromHTML(html); } catch { return { state:'unknown' }; } }
+async function fetchSmsStatusHTML() {
+  return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now());
+}
+async function getSmsStatus() {
+  try {
+    const html = await fetchSmsStatusHTML();
+    return parseSmsStatusFromHTML(html);
+  } catch {
+    return { state: 'unknown' };
+  }
+}
+
+// Autopilot på settings-siden (klik “Aktivér/Deaktiver” og luk)
+(function smsAutopilot(){
+  try {
+    const u = new URL(location.href);
+    if (u.searchParams.get('page') !== 'showmy_settings') return;
+    const m = (u.hash || '').toLowerCase().match(/tp_sms_auto=(activate|deactivate)/);
+    if (!m) return;
+    const action = m[1];
+    const doClick = () => {
+      const doc = document;
+      const link = action === 'activate'
+        ? doc.querySelector('#sms_notifikation_ikke_aktiv a')
+        : doc.querySelector('#sms_notifikation_aktiv a');
+      if (link) link.click();
+      const targetSel = action === 'activate' ? '#sms_notifikation_aktiv' : '#sms_notifikation_ikke_aktiv';
+      const t0 = Date.now();
+      const iv = setInterval(() => {
+        const target = doc.querySelector(targetSel);
+        const ok = target && isDisplayedAttr(target);
+        if (ok || Date.now() - t0 > 10000) { clearInterval(iv); try { window.close(); } catch(_) {} }
+      }, 500);
+    };
+    setTimeout(doClick, 300);
+  } catch(_) {}
+})();
 
 const sms = {
   _busy: false,
@@ -523,10 +580,9 @@ const sms = {
     this._last = st; cb && cb(st);
   },
   _openPopup(action) {
-    // action: 'activate' | 'deactivate'
     return window.open(SMS_SETTINGS_URL + '#tp_sms_auto=' + action, 'tpSmsCtl', 'width=520,height=420');
   },
-  async _pollUntil(desired, timeoutMs=10000, intervalMs=700) {
+  async _pollUntil(desired, timeoutMs=12000, intervalMs=700) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
       const st = await getSmsStatus();
@@ -543,16 +599,12 @@ const sms = {
     try {
       const pop = this._openPopup(wantOn ? 'activate' : 'deactivate');
       let st;
-      try {
-        st = await this._pollUntil(wantOn ? 'active' : 'inactive');
-      } finally {
-        try { if (pop && !pop.closed) pop.close(); } catch(_) {}
-      }
+      try { st = await this._pollUntil(wantOn ? 'active' : 'inactive'); }
+      finally { try { if (pop && !pop.closed) pop.close(); } catch(_) {} }
       cb && cb(st);
       showToast(wantOn ? 'SMS aktiveret.' : 'SMS deaktiveret.');
     } catch (e) {
       showToast('Kunne ikke ' + (wantOn ? 'aktivere' : 'deaktivere') + ' SMS (timeout).');
-      // Efter fejl, opdatér til server-sandhed
       const st = await getSmsStatus(); this._last = st; cb && cb(st);
     } finally {
       this._busy = false;
@@ -561,7 +613,7 @@ const sms = {
   }
 };
 
-/*──────── 7) DRAGGABLE ────────*/
+/*──────── 7) DRAGGABLE + UI CLAMP ────────*/
 function makeDraggable(el, storageKey, handleSelector) {
   const handle = handleSelector ? el.querySelector(handleSelector) : el;
   if (!handle) return;
@@ -580,8 +632,8 @@ function makeDraggable(el, storageKey, handleSelector) {
   const move = e => {
     if (!moving) return;
     const p = e.touches ? e.touches[0] : e;
-    const nx = Math.min(window.innerWidth - el.offsetWidth - 4, Math.max(4, baseLeft + (p.clientX - startX)));
-    const ny = Math.min(window.innerHeight - el.offsetHeight - 4, Math.max(4, baseTop  + (p.clientY - startY)));
+    const nx = Math.min(window.innerWidth - el.offsetWidth - 8, Math.max(8, baseLeft + (p.clientX - startX)));
+    const ny = Math.min(window.innerHeight - el.offsetHeight - 8, Math.max(8, baseTop  + (p.clientY - startY)));
     el.style.left = nx+'px'; el.style.top = ny+'px'; el.style.right='auto'; el.style.bottom='auto'; el.style.position='fixed';
     localStorage.setItem(storageKey, JSON.stringify({left:nx, top:ny})); e.preventDefault();
   };
@@ -593,17 +645,30 @@ function makeDraggable(el, storageKey, handleSelector) {
   handle.addEventListener('mousedown', down); handle.addEventListener('touchstart', down, {passive:false});
 }
 
-/*──────── 7) UI ────────*/
-function ensureFullyVisible(el){
-  const r = el.getBoundingClientRect(); let dx=0, dy=0;
-  if (r.right > window.innerWidth)  dx = window.innerWidth - r.right - 6;
-  if (r.bottom > window.innerHeight) dy = window.innerHeight - r.bottom - 6;
-  if (r.left < 0)  dx = 6 - r.left;
-  if (r.top  < 0)  dy = 6 - r.top;
-  if (dx || dy) el.style.transform = `translate(${dx}px,${dy}px)`;
+// Ægte clamp (ingen transform)
+function ensureFullyVisible(el, margin = 8) {
+  if (!el) return;
+  el.style.transform = 'none';
+  const r = el.getBoundingClientRect();
+  let left = r.left;
+  let top  = r.top;
+  const w = r.width;
+  const h = r.height;
+  if (left < margin) left = margin;
+  if (top  < margin) top  = margin;
+  if (left + w > window.innerWidth  - margin) left = Math.max(margin, window.innerWidth  - margin - w);
+  if (top  + h > window.innerHeight - margin) top  = Math.max(margin, window.innerHeight - margin - h);
+  el.style.position = 'fixed';
+  el.style.left = left + 'px';
+  el.style.top  = top  + 'px';
+  el.style.right  = 'auto';
+  el.style.bottom = 'auto';
 }
+
+/*──────── 7) UI (panel + gear + menu) ────────*/
 function injectUI() {
   if (document.getElementById('tpPanel')) return;
+
   const d = document.createElement('div');
   d.id = 'tpPanel';
   d.style.cssText = [
@@ -617,15 +682,22 @@ function injectUI() {
     '<div style="margin-top:6px;display:flex;flex-direction:column;gap:6px">' +
       '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="m"> <span>Besked (Pushover)</span></label>' +
       '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="i"> <span>Interesse (Pushover)</span></label>' +
-      '<div id="smsRow" style="display:flex;align-items:center;gap:6px;white-space:nowrap">' +
-        '<label style="display:flex;align-items:center;gap:6px;flex:1;min-width:0;margin:0">' +
-          '<input type="checkbox" id="smsToggle" disabled> <span>SMS</span>' +
-          '<span id="smsTag" style="font-size:11px;color:#666;overflow:hidden;text-overflow:ellipsis;">indlæser…</span>' +
-        '</label>' +
-        '<button id="smsRefresh" title="Opdatér status" style="padding:2px 6px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer;flex:0 0 auto">↻</button>' +
+      // SMS som knap + status
+      '<div id="smsRow" style="display:flex;align-items:flex-start;gap:6px;white-space:nowrap">' +
+        '<div style="display:flex;flex-direction:column;gap:2px;flex:1;min-width:0">' +
+          '<div style="display:flex;align-items:center;gap:6px">' +
+            '<strong>SMS</strong>' +
+            '<span id="smsTag" style="font-size:11px;color:#666;overflow:hidden;text-overflow:ellipsis;">indlæser…</span>' +
+          '</div>' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+            '<button id="smsAction" style="padding:4px 8px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer">Aktivér</button>' +
+            '<button id="smsRefresh" title="Opdatér status" style="padding:4px 8px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer">↻</button>' +
+          '</div>' +
+        '</div>' +
       '</div>' +
     '</div>';
   document.body.appendChild(d);
+
   makeDraggable(d, 'tpPanelPos', '#tpPanelHeader');
   ensureFullyVisible(d);
 
@@ -635,51 +707,58 @@ function injectUI() {
   m.onchange = () => localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false');
   i.onchange = () => localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false');
 
-  // SMS UI
-  const smsToggle  = d.querySelector('#smsToggle');
+  // ── SMS UI (knap + status)
+  const smsAction  = d.querySelector('#smsAction');
   const smsTag     = d.querySelector('#smsTag');
   const smsRefresh = d.querySelector('#smsRefresh');
 
-  function smsSetBusy(on, text) { smsToggle.disabled = true; smsRefresh.disabled = true; if (on) smsTag.textContent = text || 'arbejder…'; }
+  function smsSetBusy(on, text) {
+    smsAction.disabled = true;
+    smsRefresh.disabled = true;
+    if (on) smsTag.textContent = text || 'arbejder…';
+  }
   function smsRender(st) {
     const time = new Date().toLocaleTimeString();
-    const mark = (txt, color) => { smsTag.innerHTML = `<span style="color:${color};font-weight:600">${txt}</span> <span style="color:#888;font-size:11px">• ${time}</span>`; };
+    const mark = (txt, color) => {
+      smsTag.innerHTML = `<span style="color:${color};font-weight:600">${txt}</span> <span style="color:#888;font-size:11px">• ${time}</span>`;
+    };
+    smsAction.disabled = false;
+    smsRefresh.disabled = false;
     switch (st.state) {
-      case 'active':   smsToggle.checked = true;  smsToggle.disabled=false; smsRefresh.disabled=false; mark('Aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#090'); break;
-      case 'inactive': smsToggle.checked = false; smsToggle.disabled=false; smsRefresh.disabled=false; mark('Ikke aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#a00'); break;
-      case 'sys_off':  smsToggle.checked = false; smsToggle.disabled=true;  smsRefresh.disabled=false; mark('System slået fra', '#a00'); break;
-      case 'no_mobile':smsToggle.checked = false; smsToggle.disabled=true;  smsRefresh.disabled=false; mark('Manglende mobil på login', '#a00'); break;
-      default:         smsToggle.checked = false; smsToggle.disabled=false; smsRefresh.disabled=false; mark('Ukendt', '#666');
+      case 'active':   smsAction.textContent = 'Deaktiver';     mark('Aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#090'); break;
+      case 'inactive': smsAction.textContent = 'Aktivér';       mark('Ikke aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#a00'); break;
+      case 'sys_off':  smsAction.textContent = 'Ikke muligt';   smsAction.disabled = true; mark('System slået fra', '#a00'); break;
+      case 'no_mobile':smsAction.textContent = 'Kræver mobilnr.'; smsAction.disabled = true; mark('Manglende mobil på login', '#a00'); break;
+      default:         smsAction.textContent = 'Aktivér';       mark('Ukendt', '#666');
     }
   }
-
-  // Refresh-knap
   smsRefresh.addEventListener('click', async () => { smsSetBusy(true, 'opdaterer…'); await sms.refresh(smsRender); });
-
-  // Toggle: brug sidst kendte status som sandhed, og vend først når server bekræfter
-  smsToggle.addEventListener('change', async () => {
-    const last = sms._last && sms._last.state;
-    const lastActive = last === 'active';
-    // Rul UI tilbage til faktisk kendt status, mens vi arbejder
-    smsToggle.checked = lastActive;
-    smsSetBusy(true, lastActive ? 'deaktiverer…' : 'aktiverer…');
-    await sms.setEnabled(!lastActive, smsSetBusy, smsRender);
+  smsAction.addEventListener('click', async () => {
+    const wantOn = (sms._last?.state !== 'active');
+    smsSetBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
+    await sms.setEnabled(wantOn, smsSetBusy, smsRender);
   });
-
-  // Første status
   (async () => { smsSetBusy(true, 'indlæser…'); await sms.refresh(smsRender); })();
 
-  // Tandhjul (uændret fra 7.9.6)
+  // ── Tandhjul
   if (!document.getElementById('tpGear')) {
     const gear = document.createElement('div');
     gear.id = 'tpGear'; gear.title = 'Indstillinger'; gear.innerHTML = '⚙️';
     Object.assign(gear.style, {
-      position:'fixed', right:'12px', top: (d.getBoundingClientRect().top + d.offsetHeight + 10) + 'px',
+      position:'fixed',
       width:'22px', height:'22px', lineHeight:'22px', textAlign:'center',
       background:'#fff', border:'1px solid #ccc', borderRadius:'50%',
-      boxShadow:'0 1px 5px rgba(0,0,0,.2)', cursor:'pointer', zIndex:2147483647, userSelect:'none'
+      boxShadow:'0 1px 5px rgba(0,0,0,.2)', cursor:'pointer',
+      zIndex:2147483647, userSelect:'none'
     });
     document.body.appendChild(gear);
+
+    // Placér gear lige under panelet (øverst-højre)
+    const panelRect = d.getBoundingClientRect();
+    gear.style.left = (panelRect.right - gear.offsetWidth) + 'px';
+    gear.style.top  = (panelRect.bottom + 10) + 'px';
+    gear.style.right = 'auto';
+    gear.style.bottom = 'auto';
     ensureFullyVisible(gear);
     makeDraggable(gear, 'tpGearPos');
 
@@ -690,10 +769,11 @@ function injectUI() {
       Object.assign(menu.style, {
         position:'fixed', zIndex:2147483647, background:'#fff', border:'1px solid #ccc',
         borderRadius:'8px', boxShadow:'0 2px 12px rgba(0,0,0,.25)', fontSize:'12px',
-        fontFamily:'sans-serif', padding:'10px', width:'400px', maxHeight:'70vh', overflow:'auto'
+        fontFamily:'sans-serif', padding:'10px', width:'400px', maxHeight:'70vh', overflow:'auto', display:'none'
       });
       menu.innerHTML =
         '<div style="font-weight:700;margin-bottom:6px">Indstillinger</div>' +
+
         '<div style="margin-bottom:10px">' +
           '<div style="font-weight:600;margin-bottom:4px">Pushover USER-token</div>' +
           '<input id="tpUserKeyMenu" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
@@ -702,10 +782,12 @@ function injectUI() {
             '<a href="https://pushover.net/" target="_blank" rel="noopener" style="color:#06c;text-decoration:none">Guide til USER-token</a>' +
           '</div>' +
         '</div>' +
+
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
         '<div style="font-weight:700;margin-bottom:6px">Toast-indstillinger</div>' +
         '<label style="display:block;margin:4px 0"><input type="checkbox" id="tpForceDomToast"> Brug altid skærm-toast (ikke OS-meddelelser)</label>' +
         '<label style="display:block;margin:4px 0"><input type="checkbox" id="tpSmartToast"> Smart toast (DOM når synlig, OS når skjult)</label>' +
+
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
         '<div style="font-weight:700;margin-bottom:6px">Telefonbog</div>' +
         '<div style="margin-bottom:6px;font-size:12px;color:#444">CSV ligger i GitHub og bruges af opslag ved indgående kald.</div>' +
@@ -726,6 +808,7 @@ function injectUI() {
           '</div>' +
           '<div id="tpPBHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
         '</div>' +
+
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
         '<button id="tpCheckUpdate" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🔄 Søg efter opdatering</button>' +
         '<div style="margin-top:6px;font-size:11px;color:#666">Kører v.'+TP_VERSION+'</div>';
@@ -738,7 +821,7 @@ function injectUI() {
       save.addEventListener('click', () => { GM_setValue('tpUserKey', (inp.value||'').trim()); showToast('USER-token gemt.'); });
       inp.addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); GM_setValue('tpUserKey',(inp.value||'').trim()); showToast('USER-token gemt.'); }});
 
-      // Toast toggles
+      // Toast toggles (gensidigt udelukkende)
       const forceDom = menu.querySelector('#tpForceDomToast');
       const smart    = menu.querySelector('#tpSmartToast');
       forceDom.checked = localStorage.getItem('tpForceDOMToast') === 'true';
@@ -750,7 +833,7 @@ function injectUI() {
       forceDom.onchange = () => { localStorage.setItem('tpForceDOMToast', forceDom.checked ? 'true' : 'false'); syncToggles('force'); };
       smart.onchange    = () => { localStorage.setItem('tpSmartToast',    smart.checked    ? 'true' : 'false'); syncToggles('smart'); };
 
-      // Telefonbog (samme som før)
+      // Telefonbog widgets
       const pat   = menu.querySelector('#tpGitPAT');
       const file  = menu.querySelector('#tpCSVFile');
       const up    = menu.querySelector('#tpUploadCSV');
@@ -828,16 +911,63 @@ function injectUI() {
 
       return menu;
     }
+
+    function positionMenu(menu, gear) {
+      // midlertidigt synlig for at måle
+      const oldDisp = menu.style.display;
+      const oldVis  = menu.style.visibility;
+      menu.style.visibility = 'hidden';
+      menu.style.display = 'block';
+
+      const gr = gear.getBoundingClientRect();
+      const mw = menu.offsetWidth;
+      const mh = menu.offsetHeight;
+
+      // Primært under gear
+      let left = Math.round(gr.right - mw);
+      let top  = Math.round(gr.bottom + 8);
+
+      // Hvis ikke plads → placer over
+      if (top + mh > window.innerHeight - 8) {
+        top = Math.round(gr.top - mh - 8);
+      }
+
+      // Clamp
+      if (left < 8) left = 8;
+      if (left + mw > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - mw);
+      if (top < 8) top = 8;
+
+      Object.assign(menu.style, { position:'fixed', left:left+'px', top:top+'px', right:'auto', bottom:'auto' });
+
+      // gendan synlighed
+      menu.style.visibility = oldVis || 'visible';
+      menu.style.display    = oldDisp || 'block';
+    }
+
     function toggleMenu() {
       const mnu = buildMenu();
-      const r = gear.getBoundingClientRect();
-      mnu.style.right = (window.innerWidth - r.right) + 'px';
-      mnu.style.top   = (r.bottom + 6) + 'px';
-      mnu.style.display = (mnu.style.display === 'block' ? 'none' : 'block');
+      if (mnu.style.display === 'block') {
+        mnu.style.display = 'none';
+        return;
+      }
+      mnu.style.display = 'block';
+      positionMenu(mnu, gear);
     }
     gear.addEventListener('click', toggleMenu);
-    document.addEventListener('mousedown', e => { const m = menu; if (m && e.target !== m && !m.contains(e.target) && e.target !== gear) m.style.display = 'none'; });
-    window.addEventListener('resize', () => { ensureFullyVisible(gear); });
+
+    // Luk menu ved klik udenfor
+    document.addEventListener('mousedown', e => {
+      const m = menu; if (m && m.style.display === 'block' && e.target !== m && !m.contains(e.target) && e.target !== gear) m.style.display = 'none';
+    });
+
+    // Hold UI på skærmen ved resize
+    window.addEventListener('resize', () => {
+      ensureFullyVisible(d);
+      ensureFullyVisible(gear);
+      if (menu && menu.style.display === 'block') {
+        positionMenu(menu, gear);
+      }
+    });
   }
 }
 
@@ -886,6 +1016,7 @@ console.info('[TP] kører version', TP_VERSION);
   function show(el) { icon = el; var r = el.getBoundingClientRect(); var m = mkMenu(); m.style.left = r.left + 'px'; m.style.top = r.bottom + 4 + 'px'; m.style.display = 'block'; }
   function hide() { clearTimeout(hideT); hideT = setTimeout(function () { if (menu) menu.style.display = 'none'; icon = null; }, 120); }
   function findIcon(n) { while (n && n !== document) { if (n.getAttribute && n.getAttribute('title') === 'Registrer opkald til vikar') return n; n = n.parentNode; } return null; }
+
   document.addEventListener('mouseover', function (e) { var ic = findIcon(e.target); if (ic) show(ic); }, true);
   document.addEventListener('mousemove', function (e) {
     if (!menu || menu.style.display !== 'block') return;
@@ -893,6 +1024,7 @@ console.info('[TP] kører version', TP_VERSION);
     var overI = icon && (icon === e.target || icon.contains(e.target) || e.target.contains(icon));
     if (!overM && !overI) hide();
   }, true);
+
   new MutationObserver(function (ml) {
     if (!auto) return;
     ml.forEach(function (m) {
