@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.7
-// @description  Push (leader, suppression), toast (cross-tab + force DOM), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner og “Søg efter opdatering” i ⚙️.
+// @version      7.9
+// @description  Push (leader, suppression), toast (cross-tab + force DOM), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -15,11 +15,13 @@
 // @run-at       document-idle
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
+// @homepageURL  https://github.com/danieldamdk/temponizer-notifikation
+// @supportURL   https://github.com/danieldamdk/temponizer-notifikation/issues
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.7';
+const TP_VERSION = '7.9';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -40,6 +42,9 @@ const PB_BRANCH = 'main';
 const PB_CSV    = 'vikarer.csv';
 const RAW_PHONEBOOK = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_CSV}`;
 const CACHE_KEY_CSV = 'tpCSVCache';          // lokal fallback cache
+
+// Userscript RAW (én sand kilde til opdatering – matcher metadata-URLerne)
+const SCRIPT_RAW_URL = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/temponizer.user.js`;
 
 // Caller-pop
 const OPEN_NEW_TAB_ON_INBOUND = true;        // vikar åbnes i ny fane
@@ -487,7 +492,7 @@ function pickBestSheetCSV(wb) {
     const sheet = wb.Sheets[name];
     let csv = XLSX.utils.sheet_to_csv(sheet, { FS: ',', RS: '\n' });
     csv = normalizePhonebookHeader(csv);
-    const lines = csv.trim().split(/\r?\\n/).filter(Boolean);
+    const lines = csv.trim().split(/\r?\n/).filter(Boolean);
     const dataRows = Math.max(0, lines.length - 1);
     console.info('[TP][PB] Sheet:', name, 'rows:', dataRows);
     if (dataRows > best.rows) best = { rows: dataRows, csv };
@@ -505,7 +510,7 @@ async function tryExcelPOST(params) {
 async function fetchExcelAsCSVText() {
   const tries = [
     { fn: tryExcelGET,  params: 'id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag' },
-    { fn: tryExcelGET,  params: 'id=true&name=true&phone=true&cellphone=true' },
+    { fn: tryExcelGET,  params: 'id=true&name=true&phone=true&cellphonetrue' }, // fallback GET uden dato
     { fn: tryExcelPOST, params: 'id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag' },
     { fn: tryExcelPOST, params: 'id=true&name=true&phone=true&cellphone=true' },
   ];
@@ -539,6 +544,59 @@ async function fetchExcelAsCSVAndUpload() {
   showToastOnce('csvok', 'CSV uploadet (Excel→CSV).');
 }
 
+/*──────── 7) DRAGGABLE HELPERS ────────*/
+function makeDraggable(el, storageKey, handleSelector) {
+  const handle = handleSelector ? el.querySelector(handleSelector) : el;
+  if (!handle) return;
+  handle.style.cursor = 'move';
+  let moving = false, startX = 0, startY = 0, baseLeft = 0, baseTop = 0;
+
+  // restore pos
+  try {
+    const pos = JSON.parse(localStorage.getItem(storageKey) || 'null');
+    if (pos) {
+      el.style.left = pos.left + 'px';
+      el.style.top = pos.top + 'px';
+      el.style.right = 'auto';
+      el.style.bottom = 'auto';
+    }
+  } catch(_) {}
+
+  const down = e => {
+    const p = e.touches ? e.touches[0] : e;
+    moving = true;
+    const r = el.getBoundingClientRect();
+    startX = p.clientX; startY = p.clientY;
+    baseLeft = r.left; baseTop = r.top;
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+    document.addEventListener('touchmove', move, {passive:false});
+    document.addEventListener('touchend', up);
+    e.preventDefault();
+  };
+  const move = e => {
+    if (!moving) return;
+    const p = e.touches ? e.touches[0] : e;
+    const nx = Math.min(window.innerWidth - el.offsetWidth - 4, Math.max(4, baseLeft + (p.clientX - startX)));
+    const ny = Math.min(window.innerHeight - el.offsetHeight - 4, Math.max(4, baseTop  + (p.clientY - startY)));
+    el.style.left = nx + 'px';
+    el.style.top  = ny + 'px';
+    el.style.right = 'auto'; el.style.bottom = 'auto';
+    localStorage.setItem(storageKey, JSON.stringify({left:nx, top:ny}));
+    e.preventDefault();
+  };
+  const up = () => {
+    moving = false;
+    document.removeEventListener('mousemove', move);
+    document.removeEventListener('mouseup', up);
+    document.removeEventListener('touchmove', move);
+    document.removeEventListener('touchend', up);
+  };
+
+  handle.addEventListener('mousedown', down);
+  handle.addEventListener('touchstart', down, {passive:false});
+}
+
 /*──────── 7) UI (panel + gear) ────────*/
 function injectUI() {
   if (document.getElementById('tpPanel')) return; // undgå duplet
@@ -547,12 +605,13 @@ function injectUI() {
   d.id = 'tpPanel';
   d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:2147483645;background:#f9f9f9;border:1px solid #ccc;padding:8px 10px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2);min-width:220px';
   d.innerHTML =
-    '<b>TP Notifikationer</b>' +
+    '<div id="tpPanelHeader" style="font-weight:700;cursor:move">TP Notifikationer</div>' +
     '<div style="margin-top:6px">' +
       '<label style="display:block;margin:2px 0"><input type="checkbox" id="m"> Besked (Pushover)</label>' +
       '<label style="display:block;margin:2px 0"><input type="checkbox" id="i"> Interesse (Pushover)</label>' +
     '</div>';
   document.body.appendChild(d);
+  makeDraggable(d, 'tpPanelPos', '#tpPanelHeader');
 
   const m = d.querySelector('#m'), i = d.querySelector('#i');
   m.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
@@ -573,6 +632,7 @@ function injectUI() {
     });
     document.body.appendChild(gear);
     ensureFullyVisible(gear);
+    makeDraggable(gear, 'tpGearPos');
 
     // Gear-menu
     let menu = null;
@@ -582,7 +642,7 @@ function injectUI() {
       Object.assign(menu.style, {
         position:'fixed', zIndex:2147483647, background:'#fff', border:'1px solid #ccc',
         borderRadius:'8px', boxShadow:'0 2px 12px rgba(0,0,0,.25)', fontSize:'12px',
-        fontFamily:'sans-serif', padding:'10px', width:'360px', maxHeight:'70vh', overflow:'auto'
+        fontFamily:'sans-serif', padding:'10px', width:'380px', maxHeight:'70vh', overflow:'auto'
       });
       menu.innerHTML =
         '<div style="font-weight:700;margin-bottom:6px">Indstillinger</div>' +
@@ -611,6 +671,10 @@ function injectUI() {
             '<input id="tpCSVFile" type="file" accept=".csv" style="flex:1"/>' +
             '<button id="tpUploadCSV" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Upload CSV → GitHub</button>' +
           '</div>' +
+
+          // Drag & drop zone
+          '<div id="tpCSVDrop" style="margin-top:8px;padding:10px;border:2px dashed #ccc;border-radius:6px;text-align:center;color:#666">Eller træk & slip CSV her</div>' +
+
           '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
             '<button id="tpFetchCSVUpload" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">⚡ Hent Excel → CSV + Upload</button>' +
           '</div>' +
@@ -652,16 +716,14 @@ function injectUI() {
       const tIn   = menu.querySelector('#tpTestPhone');
       const tBtn  = menu.querySelector('#tpLookupPhone');
       const pbh   = menu.querySelector('#tpPBHint');
+      const drop  = menu.querySelector('#tpCSVDrop');
 
       pat.value = (GM_getValue('tpGitPAT') || '');
       pat.addEventListener('change', () => GM_setValue('tpGitPAT', pat.value || ''));
 
-      // Manuel CSV upload
-      up.addEventListener('click', async () => {
+      async function uploadCSVText(text) {
         try {
           const token = (pat.value||'').trim(); if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
-          if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
-          const text = await file.files[0].text();
           const base64 = b64encodeUtf8(text);
           pbh.textContent = 'Uploader CSV…';
           const { sha } = await ghGetSha(PB_OWNER, PB_REPO, PB_CSV, PB_BRANCH);
@@ -670,6 +732,29 @@ function injectUI() {
           pbh.textContent = 'CSV uploadet. RAW opdateres om få sek.';
           showToast('CSV uploadet.');
         } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
+      }
+
+      // Manuel CSV upload (file input)
+      up.addEventListener('click', async () => {
+        try {
+          if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
+          const text = await file.files[0].text();
+          await uploadCSVText(text);
+        } catch (e) { console.warn('[TP][PB][CSV-UPLOAD-BTN]', e); }
+      });
+
+      // Drag & Drop CSV
+      function setDropActive(on) { drop.style.borderColor = on ? '#2e7' : '#ccc'; drop.style.color = on ? '#2e7' : '#666'; }
+      drop.addEventListener('dragover', e => { e.preventDefault(); setDropActive(true); });
+      drop.addEventListener('dragenter', e => { e.preventDefault(); setDropActive(true); });
+      drop.addEventListener('dragleave', e => { e.preventDefault(); setDropActive(false); });
+      drop.addEventListener('drop', async e => {
+        e.preventDefault(); setDropActive(false);
+        const dt = e.dataTransfer; if (!dt || !dt.files || !dt.files[0]) return;
+        const f = dt.files[0];
+        if (!/\.csv$/i.test(f.name)) { showToast('Træk en .csv-fil ind.'); return; }
+        const text = await f.text();
+        await uploadCSVText(text);
       });
 
       // Auto: Excel → CSV → Upload
@@ -708,18 +793,18 @@ function injectUI() {
         }
       });
 
-      // Check for update
+      // Check for update (manuelt, supplerer Tampermonkeys auto-opdatering)
       const chk = menu.querySelector('#tpCheckUpdate');
       chk.addEventListener('click', async () => {
         try {
-          const raw = await gmGET('https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js?t=' + Date.now());
+          const raw = await gmGET(SCRIPT_RAW_URL + '?t=' + Date.now());
           const m = raw.match(/@version\s+([0-9.]+)/);
           if (!m) { showToast('Kunne ikke læse remote version.'); return; }
           const remote = m[1];
           if (remote === TP_VERSION) showToast('Du kører allerede nyeste version ('+remote+').');
           else {
             showToast('Ny version tilgængelig: '+remote+' (du kører '+TP_VERSION+'). Åbner opdatering…');
-            window.open('https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js', '_blank');
+            window.open(SCRIPT_RAW_URL, '_blank');
           }
         } catch(_) { showToast('Update-tjek fejlede.'); }
       });
