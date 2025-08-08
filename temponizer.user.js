@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.4
-// @description  Push (leader, suppression), toast (Smart: DOM når synlig, OS når skjult • max 1 OS), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS-notifikation styring (status + aktiver/deaktiver).
+// @version      7.9.5
+// @description  Push (leader, suppression), toast (Smart: DOM når synlig, OS når skjult • max 1 OS), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS-notifikation (status + toggle) direkte i hovedpanelet.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -21,7 +21,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.4';
+const TP_VERSION = '7.9.5';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -72,10 +72,8 @@ function showToast(msg) {
   const forceDom = localStorage.getItem('tpForceDOMToast') === 'true';
   const smart    = localStorage.getItem('tpSmartToast') === 'true';
 
-  if (forceDom) { showDOMToast(msg); return; }               // altid DOM
-  if (smart && document.visibilityState === 'visible') {     // smart → DOM når synlig
-    showDOMToast(msg); return;
-  }
+  if (forceDom) { showDOMToast(msg); return; }
+  if (smart && document.visibilityState === 'visible') { showDOMToast(msg); return; }
   if (Notification.permission === 'granted') {
     try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
   } else if (Notification.permission !== 'denied') {
@@ -105,7 +103,7 @@ function broadcastToast(type, msg) {
     localStorage.setItem(TOAST_EVT_KEY, JSON.stringify(ev));
   } catch (_) {}
 }
-// Kun non-leader faner reagerer – og KUN med DOM-toast (så OS kun én gang fra leader)
+// Non-leaders viser kun DOM-toast (så OS kun én gang fra leader)
 window.addEventListener('storage', e => {
   if (e.key !== TOAST_EVT_KEY || !e.newValue) return;
   try {
@@ -567,7 +565,7 @@ function parseSmsStatusFromDoc(doc) {
   else if (isVisible(elNoMob))   state = 'no_mobile';
 
   const txt = (elAktiv && isVisible(elAktiv) ? elAktiv.textContent : elInaktiv ? elInaktiv.textContent : '') || '';
-  const digits = txt.replace(/\s| /g,'').match(/\+?\d{6,}/g); // fjern almindelige + NBSP
+  const digits = txt.replace(/\u00A0/g,' ').replace(/\s+/g,'').match(/\+?\d{6,}/g);
   if (digits && digits[0]) phone = digits[0];
 
   return { state, phone };
@@ -583,7 +581,7 @@ function createHiddenIframe(id, url) {
   ifr.src = url;
   return ifr;
 }
-// Autopilot på settings-siden (bruges når X-Frame blokerer)
+// Autopilot på settings-siden (klik & luk)
 (function smsAutopilot(){
   try {
     const u = new URL(location.href);
@@ -599,18 +597,13 @@ function createHiddenIframe(id, url) {
         ? doc.querySelector('#sms_notifikation_ikke_aktiv a')
         : doc.querySelector('#sms_notifikation_aktiv a');
       if (link) link.click();
-      // vent på DOM-opdatering, luk derefter
       const targetSel = action === 'activate' ? '#sms_notifikation_aktiv' : '#sms_notifikation_ikke_aktiv';
       const t0 = Date.now();
       const iv = setInterval(() => {
         const ok = isVisible(doc.querySelector(targetSel));
-        if (ok || Date.now() - t0 > 8000) {
-          clearInterval(iv);
-          try { window.close(); } catch(_) {}
-        }
+        if (ok || Date.now() - t0 > 8000) { clearInterval(iv); try { window.close(); } catch(_) {} }
       }, 400);
     };
-    // lidt delay så siden kan initialisere scripts
     setTimeout(doClick, 300);
   } catch(_) {}
 })();
@@ -628,14 +621,12 @@ const sms = {
           this._last = st;
           statusCb && statusCb(st);
         } catch (e) { errorCb && errorCb(e); }
-        finally {
-          ifr.removeEventListener('load', onLoad);
-        }
+        finally { ifr.removeEventListener('load', onLoad); }
       };
       ifr.addEventListener('load', onLoad);
     } catch (e) { errorCb && errorCb(e); }
   },
-  refreshViaXHR(statusCb, errorCb) { // fallback: kun status
+  refreshViaXHR(statusCb, errorCb) {
     gmGET(SMS_SETTINGS_URL + '&t=' + Date.now())
       .then(html => {
         const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -647,7 +638,6 @@ const sms = {
   },
   activate(uiBusy, statusCb) {
     const done = () => this.refresh(statusCb);
-    // 1) prøv via iframe: klik linket inde i iframen
     const ifr = document.getElementById(this._iframeId);
     try {
       if (ifr && ifr.contentDocument) {
@@ -656,7 +646,6 @@ const sms = {
         if (a) { a.click(); setTimeout(done, 1200); return; }
       }
     } catch(_) {}
-    // 2) fallback: åbne autopilot-vindue
     uiBusy && uiBusy(true);
     const w = window.open(SMS_SETTINGS_URL + '#tp_sms_auto=activate', 'tpSmsActivate', 'width=520,height=420');
     const timer = setInterval(() => {
@@ -680,7 +669,6 @@ const sms = {
     }, 500);
   },
   refresh(statusCb) {
-    // prøv iframe først — hvis der ikke kommer load inden 2s, brug XHR
     let did = false;
     const fallbackT = setTimeout(() => {
       if (did) return;
@@ -692,7 +680,7 @@ const sms = {
       did = true;
       clearTimeout(fallbackT);
       statusCb && statusCb(st);
-    }, () => {/*ignored; fallback timer kører*/});
+    }, () => {/* fallback via timer */});
   }
 };
 
@@ -756,12 +744,19 @@ function injectUI() {
 
   const d = document.createElement('div');
   d.id = 'tpPanel';
-  d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:2147483645;background:#f9f9f9;border:1px solid #ccc;padding:8px 10px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2);min-width:220px';
+  d.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:2147483645;background:#f9f9f9;border:1px solid #ccc;padding:8px 10px;border-radius:6px;font-size:12px;font-family:sans-serif;box-shadow:1px 1px 5px rgba(0,0,0,.2);min-width:250px';
   d.innerHTML =
     '<div id="tpPanelHeader" style="font-weight:700;cursor:move">TP Notifikationer</div>' +
-    '<div style="margin-top:6px">' +
-      '<label style="display:block;margin:2px 0"><input type="checkbox" id="m"> Besked (Pushover)</label>' +
-      '<label style="display:block;margin:2px 0"><input type="checkbox" id="i"> Interesse (Pushover)</label>' +
+    '<div style="margin-top:6px;display:flex;flex-direction:column;gap:4px">' +
+      '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="m"> <span>Besked (Pushover)</span></label>' +
+      '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="i"> <span>Interesse (Pushover)</span></label>' +
+      '<div id="smsRow" style="display:flex;align-items:center;gap:6px;">' +
+        '<label style="display:flex;align-items:center;gap:6px;flex:1;margin:0">' +
+          '<input type="checkbox" id="smsToggle" disabled> <span>SMS (Temponizer)</span>' +
+          '<span id="smsTag" style="font-size:11px;color:#666;">indlæser…</span>' +
+        '</label>' +
+        '<button id="smsRefresh" title="Opdatér status" style="padding:2px 6px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer">↻</button>' +
+      '</div>' +
     '</div>';
   document.body.appendChild(d);
   makeDraggable(d, 'tpPanelPos', '#tpPanelHeader');
@@ -772,7 +767,66 @@ function injectUI() {
   m.onchange = () => localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false');
   i.onchange = () => localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false');
 
-  // Tandhjul
+  // SMS UI (status + toggle)
+  const smsToggle  = d.querySelector('#smsToggle');
+  const smsTag     = d.querySelector('#smsTag');
+  const smsRefresh = d.querySelector('#smsRefresh');
+
+  function smsSetBusy(on, text) {
+    smsToggle.disabled = true;
+    smsRefresh.disabled = true;
+    smsTag.textContent = on ? (text || 'arbejder…') : smsTag.textContent;
+  }
+  function smsRender(st, viaXHR) {
+    const time = new Date().toLocaleTimeString();
+    const mark = (txt, color) => { smsTag.innerHTML = `<span style="color:${color};font-weight:600">${txt}</span> <span style="color:#888;font-size:11px">• ${viaXHR ? 'XHR' : 'iframe'} • ${time}</span>`; };
+    switch (st.state) {
+      case 'active':
+        smsToggle.checked = true;
+        smsToggle.disabled = false;
+        smsRefresh.disabled = false;
+        mark('Aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#090');
+        break;
+      case 'inactive':
+        smsToggle.checked = false;
+        smsToggle.disabled = false;
+        smsRefresh.disabled = false;
+        mark('Ikke aktiv' + (st.phone ? ' ('+st.phone+')' : ''), '#a00');
+        break;
+      case 'sys_off':
+        smsToggle.checked = false;
+        smsToggle.disabled = true;
+        smsRefresh.disabled = false;
+        mark('System slået fra', '#a00');
+        break;
+      case 'no_mobile':
+        smsToggle.checked = false;
+        smsToggle.disabled = true;
+        smsRefresh.disabled = false;
+        mark('Manglende mobil på login', '#a00');
+        break;
+      default:
+        smsToggle.checked = false;
+        smsToggle.disabled = false;
+        smsRefresh.disabled = false;
+        mark('Ukendt', '#666');
+    }
+  }
+  smsRefresh.addEventListener('click', () => { smsSetBusy(true, 'opdaterer…'); sms.refresh(smsRender); });
+  smsToggle.addEventListener('change', () => {
+    const wantOn = smsToggle.checked;
+    smsSetBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
+    if (wantOn) {
+      sms.activate(smsSetBusy, (st, viaXHR) => { smsRender(st, viaXHR); showToast('SMS notifikation aktiveret (hvis muligt).'); });
+    } else {
+      sms.deactivate(smsSetBusy, (st, viaXHR) => { smsRender(st, viaXHR); showToast('SMS notifikation deaktiveret.'); });
+    }
+  });
+  // Første load
+  smsSetBusy(true, 'indlæser…');
+  sms.refresh(smsRender);
+
+  // Tandhjul (indstillinger — uden SMS nu)
   if (!document.getElementById('tpGear')) {
     const gear = document.createElement('div');
     gear.id = 'tpGear'; gear.title = 'Indstillinger'; gear.innerHTML = '⚙️';
@@ -808,10 +862,6 @@ function injectUI() {
           '</div>' +
         '</div>' +
 
-        '<div style="border-top:1px solid #eee;margin:8px 0"></div>' +
-        '<button id="tpTestPushoverBtn" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🧪 Test Pushover (Besked + Interesse)</button>' +
-        '<div id="tpLeaderHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
-
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
         '<div style="font-weight:700;margin-bottom:6px">Toast-indstillinger</div>' +
         '<label style="display:block;margin:4px 0"><input type="checkbox" id="tpForceDomToast"> Brug altid skærm-toast (ikke OS-meddelelser)</label>' +
@@ -839,16 +889,6 @@ function injectUI() {
         '</div>' +
 
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
-        '<div style="font-weight:700;margin-bottom:6px">SMS notifikation</div>' +
-        '<div id="tpSmsStatus" style="margin-bottom:6px;font-size:12px;color:#444">Status: <i>ukendt</i></div>' +
-        '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px">' +
-          '<button id="tpSmsRefresh" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Opdatér status</button>' +
-          '<button id="tpSmsActivate" style="padding:6px 8px;border:1px solid #0a0;border-radius:6px;background:#fff;cursor:pointer">Aktivér</button>' +
-          '<button id="tpSmsDeactivate" style="padding:6px 8px;border:1px solid #a00;border-radius:6px;background:#fff;cursor:pointer">Deaktivér</button>' +
-        '</div>' +
-        '<div id="tpSmsHint" style="font-size:11px;color:#666"></div>' +
-
-        '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
         '<button id="tpCheckUpdate" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🔄 Søg efter opdatering</button>' +
         '<div style="margin-top:6px;font-size:11px;color:#666">Kører v.'+TP_VERSION+'</div>'
       ;
@@ -857,15 +897,10 @@ function injectUI() {
       // Pushover
       const inp  = menu.querySelector('#tpUserKeyMenu');
       const save = menu.querySelector('#tpSaveUserKeyMenu');
-      const test = menu.querySelector('#tpTestPushoverBtn');
-      const hint = menu.querySelector('#tpLeaderHint');
+      const hint = menu.querySelector('#tpLeaderHint'); // ikke vist længere, men behold mulighed
       inp.value = getUserKey();
-      function refreshLeaderHint(){ hint.textContent = (isLeader() ? 'Denne fane er LEADER for push.' : 'Ikke leader – en anden fane sender push.'); }
-      refreshLeaderHint();
       save.addEventListener('click', () => { GM_setValue('tpUserKey', (inp.value||'').trim()); showToast('USER-token gemt.'); });
       inp.addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); GM_setValue('tpUserKey',(inp.value||'').trim()); showToast('USER-token gemt.'); }});
-      test.addEventListener('click', () => { tpTestPushoverBoth(); menu.style.display='none'; });
-      window.addEventListener('storage', e => { if (e.key===LEADER_KEY) refreshLeaderHint(); });
 
       // Toast toggles
       const forceDom = menu.querySelector('#tpForceDomToast');
@@ -879,7 +914,7 @@ function injectUI() {
       forceDom.onchange = () => { localStorage.setItem('tpForceDOMToast', forceDom.checked ? 'true' : 'false'); syncToggles('force'); };
       smart.onchange    = () => { localStorage.setItem('tpSmartToast',    smart.checked    ? 'true' : 'false'); syncToggles('smart'); };
 
-      // Telefonbog
+      // Telefonbog (PAT + CSV upload/drag/drop + test)
       const pat   = menu.querySelector('#tpGitPAT');
       const file  = menu.querySelector('#tpCSVFile');
       const up    = menu.querySelector('#tpUploadCSV');
@@ -904,7 +939,6 @@ function injectUI() {
           showToast('CSV uploadet.');
         } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
       }
-
       up.addEventListener('click', async () => {
         try {
           if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
@@ -912,7 +946,6 @@ function injectUI() {
           await uploadCSVText(text);
         } catch (e) { console.warn('[TP][PB][CSV-UPLOAD-BTN]', e); }
       });
-
       function setDropActive(on) { drop.style.borderColor = on ? '#2e7' : '#ccc'; drop.style.color = on ? '#2e7' : '#666'; }
       drop.addEventListener('dragover', e => { e.preventDefault(); setDropActive(true); });
       drop.addEventListener('dragenter', e => { e.preventDefault(); setDropActive(true); });
@@ -960,52 +993,6 @@ function injectUI() {
         }
       });
 
-      // SMS UI
-      const smsStatusEl = menu.querySelector('#tpSmsStatus');
-      const smsHintEl   = menu.querySelector('#tpSmsHint');
-      const smsBtnR     = menu.querySelector('#tpSmsRefresh');
-      const smsBtnA     = menu.querySelector('#tpSmsActivate');
-      const smsBtnD     = menu.querySelector('#tpSmsDeactivate');
-
-      function renderSms(st, viaXHR) {
-        const time = new Date().toLocaleTimeString();
-        let txt = 'Status: ';
-        let color = '#444';
-        let canA = false, canD = false, hint = '';
-        switch (st.state) {
-          case 'active':
-            txt += `<b style="color:#090">Aktiv</b>${st.phone ? ' ('+st.phone+')' : ''}`;
-            canA = false; canD = true; color = '#090'; break;
-          case 'inactive':
-            txt += `<b style="color:#a00">Ikke aktiv</b>${st.phone ? ' ('+st.phone+')' : ''}`;
-            canA = true;  canD = false; color = '#a00'; break;
-          case 'sys_off':
-            txt += `<b style="color:#a00">Kan ikke aktiveres (system slået fra)</b>`;
-            hint = 'Kontakt systemadmin i Temponizer for at slå SMS-udsendelse til.'; canA = false; canD = false; break;
-          case 'no_mobile':
-            txt += `<b style="color:#a00">Kan ikke aktiveres (mangler mobilnr.)</b>`;
-            hint = 'Tilføj mobilnummer på dit login i Temponizer og prøv igen.'; canA = false; canD = false; break;
-          default:
-            txt += '<i>ukendt</i>';
-        }
-        smsStatusEl.innerHTML = txt + ` <span style="color:#888;font-size:11px">• ${viaXHR ? 'XHR' : 'iframe'} • ${time}</span>`;
-        smsHintEl.textContent = hint;
-        smsBtnA.disabled = !canA; smsBtnD.disabled = !canD;
-      }
-      function setBusy(on) {
-        smsHintEl.textContent = on ? 'Udfører…' : '';
-        smsBtnA.disabled = on || smsBtnA.disabled;
-        smsBtnD.disabled = on || smsBtnD.disabled;
-        smsBtnR.disabled = on;
-      }
-
-      smsBtnR.addEventListener('click', () => { setBusy(true); sms.refresh((st, viaXHR) => { setBusy(false); renderSms(st, viaXHR); }); });
-      smsBtnA.addEventListener('click', () => { setBusy(true); sms.activate(setBusy, (st, viaXHR)=>{ setBusy(false); renderSms(st, viaXHR); showToast('SMS notifikation aktiveret (hvis muligt).'); }); });
-      smsBtnD.addEventListener('click', () => { setBusy(true); sms.deactivate(setBusy, (st, viaXHR)=>{ setBusy(false); renderSms(st, viaXHR); showToast('SMS notifikation deaktiveret.'); }); });
-
-      // første statusload
-      sms.refresh(renderSms);
-
       // Manuelt update-tjek
       const chk = menu.querySelector('#tpCheckUpdate');
       chk.addEventListener('click', async () => {
@@ -1015,10 +1002,7 @@ function injectUI() {
           if (!m) { showToast('Kunne ikke læse remote version.'); return; }
           const remote = m[1];
           if (remote === TP_VERSION) showToast('Du kører allerede nyeste version ('+remote+').');
-          else {
-            showToast('Ny version tilgængelig: '+remote+' (du kører '+TP_VERSION+'). Åbner opdatering…');
-            window.open(SCRIPT_RAW_URL, '_blank');
-          }
+          else { showToast('Ny version tilgængelig: '+remote+' (du kører '+TP_VERSION+'). Åbner opdatering…'); window.open(SCRIPT_RAW_URL, '_blank'); }
         } catch(_) { showToast('Update-tjek fejlede.'); }
       });
 
