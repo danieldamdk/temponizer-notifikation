@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
+// @name         Temponizer → Pushover + Toast + Quick "Intet Svar" + CallerPop (AjourCare)
 // @namespace    ajourcare.dk
-// @version      6.67
-// @description  Som 6.63 (RAW CSV lookup). Automatiseret download→konverter→upload med session-warmup (vikarlist_get), GET/POST-fallback og valg af bedste XLSX-ark. Uploader kun ved reelle rækker; ellers bevares eksisterende CSV. Push + interesse (leader), hover “Intet Svar”.
+// @version      6.68
+// @description  Push ved nye beskeder og interesse (leader-election), hover “Intet Svar” auto-gem, Telefonbog: Excel→CSV→GitHub + testopslag, Caller-pop KUN ved indgående opkald (tp_dir=in eller *1500-suffix).
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /*──────── 1) KONFIG ────────*/
-const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
+const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';   // ADMIN-fastlåst
 const POLL_MS     = 30000;
 const SUPPRESS_MS = 45000;
 const LOCK_MS     = SUPPRESS_MS + 5000;
@@ -37,6 +37,10 @@ const PB_BRANCH = 'main';
 const PB_CSV    = 'vikarer.csv';
 const PB_XLSX   = 'vikarer.xlsx';
 const RAW_PHONEBOOK = `https://raw.githubusercontent.com/${PB_OWNER}/${PB_REPO}/${PB_BRANCH}/${PB_CSV}`;
+
+// Caller-indgående markering
+const IN_SUFFIX = '*1500';
+const IN_SUFFIX_RE = /\*1500$/;
 
 /*──────── 1a) MIGRATION ────────*/
 (function migrateUserKeyToGM(){
@@ -102,6 +106,7 @@ const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
 const ST_MSG_KEY = 'tpPushState';
 const ST_INT_KEY = 'tpInterestState';
+
 function loadJson(key, fallback) { try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch (_) { return JSON.parse(JSON.stringify(fallback)); } }
 function saveJsonIfLeader(key, obj) { if (isLeader()) localStorage.setItem(key, JSON.stringify(obj)); }
 function takeLock() {
@@ -179,28 +184,15 @@ function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLead
 window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*noop*/} });
 
 /*──────── 6a) HTTP helpers ────────*/
-function commonAjaxHeaders() {
-  const h = {
-    'X-Requested-With': 'XMLHttpRequest',
-    'Referer': location.href
-  };
-  const token = getCsrfToken();
-  if (token) h['x-csrf-token'] = token;
-  return h;
-}
-function getCsrfToken() {
-  const m = document.querySelector('meta[name="csrf-token"]');
-  if (m && m.content) return m.content.trim();
-  const i = document.querySelector('input[name="csrf-token"], input[name="csrf_token"], input[name="token"]');
-  if (i && i.value) return i.value.trim();
-  return '';
-}
 function gmGET(url) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
       method: 'GET',
       url,
-      headers: { ...commonAjaxHeaders() },
+      headers: {
+        'Accept': 'text/plain, */*;q=0.8',
+        'Referer': location.href
+      },
       onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
       onerror: e => reject(e)
     });
@@ -212,20 +204,11 @@ function gmGETArrayBuffer(url) {
       method: 'GET',
       url,
       responseType: 'arraybuffer',
-      headers: { ...commonAjaxHeaders(), 'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel;q=0.9,*/*;q=0.8' },
+      headers: {
+        'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel;q=0.9, */*;q=0.8',
+        'Referer': location.href
+      },
       onload: r => (r.status>=200 && r.status<300) ? resolve(r.response) : reject(new Error('HTTP '+r.status)),
-      onerror: e => reject(e)
-    });
-  });
-}
-function gmPOST(url, body) {
-  return new Promise((resolve, reject) => {
-    GM_xmlhttpRequest({
-      method: 'POST',
-      url,
-      headers: { ...commonAjaxHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-      data: body,
-      onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
       onerror: e => reject(e)
     });
   });
@@ -236,7 +219,11 @@ function gmPOSTArrayBuffer(url, body) {
       method: 'POST',
       url,
       responseType: 'arraybuffer',
-      headers: { ...commonAjaxHeaders(), 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel;q=0.9,*/*;q=0.8' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel;q=0.9, */*;q=0.8',
+        'Referer': location.href
+      },
       data: body,
       onload: r => (r.status>=200 && r.status<300) ? resolve(r.response) : reject(new Error('HTTP '+r.status)),
       onerror: e => reject(e)
@@ -244,18 +231,23 @@ function gmPOSTArrayBuffer(url, body) {
   });
 }
 
-/*──────── 6b) CALLER-POP (RAW CSV) ────────*/
+/*──────── 6b) CALLER-POP (kun indgående) ────────*/
 function normPhone(raw) {
   const digits = String(raw||'').replace(/\D/g,'').replace(/^0+/, '').replace(/^45/, '');
   return digits.length >= 8 ? digits.slice(-8) : '';
 }
-
-// Robust CSV parser (delimiter , eller ;, simple quotes)
+function silentAbortTab(){
+  try{window.stop();}catch{}
+  try{window.close();}catch{}
+  try{open('','_self').close();}catch{}
+  try{location.replace('about:blank');}catch{}
+}
+// Robust CSV parser
 function parseCSV(text) {
   if (!text) return [];
   text = text.replace(/^\uFEFF/, '');
   const firstLine = (text.split(/\r?\n/)[0] || '');
-  const delim = (firstLine.indexOf(';') > -1 && (firstLine.indexOf(',') === -1 || firstLine.indexOf(';') < firstLine.indexOf(','))) ? ';' : ',';
+  const delim = (firstLine.indexOf(';') > firstLine.indexOf(',')) ? ';' : (firstLine.includes(';') ? ';' : ',');
   const rows = [];
   let i = 0, field = '', row = [], inQuotes = false;
   while (i < text.length) {
@@ -276,20 +268,14 @@ function parseCSV(text) {
   if (field.length || row.length) { row.push(field.trim()); rows.push(row); }
   return rows.filter(r => r.length && r.some(x => x !== ''));
 }
-
-// Læs CSV → Map(phone8 → { id, name })
 function parsePhonebookCSV(text) {
   const map = new Map();
   const rows = parseCSV(text);
   if (!rows.length) return map;
-
   const header = rows[0].map(h => h.toLowerCase());
   const idxId   = header.findIndex(h => /(vikar.*nr|vikar[_ ]?id|^id$)/.test(h));
   const idxName = header.findIndex(h => /(navn|name)/.test(h));
-  const phoneCols = header
-    .map((h, idx) => ({ h, idx }))
-    .filter(x => /(telefon|mobil|cellphone|mobile|phone)/.test(x.h));
-
+  const phoneCols = header.map((h, idx) => ({ h, idx })).filter(x => /(telefon|mobil|cellphone|mobile|phone)/.test(x.h));
   if (idxId < 0 || phoneCols.length === 0) return map;
 
   for (let r = 1; r < rows.length; r++) {
@@ -297,7 +283,6 @@ function parsePhonebookCSV(text) {
     const id   = (row[idxId]   || '').trim();
     const name = idxName >= 0 ? (row[idxName] || '').trim() : '';
     if (!id) continue;
-
     for (const pc of phoneCols) {
       const val = (row[pc.idx] || '').trim();
       const p8 = normPhone(val);
@@ -307,21 +292,35 @@ function parsePhonebookCSV(text) {
   return map;
 }
 
-async function callerPopIfNeeded() {
+// Returnerer true hvis vi har håndteret (så resten af scriptet kan stoppe)
+async function callerPopIfNeededStrict(){
+  const q   = new URLSearchParams(location.search);
+  const raw = q.get('tp_caller'); 
+  if (!raw) return false;  // ingen caller → resten af scriptet kører normalt
+
+  // Kræv tydelig "indgående" markør
+  const dir = (q.get('tp_dir') || '').toLowerCase();
+  const isInbound = (dir === 'in' || dir === 'inbound' || IN_SUFFIX_RE.test(raw));
+  if (!isInbound) { silentAbortTab(); return true; }
+
+  // Normalisér nummer (fjern evt. suffix)
+  const cleaned = String(raw).replace(IN_SUFFIX_RE, '');
+  const phone8  = normPhone(cleaned);
+  if (!phone8) { silentAbortTab(); return true; }
+
   try {
-    const q = new URLSearchParams(location.search);
-    const raw = q.get('tp_caller'); if (!raw) return;
-    const cleaned = String(raw).replace(/\*1500$/, '');
-    const phone8 = normPhone(cleaned);
-    if (!phone8) { showToast('Ukendt nummer: ' + raw); return; }
     const csv = await gmGET(RAW_PHONEBOOK);
     const map = parsePhonebookCSV(csv);
     const rec = map.get(phone8);
-    if (!rec) { showToast('Ingen match for: ' + phone8); return; }
+    if (!rec) { silentAbortTab(); return true; }
     const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
-    showToast(`Åbner vikar: ${rec.name || 'ukendt navn'} (${rec.id})`);
-    location.assign(url);
-  } catch (e) { console.warn('[TP][CALLER]', e); showToast('Kan ikke hente telefonbog lige nu.'); }
+    // Åbn i samme fane uden historik
+    location.replace(url);
+  } catch (e) {
+    console.warn('[CALLER]', e);
+    silentAbortTab();
+  }
+  return true;
 }
 
 /*──────── 6c) GITHUB API (upload) ────────*/
@@ -400,73 +399,6 @@ function pickBestSheetCSV(wb) {
   }
   return best.rows >= 1 ? best.csv : null;
 }
-
-/* *** VIGTIGT NYT: Session-warmup før eksport *** */
-function fmtTodayDK() {
-  const d = new Date();
-  const dd = String(d.getDate()).padStart(2,'0');
-  const mm = String(d.getMonth()+1).padStart(2,'0');
-  const yyyy = d.getFullYear();
-  return `${dd}.${mm}.${yyyy}`;
-}
-async function warmUpVikarListSession() {
-  // Minimal payload baseret på det du så i devtools, så printlisten faktisk får rækker
-  const today = encodeURIComponent(fmtTodayDK());
-  const body =
-    'page=vikarlist_get' +
-    '&ajax=true' +
-    '&showheader=true' +
-    '&printlist=true' +
-    '&fieldset_filtre=closed' +
-    '&fieldset_aktivitet=closed' +
-    '&kunder_id=0' +
-    '&kunde_afdeling_id=' +
-    '&arbejdssteder_id=' +
-    '&searchFromUrl=false' +
-    '&query=' +
-    '&query_vikar_nr=' +
-    '&postnummer_fra=' +
-    '&postnummer_til=' +
-    '&fetchIds=' +
-    '&days_to_birthday=2' +
-    '&vagtonskeridag_dato=i+dag' +
-    '&vagtoenskeridag_starttidspunkt=' +
-    '&vagtoenskeridag_sluttidspunkt=' +
-    '&vagtoenskeridag_dag=true' +
-    '&vagtoenskeridag_aften=true' +
-    '&vagtoenskeridag_nat=true' +
-    '&vagtoenskeridag_heledag=true' +
-    '&ansaettelsesdato_datofra=' +
-    '&ansaettelsesdato_datotil=' +
-    '&ingenvagterfra=' +
-    '&ingenvagtertil=' +
-    '&medvagterfra=' +
-    '&medvagtertil=' +
-    '&medgodkendtevagterfra=' +
-    '&medgodkendtevagtertil=' +
-    '&afholdte_dato=' + today +
-    '&ingenvagtoenskerfra=' +
-    '&ingenvagtoenskertil=' +
-    '&sex=both' +
-    '&kontor_id=-1' +
-    '&udbetalingsmetode=-1' +
-    '&loenkorsel_id=0' +
-    '&kunde_radius_search=0' +
-    '&vikar_rolle=0' +
-    '&booking_grupper_id=-1' +
-    '&kunder_sel_width=400' +
-    '&kunder_sel_id=0' +
-    '&kunder_select_search=' +
-    '&kunder_id_0=0' +
-    '&vagterfra=' +
-    '&vagtertil=' +
-    '&list_uddannelse_id_all=true' +
-    '&uddannelse_gyldig=' + today +
-    '&kompetencegyldig=' + today;
-
-  await gmPOST(`${location.origin}/index.php`, body);
-}
-
 async function tryExcelGET(params) {
   const url = `${location.origin}/index.php?page=print_vikar_list_custom_excel&sortBy=&${params}`;
   const ab = await gmGETArrayBuffer(url);
@@ -478,10 +410,6 @@ async function tryExcelPOST(params) {
   return ab;
 }
 async function fetchExcelAsCSVText() {
-  // Varm sessionen op først, så serveren har en "printlist" med rækker
-  try { await warmUpVikarListSession(); } catch (e) { console.warn('[TP][PB] warmUp fejlede (fortsætter alligevel):', e); }
-
-  // Forsøg i denne rækkefølge: GET (med dato) → GET (uden) → POST (med) → POST (uden)
   const tries = [
     { fn: tryExcelGET,  params: 'id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag' },
     { fn: tryExcelGET,  params: 'id=true&name=true&phone=true&cellphone=true' },
@@ -492,7 +420,7 @@ async function fetchExcelAsCSVText() {
   for (const t of tries) {
     try {
       const ab = await t.fn(t.params);
-      if (!ab || ab.byteLength < 256) { lastInfo = 'too small'; continue; }
+      if (!ab || ab.byteLength < 128) { lastInfo = 'too small'; continue; }
       const wb = XLSX.read(ab, { type: 'array' });
       if (!wb.SheetNames || wb.SheetNames.length === 0) { lastInfo = 'no sheets'; continue; }
       const csv = pickBestSheetCSV(wb);
@@ -504,19 +432,13 @@ async function fetchExcelAsCSVText() {
     }
   }
   console.warn('[TP][PB] Excel→CSV mislykkedes (alle forsøg). Sidste info:', lastInfo);
-  return null; // signalér at der ikke var data
+  return null;
 }
 async function fetchExcelAsCSVAndUpload() {
-  const text = await fetchExcelAsCSVText();         // kan være null ved header-only
-  if (!text) {
-    showToastOnce('csv', 'Temponizer gav ingen rækker – beholdt eksisterende CSV (ingen upload).');
-    return;
-  }
+  const text = await fetchExcelAsCSVText();
+  if (!text) { showToastOnce('csv', 'Temponizer gav ingen rækker – beholdt eksisterende CSV (ingen upload).'); return; }
   const lines = (text || '').trim().split(/\r?\n/).filter(Boolean);
-  if (lines.length < 2) {
-    showToastOnce('csv', 'Temponizer CSV havde kun header – beholdt eksisterende CSV.');
-    return;
-  }
+  if (lines.length < 2) { showToastOnce('csv', 'Temponizer CSV havde kun header – beholdt eksisterende CSV.'); return; }
   const base64 = b64encodeUtf8(text);
   const { sha } = await ghGetSha(PB_OWNER, PB_REPO, PB_CSV, PB_BRANCH);
   await ghPutFile(PB_OWNER, PB_REPO, PB_CSV, base64, 'sync: Excel→CSV via TM (auto)', sha, PB_BRANCH);
@@ -605,6 +527,12 @@ function injectUI() {
           '<button id="tpLookupPhone" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Slå op i CSV</button>' +
         '</div>' +
         '<div id="tpPBHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
+      '</div>' +
+      '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
+      '<div style="font-weight:700;margin-bottom:4px">IPnordic Communicator (opsætning)</div>' +
+      '<div style="font-size:11px;color:#444;line-height:1.45">' +
+        'Incoming rule URL: <code>?page=front&amp;tp_caller=&lt;%CallerNumber%&gt;&amp;tp_dir=in</code><br>' +
+        'Alternativt: <code>&amp;tp_caller=&lt;%CallerNumber%&gt;*1500</code> hvis du ikke kan sende <code>tp_dir</code>.' +
       '</div>';
     document.body.appendChild(menu);
 
@@ -634,7 +562,6 @@ function injectUI() {
     pat.value = (GM_getValue('tpGitPAT') || '');
     pat.addEventListener('change', () => GM_setValue('tpGitPAT', pat.value || ''));
 
-    // Manuel CSV
     up.addEventListener('click', async () => {
       try {
         const token = (pat.value||'').trim(); if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
@@ -649,10 +576,9 @@ function injectUI() {
       } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
     });
 
-    // Auto: Excel → CSV → Upload
     csvUp.addEventListener('click', async () => {
       try {
-        pbh.textContent = 'Henter Excel (warmup + GET/POST), vælger bedst ark og uploader CSV …';
+        pbh.textContent = 'Henter Excel (GET/POST), vælger bedste ark og uploader CSV …';
         const t0 = Date.now();
         await fetchExcelAsCSVAndUpload();
         const ms = Date.now()-t0;
@@ -660,7 +586,6 @@ function injectUI() {
       } catch (e) { console.warn('[TP][PB][EXCEL→CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel→CSV upload.'; showToast('Fejl – se konsol.'); }
     });
 
-    // Rå XLSX
     exUp.addEventListener('click', async () => {
       try {
         pbh.textContent = 'Henter Excel fra server …';
@@ -672,7 +597,6 @@ function injectUI() {
       } catch (e) { console.warn('[TP][PB][EXCEL-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel upload.'; showToast('Fejl – se konsol.'); }
     });
 
-    // TEST lookup
     tBtn.addEventListener('click', async () => {
       try {
         const raw = (tIn.value||'').trim();
@@ -730,21 +654,35 @@ function tpTestPushoverBoth(){
 }
 
 /*──────── 8) STARTUP ────────*/
-document.addEventListener('click', e => {
-  const a = e.target.closest && e.target.closest('a');
-  if (a && /Beskeder/.test(a.textContent || '')) {
-    if (isLeader()) { const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0}); stMsg.lastPush = stMsg.lastSent = 0; saveJsonIfLeader(ST_MSG_KEY, stMsg); }
-  }
-});
-tryBecomeLeader();
-setInterval(heartbeatIfLeader, HEARTBEAT_MS);
-setInterval(tryBecomeLeader, HEARTBEAT_MS + 1200);
-callerPopIfNeeded().catch(()=>{});
-pollMessages(); pollInterest();
-setInterval(pollMessages, POLL_MS);
-setInterval(pollInterest, POLL_MS);
-injectUI();
-console.info('[TP] kører version 6.67');
+(async function boot(){
+  // 0) Caller-pop mode? (kun ved indgående opkald; ellers abortér fanen og stop scriptet)
+  try {
+    const handled = await callerPopIfNeededStrict();
+    if (handled) return; // denne fane er enten navigeret videre eller lukket
+  } catch(_) { /* hvis noget går galt, fortsæt normalt */ }
+
+  // 1) Reset “Beskeder”-klik
+  document.addEventListener('click', e => {
+    const a = e.target.closest && e.target.closest('a');
+    if (a && /Beskeder/.test(a.textContent || '')) {
+      if (isLeader()) { const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0}); stMsg.lastPush = stMsg.lastSent = 0; saveJsonIfLeader(ST_MSG_KEY, stMsg); }
+    }
+  });
+
+  // 2) Leader-init + loops
+  tryBecomeLeader();
+  setInterval(heartbeatIfLeader, HEARTBEAT_MS);
+  setInterval(tryBecomeLeader, HEARTBEAT_MS + 1200);
+
+  // 3) Pollers
+  pollMessages(); pollInterest();
+  setInterval(pollMessages, POLL_MS);
+  setInterval(pollInterest, POLL_MS);
+
+  // 4) UI
+  injectUI();
+  console.info('[TP] kører version 6.68');
+})();
 
 /*──────── 9) HOVER “Intet Svar” (auto-gem) ────────*/
 (function () {
@@ -788,7 +726,7 @@ console.info('[TP] kører version 6.67');
           if (saveBtn) {
             setTimeout(function () {
               try { saveBtn.click(); } catch (_) {}
-              try { if (unsafeWindow.hs && unsafeWindow.hs.close) unsafeWindow.hs.close(); } catch (_) {}
+              try { if (unsafeWindow && unsafeWindow.hs && unsafeWindow.hs.close) unsafeWindow.hs.close(); } catch (_) {}
               if (hsWrap) { hsWrap.style.opacity = ''; hsWrap.style.pointerEvents = ''; }
             }, 30);
           }
