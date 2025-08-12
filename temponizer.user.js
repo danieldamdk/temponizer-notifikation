@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.19
-// @description  Robust besked/interesse notifikation: alle faner poller (jitter), tving fuld GET mindst hver 45s uanset ETag, pending-suppression (intet glipper), Smart/Force toast, max 1 OS-popup, “Intet Svar”-auto, caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→GitHub, RAW CSV, SMS status/toggle uden popup, dragbart UI med forankring, gear-menu kan lukkes (klik udenfor/Esc), badges med tællere og puls ved stigning. Auto-opdatering.
+// @version      7.9.20
+// @description  Balanceret: ~10–15s latency uden tung belastning. Leader poller beskeder/interest (HEAD + Range GET 0–30KB, min. hver 30s). Non-leaders poller kun beskeder og lytter på events. Pending-suppression (intet glipper), Smart/Force toast, max 1 OS-popup. Caller-pop: kun kø *1500, nyt faneblad, luk “launcher”-fane ved ukendt/udgående (nul flash). Excel→CSV→GitHub, RAW CSV, SMS status/toggle uden popup, dragbart UI med anker, gear-menu kan lukkes (klik udenfor/Esc), badges og puls ved stigning. Auto-opdatering.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -22,12 +22,12 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.19';
+const TP_VERSION = '7.9.20';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'REDACTED_REVOKED_CREDENTIAL';
-const POLL_MS_LEADER    = 12000;  // 12s
-const POLL_MS_NONLEADER = 20000;  // 20s
+const POLL_MS_LEADER    = 10000; // 10s
+const POLL_MS_NONLEADER = 15000; // 15s
 const SUPPRESS_MS = 45000;
 const LOCK_MS     = SUPPRESS_MS + 5000;
 
@@ -60,14 +60,20 @@ const OPEN_NEW_TAB_ON_INBOUND = true;
   } catch(_) {}
 })();
 
-/*──────── 1b) TOAST DEFAULT (Smart toast) ────────*/
-// Defaultér til "Smart toast" (OS-popup når fanen er skjult/minimeret) hvis intet valgt endnu.
+/*──────── 1b) TOAST DEFAULT + PERMISSION ────────*/
 (function initToastMode() {
   const f = localStorage.getItem('tpForceDOMToast');
   const s = localStorage.getItem('tpSmartToast');
-  if (f === null && s === null) {
-    localStorage.setItem('tpSmartToast', 'true');
-  }
+  if (f === null && s === null) localStorage.setItem('tpSmartToast', 'true');
+})();
+(function ensureNotifPermEarly(){
+  try {
+    if (localStorage.getItem('tpSmartToast') === 'true' &&
+        typeof Notification !== 'undefined' &&
+        Notification.permission === 'default') {
+      setTimeout(() => { Notification.requestPermission().catch(()=>{}); }, 1500);
+    }
+  } catch(_) {}
 })();
 
 /*──────── 2) TOAST ────────*/
@@ -83,10 +89,12 @@ function showToast(msg) {
   const smart    = localStorage.getItem('tpSmartToast') === 'true';
   if (forceDom) { showDOMToast(msg); return; }
   if (smart && document.visibilityState === 'visible') { showDOMToast(msg); return; }
-  if (Notification.permission === 'granted') {
-    try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
-  } else if (Notification.permission !== 'denied') {
-    Notification.requestPermission().then(p => { p === 'granted' ? new Notification('Temponizer', { body: msg }) : showDOMToast(msg); });
+  if (typeof Notification !== 'undefined') {
+    if (Notification.permission === 'granted') {
+      try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
+    } else if (Notification.permission !== 'denied') {
+      Notification.requestPermission().then(p => { p === 'granted' ? new Notification('Temponizer', { body: msg }) : showDOMToast(msg); });
+    } else showDOMToast(msg);
   } else showDOMToast(msg);
 }
 function showDOMToast(msg) {
@@ -119,30 +127,18 @@ window.addEventListener('storage', e => {
     const seenKey = 'tpToastSeen_' + ev.id;
     if (localStorage.getItem(seenKey)) return;
     localStorage.setItem(seenKey, '1');
-    if (!isLeader()) showDOMToast(ev.msg); // non-leader viser altid DOM
+    if (!isLeader()) showDOMToast(ev.msg); // non-leader: kun DOM
   } catch (_) {}
 });
 
-/*──────── 2b) STATUS-BANNER (caller-pop debug) ────────*/
-function tpBanner(msg, ms = 4000) {
-  try {
-    let el = document.getElementById('tpCallerBanner');
-    if (!el) {
-      el = document.createElement('div');
-      el.id = 'tpCallerBanner';
-      Object.assign(el.style, {
-        position: 'fixed', top: '8px', left: '8px',
-        zIndex: 2147483647, background: '#212121', color: '#fff',
-        padding: '8px 10px', borderRadius: '6px', font: '12px/1.3 system-ui, sans-serif',
-        boxShadow: '0 2px 10px rgba(0,0,0,.35)', opacity: '0', transition: 'opacity .25s'
-      });
-      document.body.appendChild(el);
-      requestAnimationFrame(() => el.style.opacity = '1');
-    }
-    el.textContent = msg;
-    clearTimeout(el._t);
-    el._t = setTimeout(() => { if (el) { el.style.opacity = '0'; setTimeout(() => el.remove(), 250); } }, ms);
-  } catch(_) {}
+/*──────── 2b) BADGE + UI helpers ────────*/
+function badgePulse(el) {
+  if (!el) return;
+  el.animate([{ transform:'scale(1)' }, { transform:'scale(1.15)' }, { transform:'scale(1)' }], { duration: 320, easing: 'ease-out' });
+}
+function setBadge(el, val) {
+  if (!el) return;
+  el.textContent = (typeof val === 'number' ? String(val) : '–');
 }
 
 /*──────── 3) PUSHOVER ────────*/
@@ -160,22 +156,30 @@ function sendPushover(msg) {
   });
 }
 
-/*──────── 4) STATE + LOCK ────────*/
+/*──────── 4) STATE + LOCK + COUNT EVENTS ────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
-const ST_MSG_KEY = 'tpPushState';    // {count,lastPush,lastSent,pendingCount,pendingTs}
-const ST_INT_KEY = 'tpInterestState';// {count,lastPush,lastSent,pendingCount,pendingTs}
+
+const ST_MSG_KEY = 'tpPushState';     // {count,lastPush,lastSent,pendingCount,pendingTs}
+const ST_INT_KEY = 'tpInterestState'; // {count,lastPush,lastSent,pendingCount,pendingTs}
+
+const COUNT_MSG_EVT = 'tpCount_msg';
+const COUNT_INT_EVT = 'tpCount_int';
+
 function loadJson(key, fallback) { try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch (_) { return JSON.parse(JSON.stringify(fallback)); } }
 function saveJson(key, obj)       { localStorage.setItem(key, JSON.stringify(obj)); }
+function broadcastCount(channel, count) {
+  const key = channel === 'msg' ? COUNT_MSG_EVT : COUNT_INT_EVT;
+  try { localStorage.setItem(key, JSON.stringify({ count, ts: Date.now() })); } catch(_){}
+}
 function takeLock() {
   const l = JSON.parse(localStorage.getItem('tpPushLock') || '{"t":0}');
   if (Date.now() - l.t < LOCK_MS) return false;
   localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() })); return true;
 }
 
-/*──────── 5) NOTIFY HELPERS (vis alle stigninger) ────────*/
+/*──────── 5) NOTIFY HELPERS (vis alle stigninger; pending) ────────*/
 function handleCount(channel, newCount, enableKey, stateKey, msgBuilder) {
-  // Bevar sidste state, med "pendingCount" (forsinket OS/centralt toast efter suppression)
   const st = loadJson(stateKey, {
     count: 0,
     lastPush: 0,
@@ -188,12 +192,9 @@ function handleCount(channel, newCount, enableKey, stateKey, msgBuilder) {
   const now = Date.now();
   const canPushNow = (now - st.lastPush > SUPPRESS_MS) && takeLock();
 
-  // Mikro DOM-toast ved stigning når fanen er synlig (så vi altid "ser alle" stigninger)
+  // Mikro DOM-toast ved stigning (hvis synlig fane) kun hvis vi ikke alligevel viser central toast nu
   const microDomOnRise = (count) => {
-    if (document.visibilityState === 'visible') {
-      // Kun mikro, hvis vi IKKE alligevel viser central toast nu
-      if (!canPushNow) showDOMToast(msgBuilder(count));
-    }
+    if (document.visibilityState === 'visible' && !canPushNow) showDOMToast(msgBuilder(count));
   };
 
   if (newCount > st.count) {
@@ -209,12 +210,10 @@ function handleCount(channel, newCount, enableKey, stateKey, msgBuilder) {
       st.pendingCount = null;
       st.pendingTs = 0;
     } else {
-      // Under suppression: husk højeste tal vi har set (sendes senere)
       st.pendingCount = Math.max(st.pendingCount || 0, newCount);
       if (!st.pendingTs) st.pendingTs = now;
     }
   } else if (st.pendingCount != null && canPushNow) {
-    // Suppression udløbet → lever den opsamlede notifikation (selv hvis tallet er faldet)
     const text = msgBuilder(st.pendingCount);
     if (enabled) sendPushover(text);
     broadcastToast(channel, text);
@@ -225,19 +224,18 @@ function handleCount(channel, newCount, enableKey, stateKey, msgBuilder) {
     st.pendingTs = 0;
   }
 
-  // Fald: ingen notifikation. Nulstil suppression, så næste stigning kan komme igennem hurtigere.
-  if (newCount < st.count) {
-    st.lastPush = 0;
-  }
+  // Ved fald: ingen notifikation. Nulstil suppression så næste stigning kan komme hurtigt igennem.
+  if (newCount < st.count) st.lastPush = 0;
 
   st.count = newCount;
   saveJson(stateKey, st);
+  broadcastCount(channel, newCount); // så non-leaders kan opdatere badges
 }
 
 /*──────── 6) POLLERS ────────*/
 function jitter(base) { return base + Math.floor(Math.random()*0.25*base); }
 
-/* — BESKED — (alle faner) */
+/* — BESKED — (leder + non-leader, let JSON) */
 function pollMessages(tabRole='leader') {
   fetch(MSG_URL + '&ts=' + Date.now(), {
     credentials: 'same-origin',
@@ -248,10 +246,10 @@ function pollMessages(tabRole='leader') {
   .then(d => {
     const n  = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
 
-    // Badge før state ændres (så vi kan pulse ved stigning)
     const stPrev = loadJson(ST_MSG_KEY, {count:0});
     handleCount('msg', n, 'tpPushEnableMsg', ST_MSG_KEY, (c)=>'🔔 Du har nu ' + c + ' ulæst(e) Temponizer-besked(er).');
 
+    // Badge i lokal fane
     const badge = document.getElementById('tpMsgCountBadge');
     setBadge(badge, n);
     if (n > stPrev.count) badgePulse(badge);
@@ -261,9 +259,9 @@ function pollMessages(tabRole='leader') {
   .catch(e => console.warn('[TP][ERR][MSG]['+tabRole+']', e));
 }
 
-/* — INTERESSE — (alle faner) */
+/* — INTERESSE — (KUN leader laver HEAD/GET) */
 const HTML_URL = location.origin + '/index.php?page=freevagter';
-const INT_FORCE_GET_MS = 45000; // tving fuld GET mindst hver 45s (uanset ETag)
+const INT_FORCE_GET_MS = 30000; // tving fuld GET mindst hver 30s
 let lastParseTs = Number(localStorage.getItem('tpIntLastFull') || 0);
 let lastETagSeen = null;
 
@@ -285,7 +283,7 @@ function parseInterestHTML(html) {
   }, 0);
   return c;
 }
-function pollInterest(tabRole='leader') {
+function pollInterestLeader() {
   const force = mustForceParse();
 
   fetch(HTML_URL, {
@@ -303,52 +301,54 @@ function pollInterest(tabRole='leader') {
       return fetch(HTML_URL + '&_=' + Date.now(), {
         credentials: 'same-origin',
         cache: 'no-store',
-        headers: { 'Cache-Control':'no-cache', 'Pragma':'no-cache' }
+        headers: { 'Cache-Control':'no-cache', 'Pragma':'no-cache', 'Range':'bytes=0-30000' } // hent kun toppen
       })
       .then(r => r.text())
       .then(html => {
         const c = parseInterestHTML(html);
         markParsedNow();
 
-        // Badge før state ændres
         const stPrev = loadJson(ST_INT_KEY, {count:0});
         handleCount('int', c, 'tpPushEnableInt', ST_INT_KEY, x=>'👀 ' + x + ' vikar(er) har vist interesse for ledige vagter');
 
+        // Badge i lokal (leader) fane
         const badgeI = document.getElementById('tpIntCountBadge');
         setBadge(badgeI, c);
         if (c > stPrev.count) badgePulse(badgeI);
 
-        console.info('[TP-interesse]['+tabRole+']', c, new Date().toLocaleTimeString());
+        console.info('[TP-interesse][leader]', c, new Date().toLocaleTimeString());
       });
     } else {
-      console.info('[TP-interesse]['+tabRole+'] 304', new Date().toLocaleTimeString());
+      console.info('[TP-interesse][leader] 304', new Date().toLocaleTimeString());
     }
   })
   .catch(e => {
-    console.warn('[TP][ERR][INT]['+tabRole+'][HEAD]', e);
-    // fallback: prøv én fuld GET
-    fetch(HTML_URL + '&_=' + Date.now(), {
-      credentials: 'same-origin',
-      cache: 'no-store',
-      headers: { 'Cache-Control':'no-cache', 'Pragma':'no-cache' }
-    })
-    .then(r => r.text())
-    .then(html => {
-      const c = parseInterestHTML(html);
-      markParsedNow();
+    console.warn('[TP][ERR][INT][leader][HEAD]', e);
+  });
+}
 
+/* Non-leader: ingen GET — opdater badges via storage events */
+window.addEventListener('storage', (e) => {
+  try {
+    if (e.key === COUNT_INT_EVT && e.newValue) {
+      const data = JSON.parse(e.newValue || '{}'); const c = Number(data.count || 0);
       const stPrev = loadJson(ST_INT_KEY, {count:0});
-      handleCount('int', c, 'tpPushEnableInt', ST_INT_KEY, x=>'👀 ' + x + ' vikar(er) har vist interesse for ledige vagter');
-
       const badgeI = document.getElementById('tpIntCountBadge');
       setBadge(badgeI, c);
       if (c > stPrev.count) badgePulse(badgeI);
-
-      console.info('[TP-interesse]['+tabRole+'] (fallback)', c, new Date().toLocaleTimeString());
-    })
-    .catch(()=>{});
-  });
-}
+      // Spejl count lokalt, så UI matcher
+      const st = loadJson(ST_INT_KEY, {count:0}); st.count = c; saveJson(ST_INT_KEY, st);
+    }
+    if (e.key === COUNT_MSG_EVT && e.newValue) {
+      const data = JSON.parse(e.newValue || '{}'); const n = Number(data.count || 0);
+      const stPrev = loadJson(ST_MSG_KEY, {count:0});
+      const badge = document.getElementById('tpMsgCountBadge');
+      setBadge(badge, n);
+      if (n > stPrev.count) badgePulse(badge);
+      const st = loadJson(ST_MSG_KEY, {count:0}); st.count = n; saveJson(ST_MSG_KEY, st);
+    }
+  } catch(_){}
+});
 
 /*──────── 7) LEADER-ELECTION ────────*/
 function now() { return Date.now(); }
@@ -462,6 +462,22 @@ function parsePhonebookCSV(text) {
   }
   return { map, header };
 }
+
+// Luk “launcher”-fanen hurtigt og stille
+function silentSelfClose(reason='') {
+  try { const html = document.documentElement; html.style.visibility='hidden'; html.style.opacity='0'; } catch(_){}
+  try { window.stop && window.stop(); } catch(_){}
+  let tries = 0;
+  const tryClose = () => {
+    tries++;
+    try { window.close(); } catch(_){}
+    if (!window.closed) { try { window.open('', '_self'); window.close(); } catch(_){} }
+    if (!window.closed) { try { location.replace('about:blank'); } catch(_){} }
+    if (!window.closed && tries < 6) setTimeout(tryClose, 250);
+  };
+  tryClose();
+}
+
 async function callerPopIfNeeded() {
   try {
     const q = new URLSearchParams(location.search);
@@ -470,46 +486,34 @@ async function callerPopIfNeeded() {
 
     const rawStr = String(rawParam).trim();
 
-    // Nul flash for ikke-køkald
-    const unsetHide = (() => {
-      const html = document.documentElement; const old = html.style.visibility;
-      html.style.visibility = 'hidden'; return () => { html.style.visibility = old; };
-    })();
+    // Skjul side straks, vi viser kun noget hvis der ER match
+    document.documentElement.style.visibility = 'hidden';
+    document.documentElement.style.opacity = '0';
 
     const isQueueInbound = /\*1500\s*$/.test(rawStr);
-    if (!isQueueInbound) {
-      tpBanner('Udgående/ikke-kø — lukker …', 900);
-      try { window.close(); } catch (_) {}
-      try { window.open('', '_self'); window.close(); } catch (_) {}
-      try { location.replace('about:blank'); } catch (_) {}
-      return;
-    }
-
-    unsetHide();
+    if (!isQueueInbound) { silentSelfClose('not-queue'); return; }
 
     const digitsRaw = rawStr.replace(/\*1500\s*$/,'').replace(/[^\d+]/g, '');
     const phone8 = normPhone(digitsRaw);
+    if (!phone8) { silentSelfClose('bad-number'); return; }
 
-    console.info('[TP][CALLER] Inbound køkald', { raw: rawStr, digitsRaw, phone8 });
-    tpBanner('Indgående køkald: ' + (phone8 || '—') + ' — slår op …', 2500);
-
-    if (!phone8) { tpBanner('Ukendt nummerformat: ' + rawStr, 5000); return; }
-
+    // Hent CSV RAW → cache
     let csvText = '';
     try { csvText = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now()); if (csvText) GM_setValue(CACHE_KEY_CSV, csvText); } catch(_) {}
     if (!csvText) csvText = GM_getValue(CACHE_KEY_CSV) || '';
-    if (!csvText) { tpBanner('Ingen telefonbog tilgængelig (RAW og cache tom).', 5000); return; }
+    if (!csvText) { silentSelfClose('no-csv'); return; }
 
     const { map } = parsePhonebookCSV(csvText);
     const rec = map.get(phone8);
-    if (!rec) { tpBanner('Ingen match i CSV: ' + phone8, 4000); return; }
+    if (!rec) { silentSelfClose('no-match'); return; }
 
     const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
-    tpBanner(`Match: ${rec.name || '(uden navn)'} (#${rec.id}) — åbner …`, 1800);
     if (OPEN_NEW_TAB_ON_INBOUND) { window.open(url, '_blank', 'noopener'); } else { location.assign(url); }
+    // Communicator lukker typisk selv “launcher”-fanen. Ellers:
+    setTimeout(() => silentSelfClose('after-open'), 120);
   } catch (e) {
     console.warn('[TP][CALLER] error', e);
-    tpBanner('Fejl under opslag — se konsol.', 5000);
+    silentSelfClose('error');
   }
 }
 
@@ -686,7 +690,7 @@ function invokeIframeAction(ifr, wantOn) {
   } catch(_) {}
   return false;
 }
-async function toggleSmsInIframe(wantOn, timeoutMs=15000, pollMs=600) {
+async function toggleSmsInIframe(wantOn, timeoutMs=15000, pollMs=500) {
   const ifr = await ensureSmsFrameLoaded();
   let st0 = getIframeStatus(ifr);
   if ((wantOn && st0.state === 'active') || (!wantOn && st0.state === 'inactive')) return st0;
@@ -729,15 +733,6 @@ const sms = {
 };
 
 /*──────── 12) DRAG + ANKER + UI HELPERS ────────*/
-function badgePulse(el) {
-  if (!el) return;
-  el.animate([{ transform:'scale(1)' }, { transform:'scale(1.15)' }, { transform:'scale(1)' }], { duration: 320, easing: 'ease-out' });
-}
-function setBadge(el, val) {
-  if (!el) return;
-  el.textContent = (typeof val === 'number' ? String(val) : '–');
-}
-
 function applyAnchor(el, a) {
   el.style.position='fixed';
   el.style.left  = (a.anchor.h === 'left') ? (a.offset.x + 'px') : 'auto';
@@ -964,7 +959,6 @@ function injectUI() {
     mnu.style.display = 'block'; mnu.style.visibility = 'hidden';
     positionMenu(mnu); mnu.style.visibility = 'visible';
     setTimeout(()=>{ document.addEventListener('mousedown', outsideClick, true); document.addEventListener('keydown', escClose, true); },0);
-    // init wiring første gang
     if (!mnu._wired) {
       const inp  = mnu.querySelector('#tpUserKeyMenu');
       const save = mnu.querySelector('#tpSaveUserKeyMenu');
@@ -996,9 +990,10 @@ function injectUI() {
       pat.value = (GM_getValue('tpGitPAT') || '');
       pat.addEventListener('change', () => GM_setValue('tpGitPAT', pat.value || ''));
 
-      async function uploadCSVText(text) {
+      up.addEventListener('click', async () => {
         try {
-          const token = (pat.value||'').trim(); if (!token) { showToast('Indsæt GitHub PAT først.'); return; }
+          if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
+          const text = await file.files[0].text();
           const base64 = b64encodeUtf8(text);
           pbh.textContent = 'Uploader CSV…';
           const { sha } = await ghGetSha(PB_OWNER, PB_REPO, PB_CSV, PB_BRANCH);
@@ -1006,10 +1001,6 @@ function injectUI() {
           GM_setValue(CACHE_KEY_CSV, text);
           pbh.textContent = 'CSV uploadet. RAW opdateres om få sek.'; showToast('CSV uploadet.');
         } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
-      }
-      up.addEventListener('click', async () => {
-        try { if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
-              const text = await file.files[0].text(); await uploadCSVText(text); } catch (e) { console.warn('[TP][PB][CSV-UPLOAD-BTN]', e); }
       });
 
       csvUp.addEventListener('click', async () => {
@@ -1029,10 +1020,7 @@ function injectUI() {
           if (!p8) { pbh.textContent = 'Ugyldigt nummer.'; return; }
           pbh.textContent = 'Slår op i CSV…';
           let csv = '';
-          try {
-            csv = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now());
-            if (csv) GM_setValue(CACHE_KEY_CSV, csv);
-          } catch(_) {}
+          try { csv = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now()); if (csv) GM_setValue(CACHE_KEY_CSV, csv); } catch(_) {}
           if (!csv) csv = GM_getValue(CACHE_KEY_CSV) || '';
           const { map } = parsePhonebookCSV(csv);
           const rec = map.get(p8);
@@ -1040,10 +1028,7 @@ function injectUI() {
           pbh.textContent = `Match: ${p8} → ${rec.name || '(uden navn)'} (vikar_id=${rec.id})`;
           const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
           window.open(url, '_blank', 'noopener');
-        } catch(e) {
-          console.warn('[TP][PB][LOOKUP]', e);
-          pbh.textContent = 'Fejl ved opslag.';
-        }
+        } catch(e) { console.warn('[TP][PB][LOOKUP]', e); pbh.textContent = 'Fejl ved opslag.'; }
       });
 
       test.addEventListener('click', () => { tpTestPushoverBoth(); closeMenu(); });
@@ -1071,13 +1056,11 @@ function injectUI() {
   function toggleMenu(){ if (!menu || menu.style.display !== 'block') openMenu(); else closeMenu(); }
   function outsideClick(e){
     if (!menu) return;
-    const gearBtn = d.querySelector('#tpGearBtn');
-    if (e.target === menu || menu.contains(e.target) || e.target === gearBtn) return;
+    const gb = gearBtn;
+    if (e.target === menu || menu.contains(e.target) || e.target === gb) return;
     closeMenu();
   }
   function escClose(e){ if (e.key === 'Escape') closeMenu(); }
-
-// gearBtn er allerede defineret længere oppe i injectUI()
 
   gearBtn.addEventListener('click', toggleMenu);
   window.addEventListener('resize', () => {
@@ -1111,21 +1094,27 @@ callerPopIfNeeded().catch(()=>{});
 injectUI();
 console.info('[TP] kører version', TP_VERSION);
 
-// Planlæg pollers i begge roller (med jitter), uafhængigt af leader-status.
+// Planlæg pollers (leader vs non-leader)
 function schedulePollers(){
-  const role = isLeader() ? 'leader' : 'nonleader';
-  const base = isLeader() ? POLL_MS_LEADER : POLL_MS_NONLEADER;
+  const leaderNow = isLeader();
+  const role = leaderNow ? 'leader' : 'nonleader';
+  const base = leaderNow ? POLL_MS_LEADER : POLL_MS_NONLEADER;
+
+  // Beskeder: begge roller
   pollMessages(role);
-  pollInterest(role);
+  // Interesse: kun leader
+  if (leaderNow) pollInterestLeader();
+
   setTimeout(schedulePollers, jitter(base));
 }
 schedulePollers();
 
 // Øjeblikkelig re-poll når fanen bliver synlig
 document.addEventListener('visibilitychange', () => {
+  const leaderNow = isLeader();
   if (document.visibilityState === 'visible') {
-    pollMessages(isLeader()?'leader':'nonleader');
-    pollInterest(isLeader()?'leader':'nonleader');
+    pollMessages(leaderNow ? 'leader' : 'nonleader');
+    if (leaderNow) pollInterestLeader();
   }
 });
 
