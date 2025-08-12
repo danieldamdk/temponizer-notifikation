@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
+// @name         Temponizer → Pushover + Toast + Quick "Intet Svar" + Overlevering (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.21
-// @description  Balanceret: ~10–15s. Leader: besked + interesse (HEAD + Range GET 0–30KB, min. hver 30s). Non-leader: besked + lyt på interesse. Pending-suppression (intet glipper), Smart/Force toast, max 1 OS-popup. Caller-pop: kun kø *1500, nyt faneblad, luk “launcher”-fane ved ukendt/udgående (nul flash). SMS status/toggle uden popup. Dragbart UI m. anker, gear-menu kan lukkes. Badges/puls. Auto-opdatering. v7.9.21: init-badges uden “–”, immediate interest-poll on leader, robust “Intet Svar”.
+// @version      7.10.0
+// @description  Push (leader, suppression), toast (Smart/Force, max 1 OS), badges, stealth “Intet Svar”, inbound caller-pop (kun *1500, nyt faneblad, nul flash), SMS status/toggle uden popups, Excel→CSV→GitHub (UI), RAW CSV lookup, drag+anker, auto-update. NYT: Overleverings-UI i panelet (lokal lagring; vikar-link til profil).
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -22,7 +22,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.21';
+const TP_VERSION = '7.10.0';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -214,7 +214,7 @@ function handleCount(channel, newCount, enableKey, stateKey, msgBuilder) {
 /*──────── 6) POLLERS ────────*/
 function jitter(base) { return base + Math.floor(Math.random()*0.25*base); }
 
-/* — BESKED — (leder + non-leader) */
+/* — BESKED — */
 function pollMessages(tabRole='leader') {
   fetch(MSG_URL + '&ts=' + Date.now(), {
     credentials: 'same-origin',
@@ -285,7 +285,7 @@ function pollInterestLeader() {
   .catch(e => console.warn('[TP][ERR][INT][leader][HEAD]', e));
 }
 
-/* Non-leader: ingen GET — opdater via events */
+/* Non-leader: lyt efter counts fra leader */
 window.addEventListener('storage', (e) => {
   try {
     if (e.key === COUNT_INT_EVT && e.newValue) {
@@ -318,14 +318,12 @@ function tryBecomeLeader() {
     setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t });
     if (isLeader()) {
       console.info('[TP][LEADER] Denne fane er nu leader:', TAB_ID);
-      // v7.9.21: poll med det samme, så UI ikke viser "–"
       pollMessages('leader');
       pollInterestLeader();
     }
   }
 }
 function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
-window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*no-op*/} });
 
 /*──────── 8) HTTP helpers ────────*/
 function gmGET(url) {
@@ -406,13 +404,24 @@ function parseCSV(text) {
 function parsePhonebookCSV(text) {
   const map = new Map();
   const rows = parseCSV(text);
-  if (!rows.length) return { map, header: [] };
+  if (!rows.length) return { map, header: [], vikars: [] };
   const header = rows[0].map(h => h.toLowerCase());
   const idxId   = header.findIndex(h => /(vikar.*nr|vikar[_ ]?id|^id$)/.test(h));
   const idxName = header.findIndex(h => /(navn|name)/.test(h));
   const phoneCols = header.map((h, idx) => ({ h, idx }))
     .filter(x => /(telefon(?:nummer)?|^tlf\.?$|mobil|cell(?:phone)?|mobile|phone)/.test(x.h));
-  if (idxId < 0 || phoneCols.length === 0) return { map, header };
+  const vikars = [];
+  const seen = new Set();
+  if (idxId >= 0) {
+    for (let r = 1; r < rows.length; r++) {
+      const id = (rows[r][idxId] || '').trim();
+      if (!id || seen.has(id)) continue;
+      const name = idxName >= 0 ? (rows[r][idxName] || '').trim() : '';
+      seen.add(id);
+      vikars.push({ id, name });
+    }
+  }
+  if (idxId < 0 || phoneCols.length === 0) return { map, header, vikars };
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
     const id   = (row[idxId]   || '').trim();
@@ -424,11 +433,11 @@ function parsePhonebookCSV(text) {
       if (p8) map.set(p8, { id, name });
     }
   }
-  return { map, header };
+  return { map, header, vikars };
 }
 
 // Luk “launcher”-fanen hurtigt og stille
-function silentSelfClose(reason='') {
+function silentSelfClose() {
   try { const html = document.documentElement; html.style.visibility='hidden'; html.style.opacity='0'; } catch(_){}
   try { window.stop && window.stop(); } catch(_){}
   let tries = 0;
@@ -450,36 +459,36 @@ async function callerPopIfNeeded() {
 
     const rawStr = String(rawParam).trim();
 
-    // Skjul side straks, vi viser kun noget hvis der ER match
+    // Skjul side straks – vi viser kun noget hvis der ER match
     document.documentElement.style.visibility = 'hidden';
     document.documentElement.style.opacity = '0';
 
     const isQueueInbound = /\*1500\s*$/.test(rawStr);
-    if (!isQueueInbound) { silentSelfClose('not-queue'); return; }
+    if (!isQueueInbound) { silentSelfClose(); return; }
 
     const digitsRaw = rawStr.replace(/\*1500\s*$/,'').replace(/[^\d+]/g, '');
     const phone8 = normPhone(digitsRaw);
-    if (!phone8) { silentSelfClose('bad-number'); return; }
+    if (!phone8) { silentSelfClose(); return; }
 
     let csvText = '';
     try { csvText = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now()); if (csvText) GM_setValue(CACHE_KEY_CSV, csvText); } catch(_) {}
     if (!csvText) csvText = GM_getValue(CACHE_KEY_CSV) || '';
-    if (!csvText) { silentSelfClose('no-csv'); return; }
+    if (!csvText) { silentSelfClose(); return; }
 
     const { map } = parsePhonebookCSV(csvText);
     const rec = map.get(phone8);
-    if (!rec) { silentSelfClose('no-match'); return; }
+    if (!rec) { silentSelfClose(); return; }
 
     const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
     if (OPEN_NEW_TAB_ON_INBOUND) { window.open(url, '_blank', 'noopener'); } else { location.assign(url); }
-    setTimeout(() => silentSelfClose('after-open'), 120);
+    setTimeout(() => silentSelfClose(), 120);
   } catch (e) {
     console.warn('[TP][CALLER] error', e);
-    silentSelfClose('error');
+    silentSelfClose();
   }
 }
 
-/*──────── 10) GITHUB + Excel→CSV ────────*/
+/*──────── 10) GITHUB + Excel→CSV (UI) ────────*/
 function b64encodeUtf8(str) { const bytes = new TextEncoder().encode(str); let bin=''; bytes.forEach(b=>bin+=String.fromCharCode(b)); return btoa(bin); }
 async function ghGetSha(owner, repo, path, ref) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`;
@@ -779,7 +788,7 @@ function ensureFullyVisible(el, margin = 8) {
   el.style.bottom = 'auto';
 }
 
-/*──────── 13) UI (panel + gear) ────────*/
+/*──────── 13) UI (panel + gear + OVERLEVERING) ────────*/
 function injectUI() {
   if (document.getElementById('tpPanel')) return;
 
@@ -790,7 +799,7 @@ function injectUI() {
     'background:#f9f9f9','border:1px solid #ccc','padding:8px 10px',
     'border-radius:6px','font-size:12px','font-family:sans-serif',
     'box-shadow:1px 1px 5px rgba(0,0,0,.2)',
-    'display:inline-block','min-width:220px','max-width:340px','width:auto'
+    'display:inline-block','min-width:240px','max-width:420px','width:auto'
   ].join(';');
   d.innerHTML =
     '<div id="tpPanelHeader" style="display:flex;align-items:center;gap:8px;user-select:none">' +
@@ -811,24 +820,28 @@ function injectUI() {
           '</div>' +
         '</div>' +
       '</div>' +
+      '<div style="border-top:1px solid #eee;margin:6px 0"></div>' +
+      '<button id="tpHandoverToggle" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">✍️ Overlevering</button>' +
+      '<div id="tpHandoverBox" style="display:none;margin-top:6px;border:1px solid #ddd;border-radius:6px;background:#fff;padding:8px;box-shadow:inset 0 1px 2px rgba(0,0,0,.05)"></div>' +
     '</div>';
   document.body.appendChild(d);
 
   makeDraggable(d, 'tpPanelPos', '#tpPanelHeader'); ensureFullyVisible(d);
 
+  /* Checkboxes */
   const m = d.querySelector('#m'), i = d.querySelector('#i');
   m.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
   i.checked = localStorage.getItem('tpPushEnableInt') === 'true';
   m.onchange = () => localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false');
   i.onchange = () => localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false');
 
-  // v7.9.21: Sæt badges fra sidste kendte state (ikke “–”)
+  /* Sæt badges fra last-known state */
   const stMsg = loadJson(ST_MSG_KEY, {count:0});
   const stInt = loadJson(ST_INT_KEY, {count:0});
   setBadge(d.querySelector('#tpMsgCountBadge'), Number(stMsg.count||0));
   setBadge(d.querySelector('#tpIntCountBadge'), Number(stInt.count||0));
 
-  // ── SMS UI
+  /* SMS UI */
   const smsAction  = d.querySelector('#smsAction');
   const smsTag     = d.querySelector('#smsTag');
   function smsSetBusy(on, text) { smsAction.disabled = on; if (on) smsTag.textContent = text || 'arbejder…'; }
@@ -850,11 +863,19 @@ function injectUI() {
   });
   (async () => { smsSetBusy(true, 'indlæser…'); await sms.refresh(smsRender); smsSetBusy(false); })();
 
-  // ── Gear menu
-  let menu = null;
-  const gearBtn = d.querySelector('#tpGearBtn');
+  /* OVERLEVERING UI */
+  initHandoverUI(d.querySelector('#tpHandoverToggle'), d.querySelector('#tpHandoverBox'));
 
-  function buildMenu() {
+  /* Gear menu */
+  buildGearMenu(d);
+}
+
+/*──────── 13a) Gear-menu ────────*/
+function buildGearMenu(panelRoot){
+  let menu = null;
+  const gearBtn = panelRoot.querySelector('#tpGearBtn');
+
+  function createMenu() {
     if (menu) return menu;
     menu = document.createElement('div');
     Object.assign(menu.style, {
@@ -910,7 +931,7 @@ function injectUI() {
   }
 
   function positionMenu(menu) {
-    const r = d.getBoundingClientRect();
+    const r = panelRoot.getBoundingClientRect();
     const mw = menu.offsetWidth, mh = menu.offsetHeight;
     let left = Math.max(8, Math.min(window.innerWidth - mw - 8, r.right - mw));
     let top  = Math.max(8, Math.min(window.innerHeight - mh - 8, r.bottom + 8));
@@ -918,7 +939,7 @@ function injectUI() {
   }
 
   function openMenu() {
-    const mnu = buildMenu();
+    const mnu = createMenu();
     mnu.style.display = 'block'; mnu.style.visibility = 'hidden';
     positionMenu(mnu); mnu.style.visibility = 'visible';
     setTimeout(()=>{ document.addEventListener('mousedown', outsideClick, true); document.addEventListener('keydown', escClose, true); },0);
@@ -1007,7 +1028,7 @@ function injectUI() {
         } catch(_) { showToast('Update-tjek fejlede.'); }
       });
 
-      mnu._wired = true;
+      menu._wired = true;
     }
   }
   function closeMenu() {
@@ -1027,8 +1048,14 @@ function injectUI() {
 
   gearBtn.addEventListener('click', toggleMenu);
   window.addEventListener('resize', () => {
-    ensureFullyVisible(d);
-    if (menu && menu.style.display === 'block') positionMenu(menu);
+    ensureFullyVisible(panelRoot);
+    if (menu && menu.style.display === 'block') {
+      const m = menu; const rect = panelRoot.getBoundingClientRect();
+      const mw = m.offsetWidth, mh = m.offsetHeight;
+      let left = Math.max(8, Math.min(window.innerWidth - mw - 8, rect.right - mw));
+      let top  = Math.max(8, Math.min(window.innerHeight - mh - 8, rect.bottom + 8));
+      Object.assign(m.style, { left:left+'px', top:top+'px' });
+    }
   });
 }
 
@@ -1057,7 +1084,7 @@ callerPopIfNeeded().catch(()=>{});
 injectUI();
 console.info('[TP] kører version', TP_VERSION);
 
-// Planlæg pollers (leader vs non-leader)
+// Planlæg pollers
 function schedulePollers(){
   const leaderNow = isLeader();
   const role = leaderNow ? 'leader' : 'nonleader';
@@ -1116,7 +1143,7 @@ document.addEventListener('visibilitychange', () => {
     btn.onmouseleave = () => { btn.style.background = ''; };
     btn.onclick = function () {
       auto = true;
-      stealthOn(); // skjul dialog visuelt fra start
+      stealthOn();
       if (iconEl) {
         const target = getClickable(iconEl);
         try { target.dispatchEvent(new MouseEvent('click', { bubbles:true, cancelable:true, view:window })); }
@@ -1164,10 +1191,8 @@ document.addEventListener('visibilitychange', () => {
     ) || null;
   }
   function tryCloseDialog() {
-    // klik på kendte close-knapper hvis de findes
     const closeBtn = document.querySelector('.highslide-container .highslide-close, .ui-dialog .ui-dialog-titlebar-close');
     if (closeBtn) { try { closeBtn.click(); } catch(_) {} }
-    // forsøg hs.close()
     try { if (unsafeWindow.hs && typeof unsafeWindow.hs.close === 'function') unsafeWindow.hs.close(); } catch(_){}
   }
 
@@ -1176,7 +1201,6 @@ document.addEventListener('visibilitychange', () => {
     for (const m of ml) {
       for (const n of m.addedNodes) {
         if (!(n instanceof HTMLElement)) continue;
-        // find container og textarea
         const container = (n.closest && (n.closest('.highslide-body, .highslide-container, .modal, .ui-dialog, body') || n)) || n;
         const ta = container.querySelector && container.querySelector(TEXTAREA_SEL);
         if (ta) {
@@ -1185,7 +1209,6 @@ document.addEventListener('visibilitychange', () => {
           if (btn) {
             setTimeout(() => {
               try { btn.click(); } catch(_) {}
-              // forsøg at lukke — og bliv ved få øjeblikke hvis nødvendig
               let tries = 0;
               const tick = () => {
                 tryCloseDialog();
@@ -1203,3 +1226,362 @@ document.addEventListener('visibilitychange', () => {
     }
   }).observe(document.body, { childList: true, subtree: true });
 })();
+
+/*──────── 16) OVERLEVERING (lokal lagring, pæn UI) ────────*/
+const HO_KEY = 'tpHandoverV1';
+function hoTodayKey() {
+  // yyyy-mm-dd i lokal tid
+  const d = new Date();
+  const y = d.getFullYear(), m = (d.getMonth()+1).toString().padStart(2,'0'), dd = d.getDate().toString().padStart(2,'0');
+  return `${y}-${m}-${dd}`;
+}
+function hoLoad() {
+  try { return JSON.parse(localStorage.getItem(HO_KEY) || '{}'); } catch { return {}; }
+}
+function hoSave(store) { localStorage.setItem(HO_KEY, JSON.stringify(store||{})); }
+function hoListToday() { const s = hoLoad(); return Array.isArray(s[hoTodayKey()]) ? s[hoTodayKey()] : []; }
+function hoUpsertToday(arr) { const s = hoLoad(); s[hoTodayKey()] = arr; hoSave(s); }
+function hoAdd(entry){
+  const arr = hoListToday();
+  arr.push(entry);
+  hoUpsertToday(arr);
+}
+function hoGenId(){ return `${Date.now()}_${Math.random().toString(36).slice(2,8)}`; }
+function hoMarkdown(arr){
+  const dd = new Date();
+  const dateStr = dd.toLocaleDateString('da-DK');
+  const esc = s => (s||'').replace(/\r?\n/g,' ');
+  const lines = [];
+  lines.push(`# Overlevering – ${dateStr} (Aften)`);
+  const cats = {
+    sygemelding: 'Sygemeldinger',
+    forsinket: 'For sent',
+    noshow: 'No-show',
+    kunde_annullerede: 'Afbud/annullering fra kunde',
+    gendaekket: 'Gendækket',
+    ikkegendaekket: 'Ikke gendækket',
+    ring: 'Ringeaftaler',
+    kompetence: 'Kompetence',
+    klage: 'Klage/OBS',
+    oekonomi: 'Økonomi',
+    andet: 'Andet'
+  };
+  const byCat = {};
+  for (const e of arr) {
+    const c = e.type || 'andet';
+    (byCat[c] ||= []).push(e);
+  }
+  for (const [k, title] of Object.entries(cats)) {
+    const list = byCat[k]||[];
+    if (!list.length) continue;
+    lines.push(`\n**${title}:**`);
+    for (const e of list) {
+      const who = e.vikarName ? e.vikarName : (e.vikarId ? `#${e.vikarId}` : '');
+      const kund = e.kunde || '';
+      const dt   = e.vagtDato ? (e.vagtTid ? `${e.vagtDato} ${e.vagtTid}` : e.vagtDato) : '';
+      const res  = e.resultat ? ` – ${e.resultat}` : '';
+      const fu   = e.follow ? ` [${e.follow}]` : '';
+      const note = e.note ? ` – ${esc(e.note)}` : '';
+      const parts = [who, kund, dt].filter(Boolean).join(' • ');
+      lines.push(`- ${parts}${res}${fu}${note}`);
+    }
+  }
+  const opens = arr.filter(e => e.status !== 'closed');
+  if (opens.length) {
+    lines.push(`\n**Åbne opgaver til morgenvagten:**`);
+    for (const e of opens) {
+      const txt = e.follow ? `${e.follow}` : (e.note||'Opfølgning');
+      lines.push(`- [ ] ${txt}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+/* Autocomplete fra telefonbog CSV */
+let HO_VIKAR_OPTIONS = [];
+async function hoEnsureVikarOptions(){
+  try {
+    let csv = GM_getValue(CACHE_KEY_CSV) || '';
+    if (!csv) {
+      try { csv = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now()); if (csv) GM_setValue(CACHE_KEY_CSV, csv); } catch(_){}
+    }
+    if (!csv) return;
+    const parsed = parsePhonebookCSV(csv);
+    HO_VIKAR_OPTIONS = parsed.vikars || [];
+  } catch(_){}
+}
+function hoFindVikarByInput(str){
+  if (!str) return { id:'', name:'' };
+  const m = str.match(/(.+?)\s*\(#\s*([^\)]+)\s*\)\s*$/);
+  if (m) return { name: m[1].trim(), id: m[2].trim() };
+  // fallback: exact by name
+  const needle = str.trim().toLowerCase();
+  const hit = HO_VIKAR_OPTIONS.find(v => (v.name||'').toLowerCase() === needle || v.id === needle);
+  if (hit) return { id: hit.id, name: hit.name };
+  return { id:'', name:str.trim() };
+}
+
+function initHandoverUI(btn, box){
+  if (!btn || !box) return;
+
+  const css = document.createElement('style');
+  css.textContent = `
+    .tp-chip { padding:3px 8px; border:1px solid #ccc; border-radius:999px; background:#fff; cursor:pointer; font-size:12px; }
+    .tp-chip.on { background:#eef; border-color:#99a; }
+    .tp-row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+    .tp-col { display:flex; flex-direction:column; gap:4px; }
+    .tp-input { padding:5px 6px; border:1px solid #ccc; border-radius:4px; }
+    .tp-list-item { border:1px solid #eee; border-radius:6px; padding:6px 8px; background:#fafafa; display:flex; gap:6px; align-items:flex-start; }
+    .tp-list-item.closed { opacity:.7; }
+    .tp-pill { padding:2px 6px; border-radius:999px; background:#eee; font-size:11px; margin-left:4px; }
+    .tp-link { color:#06c; text-decoration:none; }
+    .tp-link:hover { text-decoration:underline; }
+  `;
+  document.head.appendChild(css);
+
+  btn.addEventListener('click', () => {
+    box.style.display = (box.style.display === 'none' ? 'block' : 'none');
+    if (box.style.display === 'block') renderHandover();
+  });
+
+  function chipBtn(text, value, state, onClick){
+    const b = document.createElement('button');
+    b.className = 'tp-chip' + (state ? ' on' : '');
+    b.type='button'; b.textContent = text; b.addEventListener('click', onClick);
+    b.dataset.value = value;
+    return b;
+  }
+
+  function renderHandover(){
+    box.innerHTML = '';
+    const form = document.createElement('div');
+    form.className = 'tp-col';
+    form.style.marginBottom = '8px';
+
+    // Type chips
+    const types = [
+      ['Sygemelding','sygemelding'], ['For sent','forsinket'], ['No-show','noshow'],
+      ['Kunde annullerede','kunde_annullerede'], ['Gendækket','gendaekket'], ['Ikke gendækket','ikkegendaekket'],
+      ['Ringeaftale','ring'], ['Kompetence','kompetence'], ['Klage/OBS','klage'], ['Økonomi','oekonomi'], ['Andet','andet']
+    ];
+    let selType = 'andet';
+    const typeRow = document.createElement('div'); typeRow.className='tp-row';
+    typeRow.appendChild(document.createTextNode('Type:'));
+    const typeBtns = [];
+    for (const [label,val] of types) {
+      const b = chipBtn(label, val, val===selType, () => {
+        selType = val;
+        typeBtns.forEach(x => x.classList.toggle('on', x.dataset.value===selType));
+      });
+      typeBtns.push(b); typeRow.appendChild(b);
+    }
+
+    // Inputs
+    const inRow1 = document.createElement('div'); inRow1.className = 'tp-row';
+    const vikar = document.createElement('input'); vikar.placeholder='Vikar (navn eller navn (#id))'; vikar.className='tp-input'; vikar.style.flex='1';
+    const vikList = document.createElement('datalist'); vikList.id = 'tpVikarList';
+    vikar.setAttribute('list', vikList.id);
+    inRow1.appendChild(document.createTextNode('Vikar:'));
+    inRow1.appendChild(vikar);
+    inRow1.appendChild(vikList);
+
+    const inRow2 = document.createElement('div'); inRow2.className = 'tp-row';
+    const kunde = document.createElement('input'); kunde.placeholder='Kunde/Team'; kunde.className='tp-input'; kunde.style.flex='1';
+    const vDato = document.createElement('input'); vDato.type='date'; vDato.className='tp-input';
+    const vTid  = document.createElement('input'); vTid.type='time'; vTid.className='tp-input';
+    inRow2.appendChild(document.createTextNode('Kunde:')); inRow2.appendChild(kunde);
+    inRow2.appendChild(document.createTextNode('Dato:'));  inRow2.appendChild(vDato);
+    inRow2.appendChild(document.createTextNode('Tid:'));   inRow2.appendChild(vTid);
+
+    // Resultat chips
+    const resRow = document.createElement('div'); resRow.className='tp-row';
+    resRow.appendChild(document.createTextNode('Resultat:'));
+    let selRes = '';
+    const resOpts = [['Dækket','Dækket'], ['Ikke dækket','Ikke dækket'], ['Booket','Booket'], ['Annulleret','Annulleret'], ['Flyttet','Flyttet'], ['—','']];
+    const resBtns = [];
+    for (const [label,val] of resOpts) {
+      const b = chipBtn(label, val, val===selRes, () => {
+        selRes = val;
+        resBtns.forEach(x => x.classList.toggle('on', x.dataset.value===selRes));
+      });
+      resBtns.push(b); resRow.appendChild(b);
+    }
+
+    // Follow-up chips
+    const fuRow = document.createElement('div'); fuRow.className='tp-row';
+    fuRow.appendChild(document.createTextNode('Følg-op:'));
+    let selFU = '';
+    const fuBtnCustom = chipBtn('Ring kl …','ring', false, () => {
+      const t = prompt('Ring kl. (fx 08:15 eller 12:00)'); if (t) { selFU = 'Ring kl ' + t; syncFU(); }
+    });
+    const fuBtnImorgen = chipBtn('Tjek i morgen','imorgen', false, () => { selFU='Tjek i morgen'; syncFU(); });
+    const fuBtnMandag  = chipBtn('Mandag','mandag', false, () => { selFU='Mandag'; syncFU(); });
+    const fuBtnNone    = chipBtn('Ingen','', true, () => { selFU=''; syncFU(); });
+    function syncFU(){
+      [fuBtnCustom, fuBtnImorgen, fuBtnMandag, fuBtnNone].forEach(b => b.classList.remove('on'));
+      const match = selFU.startsWith('Ring kl') ? fuBtnCustom
+        : selFU==='Tjek i morgen' ? fuBtnImorgen
+        : selFU==='Mandag' ? fuBtnMandag
+        : fuBtnNone;
+      match.classList.add('on');
+    }
+    fuRow.append(fuBtnCustom, fuBtnImorgen, fuBtnMandag, fuBtnNone);
+
+    const note = document.createElement('textarea'); note.placeholder='Kort note (valgfri)'; note.className='tp-input'; note.style.minHeight='44px';
+
+    // Submit row
+    const actRow = document.createElement('div'); actRow.className='tp-row';
+    const addBtn = document.createElement('button'); addBtn.textContent='Tilføj'; addBtn.className='tp-chip'; addBtn.style.fontWeight='600';
+    const copyBtn = document.createElement('button'); copyBtn.textContent='Kopiér som markdown'; copyBtn.className='tp-chip';
+    actRow.append(addBtn, copyBtn);
+
+    form.append(typeRow, inRow1, inRow2, resRow, fuRow, note, actRow);
+    box.appendChild(form);
+
+    const listWrap = document.createElement('div'); listWrap.style.display='flex'; listWrap.style.flexDirection='column'; listWrap.style.gap='6px';
+    const listHdr  = document.createElement('div'); listHdr.style.display='flex'; listHdr.style.alignItems='center'; listHdr.style.justifyContent='space-between';
+    listHdr.innerHTML = '<div style="font-weight:700">Dagens overlevering</div><div id="tpHoCounters" style="font-size:11px;color:#666"></div>';
+    const list = document.createElement('div'); list.id='tpHandoverList'; list.style.display='flex'; list.style.flexDirection='column'; list.style.gap='6px';
+    listWrap.append(listHdr, list);
+    box.appendChild(listWrap);
+
+    // Fill vikar datalist
+    (async () => {
+      await hoEnsureVikarOptions();
+      vikList.innerHTML = HO_VIKAR_OPTIONS.slice(0,500).map(v => {
+        const label = v.name ? `${v.name} (#${v.id})` : `#${v.id}`;
+        return `<option value="${label}"></option>`;
+      }).join('');
+    })();
+
+    // Add handler
+    addBtn.addEventListener('click', () => {
+      const who = hoFindVikarByInput(vikar.value);
+      const entry = {
+        id: hoGenId(),
+        t: Date.now(),
+        type: selType,
+        vikarId: (who.id||'').trim(),
+        vikarName: (who.name||'').trim(),
+        kunde: (kunde.value||'').trim(),
+        vagtDato: (vDato.value||'').trim(),
+        vagtTid:  (vTid.value||'').trim(),
+        resultat: selRes,
+        follow: selFU,
+        note: (note.value||'').trim(),
+        status: 'open'
+      };
+      hoAdd(entry);
+      vikar.value=''; kunde.value=''; vDato.value=''; vTid.value=''; selRes=''; selFU=''; note.value='';
+      resBtns.forEach(x => x.classList.toggle('on', x.dataset.value===selRes));
+      syncFU();
+      renderList();
+    });
+
+    copyBtn.addEventListener('click', () => {
+      const md = hoMarkdown(hoListToday());
+      try {
+        navigator.clipboard.writeText(md);
+        showDOMToast('Overlevering kopieret.');
+      } catch(_) {
+        const ta = document.createElement('textarea'); ta.value = md; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); showDOMToast('Overlevering kopieret.'); } catch(_) {}
+        ta.remove();
+      }
+    });
+
+    function renderCounters(arr){
+      const g = (k) => arr.filter(e => e.type===k).length;
+      const daek = arr.filter(e => e.resultat==='Dækket').length;
+      const idaek = arr.filter(e => e.resultat==='Ikke dækket').length;
+      const syg  = g('sygemelding');
+      const fs   = g('forsinket'); const ns = g('noshow');
+      const open = arr.filter(e => e.status!=='closed').length;
+      const hdr = box.querySelector('#tpHoCounters');
+      hdr.textContent = `Dækket: ${daek} • Ikke dækket: ${idaek} • Syg: ${syg} • For sent/No-show: ${fs+ns} • Åbne: ${open}`;
+    }
+
+    function entryToLine(e){
+      const wrap = document.createElement('div');
+      wrap.className = 'tp-list-item' + (e.status==='closed' ? ' closed' : '');
+      const left = document.createElement('div'); left.style.flex='1';
+
+      const who = document.createElement('span');
+      if (e.vikarId) {
+        who.innerHTML = `<a class="tp-link" target="_blank" rel="noopener" href="/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(e.vikarId)}#stamoplysninger">${e.vikarName || ('#'+e.vikarId)}</a>`;
+      } else if (e.vikarName) {
+        who.textContent = e.vikarName;
+      }
+
+      const info = [];
+      if (e.kunde) info.push(e.kunde);
+      const dt = e.vagtDato ? (e.vagtTid ? `${e.vagtDato} ${e.vagtTid}` : e.vagtDato) : '';
+      if (dt) info.push(dt);
+      const meta = info.join(' • ');
+
+      const head = document.createElement('div');
+      head.innerHTML = `<strong>${labelForType(e.type)}</strong> `;
+      head.appendChild(who);
+      if (meta) head.insertAdjacentHTML('beforeend', ` — ${meta}`);
+      if (e.resultat) head.insertAdjacentHTML('beforeend', ` <span class="tp-pill">${e.resultat}</span>`);
+      if (e.follow)   head.insertAdjacentHTML('beforeend', ` <span class="tp-pill">${e.follow}</span>`);
+
+      const note = document.createElement('div'); note.style.fontSize='11px'; note.style.color='#444'; if (e.note) note.textContent = e.note;
+
+      left.append(head, note);
+
+      const right = document.createElement('div'); right.style.display='flex'; right.style.flexDirection='column'; right.style.gap='4px';
+      const bClose = document.createElement('button'); bClose.className='tp-chip'; bClose.textContent = (e.status==='closed' ? 'Genåbn' : 'Luk');
+      const bDel   = document.createElement('button'); bDel.className='tp-chip'; bDel.textContent='Slet';
+      right.append(bClose, bDel);
+
+      bClose.addEventListener('click', () => {
+        const arr = hoListToday();
+        const idx = arr.findIndex(x => x.id===e.id);
+        if (idx>=0) { arr[idx].status = (arr[idx].status==='closed' ? 'open' : 'closed'); hoUpsertToday(arr); renderList(); }
+      });
+      bDel.addEventListener('click', () => {
+        if (!confirm('Slet denne linje?')) return;
+        const arr = hoListToday().filter(x => x.id!==e.id);
+        hoUpsertToday(arr); renderList();
+      });
+
+      wrap.append(left, right);
+      return wrap;
+    }
+
+    function labelForType(t){
+      switch(t){
+        case 'sygemelding': return 'Sygemelding';
+        case 'forsinket': return 'For sent';
+        case 'noshow': return 'No-show';
+        case 'kunde_annullerede': return 'Kunde annullerede';
+        case 'gendaekket': return 'Gendækket';
+        case 'ikkegendaekket': return 'Ikke gendækket';
+        case 'ring': return 'Ringeaftale';
+        case 'kompetence': return 'Kompetence';
+        case 'klage': return 'Klage/OBS';
+        case 'oekonomi': return 'Økonomi';
+        default: return 'Andet';
+      }
+    }
+
+    function renderList(){
+      const arr = hoListToday();
+      const open = arr.filter(e => e.status!=='closed').sort((a,b)=>a.t-b.t);
+      const closed = arr.filter(e => e.status==='closed').sort((a,b)=>a.t-b.t);
+      list.innerHTML = '';
+      open.forEach(e => list.appendChild(entryToLine(e)));
+      if (closed.length) {
+        const sep = document.createElement('div'); sep.style.fontSize='11px'; sep.style.color='#666'; sep.style.marginTop='4px'; sep.textContent='Afsluttet i dag';
+        list.appendChild(sep);
+        closed.forEach(e => list.appendChild(entryToLine(e)));
+      }
+      renderCounters(arr);
+    }
+
+    renderList();
+  }
+}
+
+/*──────── end OVERLEVERING ────────*/
