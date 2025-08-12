@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.16
-// @description  Push (leader+suppression), toast (Smart/Force DOM, max 1 OS på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, “Søg efter opdatering”, drag af UI + CSV drag&drop, samt SMS (status + aktivér/deaktiver) uden popup i hovedpanelet. Gear i header. Interesse-poller tvinger let GET jævnligt (no-cache). Hurtigere besked-poll (15s) + non-leader hint til leader.
+// @version      7.9.17
+// @description  Push (leader+suppression+pending), toast (Smart/Force DOM, max 1 OS), “Intet Svar”-auto-gem, telefonbog m. caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→GitHub, RAW CSV lookup. Statusbanner, opdateringstjek, drag af UI, SMS (status + aktiver/deaktiver) uden popup i hovedpanelet. Hurtigere besked-poll + non-leader hints. Interesse: HEAD-probe fra non-leaders + jævnlig forced GET på leader.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -22,11 +22,11 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.16';
+const TP_VERSION = '7.9.17';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
-const POLL_MS     = 15000;   // <- 15s (hurtigere besked-poll)
+const POLL_MS     = 15000;   // 15s
 const SUPPRESS_MS = 45000;
 const LOCK_MS     = SUPPRESS_MS + 5000;
 
@@ -152,8 +152,10 @@ function sendPushover(msg) {
 /*──────── 4) STATE + LOCK ────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
-const ST_MSG_KEY = 'tpPushState';
-const ST_INT_KEY = 'tpInterestState';
+
+const ST_MSG_KEY = 'tpPushState';    // {count,lastPush,lastSent,pending}
+const ST_INT_KEY = 'tpInterestState';// {count,lastPush,lastSent,pending}
+
 function loadJson(key, fallback) { try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch (_) { return JSON.parse(JSON.stringify(fallback)); } }
 function saveJsonIfLeader(key, obj) { if (isLeader()) localStorage.setItem(key, JSON.stringify(obj)); }
 function takeLock() {
@@ -188,7 +190,7 @@ function pollMessages() {
   })
   .then(r => r.json())
   .then(d => {
-    const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
+    const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:null});
     const n  = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
     const en = localStorage.getItem('tpPushEnableMsg') === 'true';
 
@@ -198,50 +200,90 @@ function pollMessages() {
       return;
     }
 
-    if (n > stMsg.count && n !== stMsg.lastSent) {
-      const canPush = (Date.now() - stMsg.lastPush > SUPPRESS_MS) && takeLock();
-      if (canPush) {
+    // Pending-aware suppression
+    const now = Date.now();
+    const canPushNow = (now - stMsg.lastPush > SUPPRESS_MS) && takeLock();
+
+    if (n > stMsg.count) {
+      if (canPushNow) {
         const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
-        if (en) sendPushover(m);
-        broadcastToast('msg', m);
-        showToastOnce('msg', m);
-        stMsg.lastPush = Date.now(); stMsg.lastSent = n;
-      } else stMsg.lastSent = n;
-    } else if (n < stMsg.count) { stMsg.lastPush = 0; }
+        if (en) sendPushover(m); broadcastToast('msg', m); showToastOnce('msg', m);
+        stMsg.lastPush = now; stMsg.lastSent = n; stMsg.pending = null;
+      } else {
+        stMsg.pending = n; // husk at vi skylder en push
+      }
+    } else if (stMsg.pending && n >= stMsg.pending && canPushNow) {
+      const m = '🔔 Du har nu ' + stMsg.pending + ' ulæst(e) Temponizer-besked(er).';
+      if (en) sendPushover(m); broadcastToast('msg', m); showToastOnce('msg', m);
+      stMsg.lastPush = now; stMsg.lastSent = stMsg.pending; stMsg.pending = null;
+    }
+
+    if (n < stMsg.count) { stMsg.lastPush = 0; stMsg.pending = null; }
     stMsg.count = n; saveJsonIfLeader(ST_MSG_KEY, stMsg);
     console.info('[TP-besked]', n, new Date().toLocaleTimeString());
   })
   .catch(e => console.warn('[TP][ERR][MSG]', e));
 }
 
-/* Interesse – HEAD + tvungen let GET jævnligt (no-cache) */
+/* Interesse — leader gør fuld parse; non-leaders laver HEAD-probe + hint */
 const HTML_URL = location.origin + '/index.php?page=freevagter';
-let lastETag = localStorage.getItem('tpLastETag') || null;
-const INT_FORCE_GET_MS = 120000; // tving fuld GET mindst hver 2 min
+let lastETagLeader = localStorage.getItem('tpLastETag') || null;
+const INT_FORCE_GET_MS = 120000; // tving fuld GET mindst hver 2 min på leader
 let lastInterestFullParse = Number(localStorage.getItem('tpIntLastFull') || 0);
 
-function pollInterest() {
-  if (!isLeader()) return;
+const INT_HINT_KEY = 'tpIntHintV1';
+let intHintLocalTs = 0;
+function hintLeaderInterest() {
+  const now = Date.now();
+  if (now - intHintLocalTs < 10000) return;
+  intHintLocalTs = now;
+  try { localStorage.setItem(INT_HINT_KEY, String(now)); } catch(_) {}
+}
+window.addEventListener('storage', (e) => {
+  if (e.key === INT_HINT_KEY && isLeader()) {
+    try { pollInterest(true); } catch (_) {}
+  }
+});
 
-  const forceGet = (Date.now() - lastInterestFullParse) > INT_FORCE_GET_MS;
+let nlLastETag = null;
+function pollInterest(forceByHint = false) {
+  const isL = isLeader();
+  const forceGetLeader = (Date.now() - lastInterestFullParse) > INT_FORCE_GET_MS;
 
+  // Non-leader: HEAD-probe kun; hint leader ved ændring
+  if (!isL) {
+    fetch(HTML_URL, {
+      method: 'HEAD', credentials: 'same-origin', cache: 'no-store',
+      headers: { 'Cache-Control':'no-cache','Pragma':'no-cache', ...(nlLastETag ? {'If-None-Match': nlLastETag} : {}) }
+    })
+    .then(h => {
+      const et = h.headers.get('ETag') || null;
+      const changed = et && nlLastETag && et !== nlLastETag;
+      nlLastETag = et || nlLastETag || null;
+      if (h.status !== 304 || changed) hintLeaderInterest();
+    })
+    .catch(()=>{ /* no-op */ });
+    return;
+  }
+
+  // Leader: HEAD + betinget GET (eller hvis hint/force)
   fetch(HTML_URL, {
     method: 'HEAD',
     credentials: 'same-origin',
     cache: 'no-store',
     headers: {
-      ...(lastETag ? { 'If-None-Match': lastETag } : {}),
+      ...(lastETagLeader ? { 'If-None-Match': lastETagLeader } : {}),
       'Cache-Control': 'no-cache',
       'Pragma': 'no-cache'
     }
   })
   .then(h => {
     const et = h.headers.get('ETag') || null;
-    const etChanged = et && et !== lastETag;
-    lastETag = et;
-    if (lastETag) localStorage.setItem('tpLastETag', lastETag);
+    const etChanged = et && et !== lastETagLeader;
+    lastETagLeader = et;
+    if (lastETagLeader) localStorage.setItem('tpLastETag', lastETagLeader);
 
-    if (h.status !== 304 || etChanged || forceGet) {
+    if (h.status !== 304 || etChanged || forceGetLeader || forceByHint) {
       return fetch(HTML_URL, {
         credentials: 'same-origin',
         cache: 'no-store',
@@ -271,17 +313,27 @@ function parseInterestHTML(html) {
   lastInterestFullParse = Date.now();
   localStorage.setItem('tpIntLastFull', String(lastInterestFullParse));
 
-  const stInt = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0});
+  const stInt = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0,pending:null});
   const en = localStorage.getItem('tpPushEnableInt') === 'true';
-  if (c > stInt.count && c !== stInt.lastSent) {
-    if (Date.now() - stInt.lastPush > SUPPRESS_MS && takeLock()) {
+
+  const now = Date.now();
+  const canPushNow = (now - stInt.lastPush > SUPPRESS_MS) && takeLock();
+
+  if (c > stInt.count) {
+    if (canPushNow) {
       const m = '👀 ' + c + ' vikar(er) har vist interesse for ledige vagter';
-      if (en) sendPushover(m);
-      broadcastToast('int', m);
-      showToastOnce('int', m);
-      stInt.lastPush = Date.now(); stInt.lastSent = c;
-    } else stInt.lastSent = c;
-  } else if (c < stInt.count) stInt.lastPush = 0;
+      if (en) sendPushover(m); broadcastToast('int', m); showToastOnce('int', m);
+      stInt.lastPush = now; stInt.lastSent = c; stInt.pending = null;
+    } else {
+      stInt.pending = c;
+    }
+  } else if (stInt.pending && c >= stInt.pending && canPushNow) {
+    const m = '👀 ' + stInt.pending + ' vikar(er) har vist interesse for ledige vagter';
+    if (en) sendPushover(m); broadcastToast('int', m); showToastOnce('int', m);
+    stInt.lastPush = now; stInt.lastSent = stInt.pending; stInt.pending = null;
+  }
+
+  if (c < stInt.count) { stInt.lastPush = 0; stInt.pending = null; }
   stInt.count = c; saveJsonIfLeader(ST_INT_KEY, stInt);
   console.info('[TP-interesse]', c, new Date().toLocaleTimeString());
 }
@@ -788,7 +840,7 @@ function injectUI() {
   m.onchange = () => localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false');
   i.onchange = () => localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false');
 
-  // ── SMS UI (kun status + én knap)
+  // ── SMS UI
   const smsAction  = d.querySelector('#smsAction');
   const smsTag     = d.querySelector('#smsTag');
 
@@ -814,7 +866,7 @@ function injectUI() {
   });
   (async () => { smsSetBusy(true, 'indlæser…'); await sms.refresh(smsRender); smsSetBusy(false); })();
 
-  // ── Gear menu (forankret ved panelet)
+  // ── Gear menu
   let menu = null; const gearBtn = d.querySelector('#tpGearBtn');
   function buildMenu() {
     if (menu) return menu;
@@ -851,7 +903,6 @@ function injectUI() {
           '<input id="tpCSVFile" type="file" accept=".csv" style="flex:1"/>' +
           '<button id="tpUploadCSV" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Upload CSV → GitHub</button>' +
         '</div>' +
-        '<div id="tpCSVDrop" style="margin-top:8px;padding:10px;border:2px dashed #ccc;border-radius:6px;text-align:center;color:#666">Eller træk & slip CSV her</div>' +
         '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
           '<button id="tpFetchCSVUpload" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">⚡ Hent Excel → CSV + Upload</button>' +
         '</div>' +
@@ -861,6 +912,9 @@ function injectUI() {
         '</div>' +
         '<div id="tpPBHint" style="margin-top:6px;font-size:11px;color:#666"></div>' +
       '</div>' +
+
+      '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
+      '<button id="tpTestPushoverBtn" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🧪 Test Pushover (Besked + Interesse)</button>' +
 
       '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
       '<button id="tpCheckUpdate" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🔄 Søg efter opdatering</button>' +
@@ -894,7 +948,6 @@ function injectUI() {
     const tIn   = menu.querySelector('#tpTestPhone');
     const tBtn  = menu.querySelector('#tpLookupPhone');
     const pbh   = menu.querySelector('#tpPBHint');
-    const drop  = menu.querySelector('#tpCSVDrop');
 
     pat.value = (GM_getValue('tpGitPAT') || '');
     pat.addEventListener('change', () => GM_setValue('tpGitPAT', pat.value || ''));
@@ -915,40 +968,12 @@ function injectUI() {
       try { if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
             const text = await file.files[0].text(); await uploadCSVText(text); } catch (e) { console.warn('[TP][PB][CSV-UPLOAD-BTN]', e); }
     });
-    function setDropActive(on) { drop.style.borderColor = on ? '#2e7' : '#ccc'; drop.style.color = on ? '#2e7' : '#666'; }
-    drop.addEventListener('dragover', e => { e.preventDefault(); setDropActive(true); });
-    drop.addEventListener('dragenter', e => { e.preventDefault(); setDropActive(true); });
-    drop.addEventListener('dragleave', e => { e.preventDefault(); setDropActive(false); });
-    drop.addEventListener('drop', async e => {
-      e.preventDefault(); setDropActive(false);
-      const dt = e.dataTransfer; if (!dt || !dt.files || !dt.files[0]) return;
-      const f = dt.files[0]; if (!/\.csv$/i.test(f.name)) { showToast('Træk en .csv-fil ind.'); return; }
-      const text = await f.text(); await uploadCSVText(text);
-    });
 
-    csvUp.addEventListener('click', async () => {
-      try { pbh.textContent = 'Henter Excel (GET/POST), vælger bedste ark og uploader CSV …';
-            const t0 = Date.now(); await fetchExcelAsCSVAndUpload();
-            pbh.textContent = `Færdig på ${Date.now()-t0} ms.`; }
-      catch (e) { console.warn('[TP][PB][EXCEL→CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel→CSV upload.'; showToast('Fejl – se konsol.'); }
-    });
+    // Pushover TEST
+    const test = menu.querySelector('#tpTestPushoverBtn');
+    test.addEventListener('click', () => { tpTestPushoverBoth(); menu.style.display='none'; });
 
-    tBtn.addEventListener('click', async () => {
-      try {
-        const raw = (tIn.value||'').trim(); const p8 = normPhone(raw);
-        if (!p8) { pbh.textContent = 'Ugyldigt nummer.'; return; }
-        pbh.textContent = 'Slår op i CSV…';
-        let csv = ''; try { csv = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now()); if (csv) GM_setValue(CACHE_KEY_CSV, csv); } catch(_) {}
-        if (!csv) csv = GM_getValue(CACHE_KEY_CSV) || '';
-        const { map } = parsePhonebookCSV(csv);
-        const rec = map.get(p8);
-        if (!rec) { pbh.textContent = `Ingen match for ${p8}.`; return; }
-        pbh.textContent = `Match: ${p8} → ${rec.name || '(uden navn)'} (vikar_id=${rec.id})`;
-        const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
-        window.open(url, '_blank', 'noopener');
-      } catch(e) { console.warn('[TP][PB][LOOKUP]', e); pbh.textContent = 'Fejl ved opslag.'; }
-    });
-
+    // Opdateringstjek
     const chk = menu.querySelector('#tpCheckUpdate');
     chk.addEventListener('click', async () => {
       try {
@@ -982,9 +1007,10 @@ function injectUI() {
   d.querySelector('#tpGearBtn').addEventListener('click', toggleMenu);
   document.addEventListener('mousedown', e => {
     const gearBtn = d.querySelector('#tpGearBtn');
+    const menu = document.querySelector('#tpPanel + div[style*="position: fixed"]');
     if (menu && menu.style.display === 'block' && e.target !== menu && !menu.contains(e.target) && e.target !== gearBtn) menu.style.display = 'none';
   });
-  window.addEventListener('resize', () => { ensureFullyVisible(d); if (menu && menu.style.display === 'block') positionMenu(menu); });
+  window.addEventListener('resize', () => { ensureFullyVisible(d); const menu = document.querySelector('#tpPanel + div[style*="position: fixed"]'); if (menu && menu.style.display === 'block') positionMenu(menu); });
 }
 
 /* Test-knap */
@@ -1001,7 +1027,7 @@ function tpTestPushoverBoth(){
 document.addEventListener('click', e => {
   const a = e.target.closest && e.target.closest('a');
   if (a && /Beskeder/.test(a.textContent || '')) {
-    if (isLeader()) { const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0}); stMsg.lastPush = stMsg.lastSent = 0; saveJsonIfLeader(ST_MSG_KEY, stMsg); }
+    if (isLeader()) { const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:null}); stMsg.lastPush = stMsg.lastSent = 0; stMsg.pending=null; saveJsonIfLeader(ST_MSG_KEY, stMsg); }
   }
 });
 tryBecomeLeader();
@@ -1017,8 +1043,8 @@ console.info('[TP] kører version', TP_VERSION);
 // Øjeblikkelig re-poll når fanen bliver synlig
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
-    if (isLeader()) { try { pollMessages(); } catch(_){} }
-    else { hintLeaderNow(); }
+    if (isLeader()) { try { pollMessages(); pollInterest(true); } catch(_){} }
+    else { hintLeaderNow(); hintLeaderInterest(); }
   }
 });
 
