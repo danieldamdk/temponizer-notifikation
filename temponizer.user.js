@@ -1078,9 +1078,21 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-/*──────── 15) HOVER “Intet Svar” (robust) ────────*/
+/*──────── 15) HOVER “Intet Svar” (stealth + robust close) ────────*/
 (function () {
-  let auto = false, iconEl = null, menu = null, hideT = null;
+  let auto = false, iconEl = null, menu = null, hideT = null, stealthCssEl = null;
+
+  function stealthOn() {
+    if (stealthCssEl) return;
+    stealthCssEl = document.createElement('style');
+    stealthCssEl.id = 'tpIntetSvarStealth';
+    stealthCssEl.textContent = `
+      .highslide-container, .highslide-container * { opacity:0 !important; pointer-events:none !important; }
+      .ui-dialog, .ui-dialog * { opacity:0 !important; pointer-events:none !important; }
+    `;
+    document.head.appendChild(stealthCssEl);
+  }
+  function stealthOff() { if (stealthCssEl) { stealthCssEl.remove(); stealthCssEl = null; } }
 
   function getClickable(el){ return el && el.closest ? (el.closest('a[href],button,[onclick]') || el) : el; }
   function findIcon(n) {
@@ -1104,6 +1116,7 @@ document.addEventListener('visibilitychange', () => {
     btn.onmouseleave = () => { btn.style.background = ''; };
     btn.onclick = function () {
       auto = true;
+      stealthOn(); // skjul dialog visuelt fra start
       if (iconEl) {
         const target = getClickable(iconEl);
         try { target.dispatchEvent(new MouseEvent('click', { bubbles:true, cancelable:true, view:window })); }
@@ -1150,12 +1163,20 @@ document.addEventListener('visibilitychange', () => {
       Array.from(root.querySelectorAll('button')).find(b => /gem registrering/i.test(b.textContent||'') || /^\s*gem\s*$/i.test(b.textContent||''))
     ) || null;
   }
+  function tryCloseDialog() {
+    // klik på kendte close-knapper hvis de findes
+    const closeBtn = document.querySelector('.highslide-container .highslide-close, .ui-dialog .ui-dialog-titlebar-close');
+    if (closeBtn) { try { closeBtn.click(); } catch(_) {} }
+    // forsøg hs.close()
+    try { if (unsafeWindow.hs && typeof unsafeWindow.hs.close === 'function') unsafeWindow.hs.close(); } catch(_){}
+  }
 
   new MutationObserver((ml) => {
     if (!auto) return;
     for (const m of ml) {
       for (const n of m.addedNodes) {
         if (!(n instanceof HTMLElement)) continue;
+        // find container og textarea
         const container = (n.closest && (n.closest('.highslide-body, .highslide-container, .modal, .ui-dialog, body') || n)) || n;
         const ta = container.querySelector && container.querySelector(TEXTAREA_SEL);
         if (ta) {
@@ -1164,7 +1185,15 @@ document.addEventListener('visibilitychange', () => {
           if (btn) {
             setTimeout(() => {
               try { btn.click(); } catch(_) {}
-              try { if (unsafeWindow.hs && unsafeWindow.hs.close) unsafeWindow.hs.close(); } catch(_) {}
+              // forsøg at lukke — og bliv ved få øjeblikke hvis nødvendig
+              let tries = 0;
+              const tick = () => {
+                tryCloseDialog();
+                const stillOpen = document.querySelector('.highslide-container, .ui-dialog');
+                if (!stillOpen || ++tries > 20) { stealthOff(); return; }
+                setTimeout(tick, 50);
+              };
+              setTimeout(tick, 50);
             }, 30);
             auto = false;
             return;
