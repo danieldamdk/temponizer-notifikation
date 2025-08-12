@@ -1077,7 +1077,8 @@ function injectUI() {
   }
   function escClose(e){ if (e.key === 'Escape') closeMenu(); }
 
-  const gearBtn = d.querySelector('#tpGearBtn');
+// gearBtn er allerede defineret længere oppe i injectUI()
+
   gearBtn.addEventListener('click', toggleMenu);
   window.addEventListener('resize', () => {
     ensureFullyVisible(d);
