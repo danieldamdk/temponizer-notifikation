@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.17
-// @description  Push (leader+suppression+pending), toast (Smart/Force DOM, max 1 OS), “Intet Svar”-auto-gem, telefonbog m. caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→GitHub, RAW CSV lookup. Statusbanner, opdateringstjek, drag af UI, SMS (status + aktiver/deaktiver) uden popup i hovedpanelet. Hurtigere besked-poll + non-leader hints. Interesse: HEAD-probe fra non-leaders + jævnlig forced GET på leader.
+// @version      7.9.18
+// @description  Mere robuste notifikationer: alle faner poller (jitter), fælles lock (max 1 OS/Pushover), pending-suppression så intet glipper. Smart/Force toast, “Intet Svar”-auto, caller-pop (kun kø *1500, nyt faneblad, nul flash), Excel→CSV→GitHub, RAW CSV, SMS status/toggle uden popup, dragbart UI, gear-fix & luk med Esc/klik. Auto-opdatering.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -22,11 +22,12 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.17';
+const TP_VERSION = '7.9.18';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
-const POLL_MS     = 15000;   // 15s
+const POLL_MS_LEADER     = 15000;  // 15s
+const POLL_MS_NONLEADER  = 30000;  // 30s (skåner lidt)
 const SUPPRESS_MS = 45000;
 const LOCK_MS     = SUPPRESS_MS + 5000;
 
@@ -108,7 +109,8 @@ window.addEventListener('storage', e => {
     const seenKey = 'tpToastSeen_' + ev.id;
     if (localStorage.getItem(seenKey)) return;
     localStorage.setItem(seenKey, '1');
-    if (!isLeader()) showDOMToast(ev.msg); // non-leader viser altid DOM
+    // Non-leaders viser altid DOM (OS kun fra den, der vandt lock)
+    if (!isLeader()) showDOMToast(ev.msg);
   } catch (_) {}
 });
 
@@ -157,32 +159,49 @@ const ST_MSG_KEY = 'tpPushState';    // {count,lastPush,lastSent,pending}
 const ST_INT_KEY = 'tpInterestState';// {count,lastPush,lastSent,pending}
 
 function loadJson(key, fallback) { try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch (_) { return JSON.parse(JSON.stringify(fallback)); } }
-function saveJsonIfLeader(key, obj) { if (isLeader()) localStorage.setItem(key, JSON.stringify(obj)); }
+function saveJson(key, obj)       { localStorage.setItem(key, JSON.stringify(obj)); }
 function takeLock() {
   const l = JSON.parse(localStorage.getItem('tpPushLock') || '{"t":0}');
   if (Date.now() - l.t < LOCK_MS) return false;
   localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() })); return true;
 }
 
-/*──────── 5) POLLERS ────────*/
-// — Besked: leader-hint så non-leaders kan trigge hurtig poll —
-const MSG_HINT_KEY = 'tpMsgHintV1';
-let msgHintLocalTs = 0;
-function hintLeaderNow() {
+/*──────── 5) NOTIFY HELPERS (fælles for MSG/INT) ────────*/
+function handleCount(channel, newCount, enableKey, stateKey, msgBuilder) {
+  const st = loadJson(stateKey, {count:0,lastPush:0,lastSent:0,pending:null});
+  const enabled = localStorage.getItem(enableKey) === 'true';
   const now = Date.now();
-  if (now - msgHintLocalTs < 10000) return; // rate-limit 10s
-  msgHintLocalTs = now;
-  try { localStorage.setItem(MSG_HINT_KEY, String(now)); } catch (_) {}
-}
-window.addEventListener('storage', (e) => {
-  if (e.key === MSG_HINT_KEY && isLeader()) {
-    try { pollMessages(); } catch (_) {}
-  }
-});
+  const canPushNow = (now - st.lastPush > SUPPRESS_MS) && takeLock();
 
-let _nlLastMsg = 0; // non-leader sidste set
-function pollMessages() {
-  const isL = isLeader();
+  if (newCount > st.count) {
+    if (canPushNow) {
+      const text = msgBuilder(newCount);
+      if (enabled) sendPushover(text);
+      broadcastToast(channel, text);
+      showToastOnce(channel, text);
+      st.lastPush = now; st.lastSent = newCount; st.pending = null;
+    } else {
+      st.pending = newCount; // husk vi skylder en push
+    }
+  } else if (st.pending && newCount >= st.pending && canPushNow) {
+    const text = msgBuilder(st.pending);
+    if (enabled) sendPushover(text);
+    broadcastToast(channel, text);
+    showToastOnce(channel, text);
+    st.lastPush = now; st.lastSent = st.pending; st.pending = null;
+  }
+
+  if (newCount < st.count) { st.lastPush = 0; st.pending = null; }
+  st.count = newCount; saveJson(stateKey, st);
+}
+
+/*──────── 6) POLLERS ────────*/
+function jitter(base) {
+  const j = Math.floor(Math.random()*0.25*base); // 0-25% jitter
+  return base + j;
+}
+
+function pollMessages(tabRole = 'leader') {
   fetch(MSG_URL + '&ts=' + Date.now(), {
     credentials: 'same-origin',
     cache: 'no-store',
@@ -190,155 +209,71 @@ function pollMessages() {
   })
   .then(r => r.json())
   .then(d => {
-    const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:null});
     const n  = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
-    const en = localStorage.getItem('tpPushEnableMsg') === 'true';
-
-    if (!isL) {
-      if (n > _nlLastMsg) hintLeaderNow(); // bed leader om at poll’e nu
-      _nlLastMsg = n;
-      return;
-    }
-
-    // Pending-aware suppression
-    const now = Date.now();
-    const canPushNow = (now - stMsg.lastPush > SUPPRESS_MS) && takeLock();
-
-    if (n > stMsg.count) {
-      if (canPushNow) {
-        const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
-        if (en) sendPushover(m); broadcastToast('msg', m); showToastOnce('msg', m);
-        stMsg.lastPush = now; stMsg.lastSent = n; stMsg.pending = null;
-      } else {
-        stMsg.pending = n; // husk at vi skylder en push
-      }
-    } else if (stMsg.pending && n >= stMsg.pending && canPushNow) {
-      const m = '🔔 Du har nu ' + stMsg.pending + ' ulæst(e) Temponizer-besked(er).';
-      if (en) sendPushover(m); broadcastToast('msg', m); showToastOnce('msg', m);
-      stMsg.lastPush = now; stMsg.lastSent = stMsg.pending; stMsg.pending = null;
-    }
-
-    if (n < stMsg.count) { stMsg.lastPush = 0; stMsg.pending = null; }
-    stMsg.count = n; saveJsonIfLeader(ST_MSG_KEY, stMsg);
-    console.info('[TP-besked]', n, new Date().toLocaleTimeString());
+    handleCount('msg', n, 'tpPushEnableMsg', ST_MSG_KEY, (c)=>'🔔 Du har nu ' + c + ' ulæst(e) Temponizer-besked(er).');
+    console.info('[TP-besked]['+tabRole+']', n, new Date().toLocaleTimeString());
   })
-  .catch(e => console.warn('[TP][ERR][MSG]', e));
+  .catch(e => console.warn('[TP][ERR][MSG]['+tabRole+']', e));
 }
 
-/* Interesse — leader gør fuld parse; non-leaders laver HEAD-probe + hint */
+/* Interesse — alle faner: HEAD; ved ændring/force → GET+parse i fanen selv */
 const HTML_URL = location.origin + '/index.php?page=freevagter';
-let lastETagLeader = localStorage.getItem('tpLastETag') || null;
-const INT_FORCE_GET_MS = 120000; // tving fuld GET mindst hver 2 min på leader
+const INT_FORCE_GET_MS = 120000; // tving fuld GET mindst hver 2 min
 let lastInterestFullParse = Number(localStorage.getItem('tpIntLastFull') || 0);
+let lastETagSeen = null;
 
-const INT_HINT_KEY = 'tpIntHintV1';
-let intHintLocalTs = 0;
-function hintLeaderInterest() {
-  const now = Date.now();
-  if (now - intHintLocalTs < 10000) return;
-  intHintLocalTs = now;
-  try { localStorage.setItem(INT_HINT_KEY, String(now)); } catch(_) {}
-}
-window.addEventListener('storage', (e) => {
-  if (e.key === INT_HINT_KEY && isLeader()) {
-    try { pollInterest(true); } catch (_) {}
-  }
-});
+function pollInterest(tabRole='leader') {
+  const mustForce = (Date.now() - lastInterestFullParse) > INT_FORCE_GET_MS;
 
-let nlLastETag = null;
-function pollInterest(forceByHint = false) {
-  const isL = isLeader();
-  const forceGetLeader = (Date.now() - lastInterestFullParse) > INT_FORCE_GET_MS;
-
-  // Non-leader: HEAD-probe kun; hint leader ved ændring
-  if (!isL) {
-    fetch(HTML_URL, {
-      method: 'HEAD', credentials: 'same-origin', cache: 'no-store',
-      headers: { 'Cache-Control':'no-cache','Pragma':'no-cache', ...(nlLastETag ? {'If-None-Match': nlLastETag} : {}) }
-    })
-    .then(h => {
-      const et = h.headers.get('ETag') || null;
-      const changed = et && nlLastETag && et !== nlLastETag;
-      nlLastETag = et || nlLastETag || null;
-      if (h.status !== 304 || changed) hintLeaderInterest();
-    })
-    .catch(()=>{ /* no-op */ });
-    return;
-  }
-
-  // Leader: HEAD + betinget GET (eller hvis hint/force)
   fetch(HTML_URL, {
     method: 'HEAD',
     credentials: 'same-origin',
     cache: 'no-store',
     headers: {
-      ...(lastETagLeader ? { 'If-None-Match': lastETagLeader } : {}),
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache'
+      ...(lastETagSeen ? { 'If-None-Match': lastETagSeen } : {}),
+      'Cache-Control':'no-cache','Pragma':'no-cache'
     }
   })
   .then(h => {
     const et = h.headers.get('ETag') || null;
-    const etChanged = et && et !== lastETagLeader;
-    lastETagLeader = et;
-    if (lastETagLeader) localStorage.setItem('tpLastETag', lastETagLeader);
-
-    if (h.status !== 304 || etChanged || forceGetLeader || forceByHint) {
+    const changed = et && et !== lastETagSeen;
+    lastETagSeen = et || lastETagSeen || null;
+    if (h.status !== 304 || changed || mustForce) {
       return fetch(HTML_URL, {
         credentials: 'same-origin',
         cache: 'no-store',
         headers: { Range: 'bytes=0-20000', 'Cache-Control':'no-cache', 'Pragma':'no-cache' }
-      }).then(r => r.text()).then(parseInterestHTML);
+      }).then(r => r.text()).then(html => {
+        const doc   = new DOMParser().parseFromString(html, 'text/html');
+        const boxes = Array.prototype.slice.call(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
+        const c = boxes.reduce((s, el) => { const v = parseInt(el.textContent.trim(), 10); return s + (isNaN(v) ? 0 : v); }, 0);
+        lastInterestFullParse = Date.now(); localStorage.setItem('tpIntLastFull', String(lastInterestFullParse));
+        handleCount('int', c, 'tpPushEnableInt', ST_INT_KEY, (x)=>'👀 ' + x + ' vikar(er) har vist interesse for ledige vagter');
+        console.info('[TP-interesse]['+tabRole+']', c, new Date().toLocaleTimeString());
+      });
     } else {
-      console.info('[TP-interesse] 304 (skipper) •', new Date().toLocaleTimeString());
+      console.info('[TP-interesse]['+tabRole+'] 304', new Date().toLocaleTimeString());
     }
   })
   .catch(e => {
-    console.warn('[TP][ERR][INT][HEAD]', e);
+    console.warn('[TP][ERR][INT]['+tabRole+'][HEAD]', e);
+    // fallback: prøv en let GET én gang
     fetch(HTML_URL, {
       credentials: 'same-origin',
       cache: 'no-store',
       headers: { Range: 'bytes=0-20000', 'Cache-Control':'no-cache', 'Pragma':'no-cache' }
-    }).then(r => r.text()).then(parseInterestHTML)
-     .catch(err => console.warn('[TP][ERR][INT][GET]', err));
+    }).then(r => r.text()).then(html => {
+      const doc   = new DOMParser().parseFromString(html, 'text/html');
+      const boxes = Array.prototype.slice.call(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
+      const c = boxes.reduce((s, el) => { const v = parseInt(el.textContent.trim(), 10); return s + (isNaN(v) ? 0 : v); }, 0);
+      lastInterestFullParse = Date.now(); localStorage.setItem('tpIntLastFull', String(lastInterestFullParse));
+      handleCount('int', c, 'tpPushEnableInt', ST_INT_KEY, (x)=>'👀 ' + x + ' vikar(er) har vist interesse for ledige vagter');
+      console.info('[TP-interesse]['+tabRole+'] (fallback)', c, new Date().toLocaleTimeString());
+    }).catch(()=>{});
   });
 }
 
-function parseInterestHTML(html) {
-  if (!isLeader()) return;
-  const doc   = new DOMParser().parseFromString(html, 'text/html');
-  const boxes = Array.prototype.slice.call(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
-  const c = boxes.reduce((s, el) => { const v = parseInt(el.textContent.trim(), 10); return s + (isNaN(v) ? 0 : v); }, 0);
-
-  lastInterestFullParse = Date.now();
-  localStorage.setItem('tpIntLastFull', String(lastInterestFullParse));
-
-  const stInt = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0,pending:null});
-  const en = localStorage.getItem('tpPushEnableInt') === 'true';
-
-  const now = Date.now();
-  const canPushNow = (now - stInt.lastPush > SUPPRESS_MS) && takeLock();
-
-  if (c > stInt.count) {
-    if (canPushNow) {
-      const m = '👀 ' + c + ' vikar(er) har vist interesse for ledige vagter';
-      if (en) sendPushover(m); broadcastToast('int', m); showToastOnce('int', m);
-      stInt.lastPush = now; stInt.lastSent = c; stInt.pending = null;
-    } else {
-      stInt.pending = c;
-    }
-  } else if (stInt.pending && c >= stInt.pending && canPushNow) {
-    const m = '👀 ' + stInt.pending + ' vikar(er) har vist interesse for ledige vagter';
-    if (en) sendPushover(m); broadcastToast('int', m); showToastOnce('int', m);
-    stInt.lastPush = now; stInt.lastSent = stInt.pending; stInt.pending = null;
-  }
-
-  if (c < stInt.count) { stInt.lastPush = 0; stInt.pending = null; }
-  stInt.count = c; saveJsonIfLeader(ST_INT_KEY, stInt);
-  console.info('[TP-interesse]', c, new Date().toLocaleTimeString());
-}
-
-/*──────── 6) LEADER-ELECTION ────────*/
+/*──────── 7) LEADER-ELECTION ────────*/
 function now() { return Date.now(); }
 function getLeader() { try { return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null'); } catch (_) { return null; } }
 function setLeader(obj) { localStorage.setItem(LEADER_KEY, JSON.stringify(obj)); }
@@ -347,7 +282,7 @@ function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.unti
 function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
 window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*no-op*/} });
 
-/*──────── 6a) HTTP helpers ────────*/
+/*──────── 8) HTTP helpers ────────*/
 function gmGET(url) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
@@ -392,7 +327,7 @@ function gmPOSTArrayBuffer(url, body) {
   });
 }
 
-/*──────── 6b) CALLER-POP ────────*/
+/*──────── 9) CALLER-POP ────────*/
 function normPhone(raw) {
   const digits = String(raw||'').replace(/\D/g,'').replace(/^0+/, '').replace(/^45/, '');
   return digits.length >= 8 ? digits.slice(-8) : '';
@@ -501,9 +436,9 @@ async function callerPopIfNeeded() {
   }
 }
 
-/*──────── 6c) GITHUB API ────────*/
+/*──────── 10) GITHUB API + Excel→CSV (uændret i forhold til 7.9.17, minus drag-drop i UI) ────────*/
 function b64encodeUtf8(str) { const bytes = new TextEncoder().encode(str); let bin=''; bytes.forEach(b=>bin+=String.fromCharCode(b)); return btoa(bin); }
-function ghGetSha(owner, repo, path, ref) {
+async function ghGetSha(owner, repo, path, ref) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`;
   const token = (GM_getValue('tpGitPAT') || '').trim();
   return new Promise((resolve, reject) => {
@@ -519,7 +454,7 @@ function ghGetSha(owner, repo, path, ref) {
     });
   });
 }
-function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
+async function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`;
   const token = (GM_getValue('tpGitPAT') || '').trim();
   return new Promise((resolve, reject) => {
@@ -532,8 +467,6 @@ function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
     });
   });
 }
-
-/*──────── 6d) EXCEL → CSV ────────*/
 function normalizePhonebookHeader(csv) {
   const lines = csv.split(/\r?\n/); if (!lines.length) return csv;
   const hdr = (lines[0] || '').split(',');
@@ -556,7 +489,6 @@ function pickBestSheetCSV(wb) {
     csv = normalizePhonebookHeader(csv);
     const lines = csv.trim().split(/\r?\n/).filter(Boolean);
     const dataRows = Math.max(0, lines.length - 1);
-    console.info('[TP][PB] Sheet:', name, 'rows:', dataRows);
     if (dataRows > best.rows) best = { rows: dataRows, csv };
   }
   return best.rows >= 1 ? best.csv : null;
@@ -576,22 +508,16 @@ async function fetchExcelAsCSVText() {
     { fn: tryExcelPOST, params: 'id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag' },
     { fn: tryExcelPOST, params: 'id=true&name=true&phone=true&cellphone=true' },
   ];
-  let lastInfo = '';
   for (const t of tries) {
     try {
       const ab = await t.fn(t.params);
-      if (!ab || ab.byteLength < 128) { lastInfo = 'too small'; continue; }
+      if (!ab || ab.byteLength < 128) continue;
       const wb = XLSX.read(ab, { type: 'array' });
-      if (!wb.SheetNames || wb.SheetNames.length === 0) { lastInfo = 'no sheets'; continue; }
+      if (!wb.SheetNames || wb.SheetNames.length === 0) continue;
       const csv = pickBestSheetCSV(wb);
       if (csv) return csv;
-      lastInfo = 'sheets found but header-only';
-    } catch (e) {
-      console.warn('[TP][PB] Excel hentning fejlede:', e);
-      lastInfo = String(e && e.message || e);
-    }
+    } catch (_) {}
   }
-  console.warn('[TP][PB] Excel→CSV mislykkedes. Sidste info:', lastInfo);
   return null;
 }
 async function fetchExcelAsCSVAndUpload() {
@@ -606,9 +532,8 @@ async function fetchExcelAsCSVAndUpload() {
   showToastOnce('csvok', 'CSV uploadet (Excel→CSV).');
 }
 
-/*──────── 6e) SMS (status + aktivér/deaktiver) — uden popup + uden toast ────────*/
+/*──────── 11) SMS (status + aktivér/deaktiver) — uden popup ────────*/
 const SMS_SETTINGS_URL = `${location.origin}/index.php?page=showmy_settings`;
-
 function hasDisplayBlock(el) {
   if (!el) return false;
   const s = (el.getAttribute('style') || '').replace(/\s+/g,'').toLowerCase();
@@ -621,12 +546,8 @@ function parseSmsStatusFromDoc(doc) {
   const elInaktiv = doc.getElementById('sms_notifikation_ikke_aktiv');
   const aktivShown   = hasDisplayBlock(elAktiv);
   const inaktivShown = hasDisplayBlock(elInaktiv);
-
-  const hasDeactivateLink = !!(doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') ||
-                               doc.querySelector('#sms_notifikation_aktiv a[href*="deactivate_cell_sms_notifikationer"]'));
-  const hasActivateLink   = !!(doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') ||
-                               doc.querySelector('#sms_notifikation_ikke_aktiv a[href*="activate_cell_sms_notifikationer"]'));
-
+  const hasDeactivateLink = !!(doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_aktiv a[href*="deactivate_cell_sms_notifikationer"]'));
+  const hasActivateLink   = !!(doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_ikke_aktiv a[href*="activate_cell_sms_notifikationer"]'));
   let state = 'unknown', phone = '';
   if (aktivShown || (!inaktivShown && hasDeactivateLink && !hasActivateLink)) state = 'active';
   else if (inaktivShown || (!aktivShown && hasActivateLink && !hasDeactivateLink)) state = 'inactive';
@@ -638,21 +559,14 @@ function parseSmsStatusFromDoc(doc) {
     if (aHit && !iHit) state = 'active';
     else if (iHit && !aHit) state = 'inactive';
   }
-
   const refTxt = state === 'active' ? (elAktiv?.textContent || '') : (elInaktiv?.textContent || '');
   const m = refTxt.replace(/\u00A0/g,' ').match(/\+?\d[\d\s]{5,}/);
   if (m) phone = m[0].replace(/\s+/g,'');
-
   return { state, phone };
 }
 function parseSmsStatusFromHTML(html) { return parseSmsStatusFromDoc(new DOMParser().parseFromString(html, 'text/html')); }
 async function fetchSmsStatusHTML() { return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now()); }
-async function getSmsStatus() {
-  try { return parseSmsStatusFromHTML(await fetchSmsStatusHTML()); }
-  catch { return { state: 'unknown' }; }
-}
-
-// Skjult iframe-controller (ingen popup/faner)
+async function getSmsStatus() { try { return parseSmsStatusFromHTML(await fetchSmsStatusHTML()); } catch { return { state: 'unknown' }; } }
 function hardenSmsIframe(ifr){
   try {
     const w=ifr.contentWindow, d=ifr.contentDocument;
@@ -699,13 +613,10 @@ async function toggleSmsInIframe(wantOn, timeoutMs=15000, pollMs=600) {
   const ifr = await ensureSmsFrameLoaded();
   let st0 = getIframeStatus(ifr);
   if ((wantOn && st0.state === 'active') || (!wantOn && st0.state === 'inactive')) return st0;
-
   const invoked = invokeIframeAction(ifr, wantOn);
   if (!invoked) throw new Error('Kan ikke udløse aktivering/deaktivering i iframe.');
-
   const maybeReloaded = new Promise(res => { let done=false; ifr.addEventListener('load', () => { if (!done){ done=true; res(); } }, { once:true }); setTimeout(() => { if (!done) res(); }, 1200); });
   await maybeReloaded;
-
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
     const st = getIframeStatus(ifr);
@@ -713,12 +624,10 @@ async function toggleSmsInIframe(wantOn, timeoutMs=15000, pollMs=600) {
     if (!wantOn && st.state === 'inactive') return st;
     await new Promise(r => setTimeout(r, pollMs));
   }
-  // fallback: hård reload og læs status
   const reload = () => new Promise(res => { ifr.onload = () => res(); ifr.src = SMS_SETTINGS_URL + '&ts=' + Date.now(); });
   await reload();
   return getIframeStatus(ifr);
 }
-
 const sms = {
   _busy: false,
   _last: null,
@@ -732,19 +641,17 @@ const sms = {
     uiBusy && uiBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
     try {
       const st = await toggleSmsInIframe(wantOn, 15000, 500);
-      this._last = st;
-      cb && cb(st);
+      this._last = st; cb && cb(st);
     } catch (e) {
       console.warn('[TP][SMS] setEnabled error', e);
       const st = await getSmsStatus(); this._last = st; cb && cb(st);
     } finally {
-      this._busy = false;
-      uiBusy && uiBusy(false);
+      this._busy = false; uiBusy && uiBusy(false);
     }
   }
 };
 
-/*──────── 7) DRAGGABLE + UI CLAMP ────────*/
+/*──────── 12) DRAG + UI ────────*/
 function makeDraggable(el, storageKey, handleSelector) {
   const handle = handleSelector ? el.querySelector(handleSelector) : el;
   if (!handle) return;
@@ -797,7 +704,7 @@ function ensureFullyVisible(el, margin = 8) {
   el.style.bottom = 'auto';
 }
 
-/*──────── 7) UI (panel + gear + menu) ────────*/
+/*──────── 13) UI (panel + gear) ────────*/
 function injectUI() {
   if (document.getElementById('tpPanel')) return;
 
@@ -843,11 +750,7 @@ function injectUI() {
   // ── SMS UI
   const smsAction  = d.querySelector('#smsAction');
   const smsTag     = d.querySelector('#smsTag');
-
-  function smsSetBusy(on, text) {
-    smsAction.disabled = on;
-    if (on) smsTag.textContent = text || 'arbejder…';
-  }
+  function smsSetBusy(on, text) { smsAction.disabled = on; if (on) smsTag.textContent = text || 'arbejder…'; }
   function smsRender(st) {
     const mark = (txt, color) => { smsTag.innerHTML = `<span style="color:${color};font-weight:600">${txt}</span>`; };
     smsAction.disabled = false;
@@ -867,7 +770,9 @@ function injectUI() {
   (async () => { smsSetBusy(true, 'indlæser…'); await sms.refresh(smsRender); smsSetBusy(false); })();
 
   // ── Gear menu
-  let menu = null; const gearBtn = d.querySelector('#tpGearBtn');
+  let menu = null;
+  const gearBtn = d.querySelector('#tpGearBtn');
+
   function buildMenu() {
     if (menu) return menu;
     menu = document.createElement('div');
@@ -890,14 +795,14 @@ function injectUI() {
 
       '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
       '<div style="font-weight:700;margin-bottom:6px">Toast-indstillinger</div>' +
-      '<label style="display:block;margin:4px 0"><input type="checkbox" id="tpForceDomToast"> Brug altid skærm-toast (ikke OS-meddelelser)</label>' +
+      '<label style="display:block;margin:4px 0"><input type="checkbox" id="tpForceDomToast"> Brug altid skærm-toast (ingen OS-popups)</label>' +
       '<label style="display:block;margin:4px 0"><input type="checkbox" id="tpSmartToast"> Smart toast (DOM når synlig, OS når skjult)</label>' +
 
       '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
       '<div style="font-weight:700;margin-bottom:6px">Telefonbog</div>' +
-      '<div style="margin-bottom:6px;font-size:12px;color:#444">CSV ligger i GitHub og bruges af opslag ved indgående kald.</div>' +
+      '<div style="margin-bottom:6px;font-size:12px;color:#444">CSV ligger i GitHub og bruges ved indgående kald.</div>' +
       '<div style="margin-bottom:6px">' +
-        '<div style="font-weight:600;margin-bottom:4px">GitHub PAT (fine-grained • Contents: RW til repo)</div>' +
+        '<div style="font-weight:600;margin-bottom:4px">GitHub PAT (fine-grained • Contents: RW)</div>' +
         '<input id="tpGitPAT" type="password" placeholder="fine-grained token" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:4px">' +
         '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
           '<input id="tpCSVFile" type="file" accept=".csv" style="flex:1"/>' +
@@ -960,8 +865,7 @@ function injectUI() {
         const { sha } = await ghGetSha(PB_OWNER, PB_REPO, PB_CSV, PB_BRANCH);
         await ghPutFile(PB_OWNER, PB_REPO, PB_CSV, base64, 'sync: upload CSV via TM', sha, PB_BRANCH);
         GM_setValue(CACHE_KEY_CSV, text);
-        pbh.textContent = 'CSV uploadet. RAW opdateres om få sek.';
-        showToast('CSV uploadet.');
+        pbh.textContent = 'CSV uploadet. RAW opdateres om få sek.'; showToast('CSV uploadet.');
       } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
     }
     up.addEventListener('click', async () => {
@@ -971,7 +875,7 @@ function injectUI() {
 
     // Pushover TEST
     const test = menu.querySelector('#tpTestPushoverBtn');
-    test.addEventListener('click', () => { tpTestPushoverBoth(); menu.style.display='none'; });
+    test.addEventListener('click', () => { tpTestPushoverBoth(); closeMenu(); });
 
     // Opdateringstjek
     const chk = menu.querySelector('#tpCheckUpdate');
@@ -989,8 +893,10 @@ function injectUI() {
       } catch(_) { showToast('Update-tjek fejlede.'); }
     });
 
+    document.body.appendChild(menu);
     return menu;
   }
+
   function positionMenu(menu) {
     const r = d.getBoundingClientRect();
     const mw = menu.offsetWidth, mh = menu.offsetHeight;
@@ -998,19 +904,29 @@ function injectUI() {
     let top  = Math.max(8, Math.min(window.innerHeight - mh - 8, r.bottom + 8));
     Object.assign(menu.style, { left:left+'px', top:top+'px', right:'auto', bottom:'auto', position:'fixed' });
   }
-  function toggleMenu() {
+
+  function openMenu() {
     const mnu = buildMenu();
-    if (mnu.style.display === 'block') { mnu.style.display = 'none'; return; }
     mnu.style.display = 'block'; mnu.style.visibility = 'hidden';
-    mnu.style.display = 'block'; positionMenu(mnu); mnu.style.visibility = 'visible';
+    positionMenu(mnu); mnu.style.visibility = 'visible';
+    setTimeout(()=>{ document.addEventListener('mousedown', outsideClick, true); document.addEventListener('keydown', escClose, true); },0);
   }
-  d.querySelector('#tpGearBtn').addEventListener('click', toggleMenu);
-  document.addEventListener('mousedown', e => {
-    const gearBtn = d.querySelector('#tpGearBtn');
-    const menu = document.querySelector('#tpPanel + div[style*="position: fixed"]');
-    if (menu && menu.style.display === 'block' && e.target !== menu && !menu.contains(e.target) && e.target !== gearBtn) menu.style.display = 'none';
-  });
-  window.addEventListener('resize', () => { ensureFullyVisible(d); const menu = document.querySelector('#tpPanel + div[style*="position: fixed"]'); if (menu && menu.style.display === 'block') positionMenu(menu); });
+  function closeMenu() {
+    if (!menu) return;
+    menu.style.display = 'none';
+    document.removeEventListener('mousedown', outsideClick, true);
+    document.removeEventListener('keydown', escClose, true);
+  }
+  function toggleMenu(){ if (!menu || menu.style.display !== 'block') openMenu(); else closeMenu(); }
+  function outsideClick(e){
+    if (!menu) return; if (e.target === menu || menu.contains(e.target)) return;
+    if (e.target === gearBtn) return; // tillad klik på gear uden luk
+    closeMenu();
+  }
+  function escClose(e){ if (e.key === 'Escape') closeMenu(); }
+
+  gearBtn.addEventListener('click', toggleMenu);
+  window.addEventListener('resize', () => { ensureFullyVisible(d); if (menu && menu.style.display === 'block') positionMenu(menu); });
 }
 
 /* Test-knap */
@@ -1023,32 +939,39 @@ function tpTestPushoverBoth(){
   showToast('Sendte Pushover-test (Besked + Interesse). Tjek Pushover.');
 }
 
-/*──────── 8) STARTUP ────────*/
+/*──────── 14) STARTUP ────────*/
 document.addEventListener('click', e => {
   const a = e.target.closest && e.target.closest('a');
   if (a && /Beskeder/.test(a.textContent || '')) {
-    if (isLeader()) { const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:null}); stMsg.lastPush = stMsg.lastSent = 0; stMsg.pending=null; saveJsonIfLeader(ST_MSG_KEY, stMsg); }
+    const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:null});
+    stMsg.lastPush = stMsg.lastSent = 0; stMsg.pending=null; saveJson(ST_MSG_KEY, stMsg);
   }
 });
 tryBecomeLeader();
 setInterval(heartbeatIfLeader, HEARTBEAT_MS);
 setInterval(tryBecomeLeader, HEARTBEAT_MS + 1200);
 callerPopIfNeeded().catch(()=>{});
-pollMessages(); pollInterest();
-setInterval(pollMessages, POLL_MS);
-setInterval(pollInterest, POLL_MS);
 injectUI();
 console.info('[TP] kører version', TP_VERSION);
+
+// Planlæg pollers i begge roller (med jitter)
+function schedulePollers(){
+  const role = isLeader() ? 'leader' : 'nonleader';
+  const base = isLeader() ? POLL_MS_LEADER : POLL_MS_NONLEADER;
+  pollMessages(role); pollInterest(role);
+  setTimeout(schedulePollers, jitter(base));
+}
+schedulePollers();
 
 // Øjeblikkelig re-poll når fanen bliver synlig
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
-    if (isLeader()) { try { pollMessages(); pollInterest(true); } catch(_){} }
-    else { hintLeaderNow(); hintLeaderInterest(); }
+    pollMessages(isLeader()?'leader':'nonleader');
+    pollInterest(isLeader()?'leader':'nonleader');
   }
 });
 
-/*──────── 9) HOVER “Intet Svar” ────────*/
+/*──────── 15) HOVER “Intet Svar” ────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
   function mkMenu() {
