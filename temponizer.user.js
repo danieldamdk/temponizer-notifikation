@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.9.20
-// @description  Balanceret: ~10–15s latency uden tung belastning. Leader poller beskeder/interest (HEAD + Range GET 0–30KB, min. hver 30s). Non-leaders poller kun beskeder og lytter på events. Pending-suppression (intet glipper), Smart/Force toast, max 1 OS-popup. Caller-pop: kun kø *1500, nyt faneblad, luk “launcher”-fane ved ukendt/udgående (nul flash). Excel→CSV→GitHub, RAW CSV, SMS status/toggle uden popup, dragbart UI med anker, gear-menu kan lukkes (klik udenfor/Esc), badges og puls ved stigning. Auto-opdatering.
+// @version      7.9.21
+// @description  Balanceret: ~10–15s. Leader: besked + interesse (HEAD + Range GET 0–30KB, min. hver 30s). Non-leader: besked + lyt på interesse. Pending-suppression (intet glipper), Smart/Force toast, max 1 OS-popup. Caller-pop: kun kø *1500, nyt faneblad, luk “launcher”-fane ved ukendt/udgående (nul flash). SMS status/toggle uden popup. Dragbart UI m. anker, gear-menu kan lukkes. Badges/puls. Auto-opdatering. v7.9.21: init-badges uden “–”, immediate interest-poll on leader, robust “Intet Svar”.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -22,7 +22,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.9.20';
+const TP_VERSION = '7.9.21';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -132,14 +132,8 @@ window.addEventListener('storage', e => {
 });
 
 /*──────── 2b) BADGE + UI helpers ────────*/
-function badgePulse(el) {
-  if (!el) return;
-  el.animate([{ transform:'scale(1)' }, { transform:'scale(1.15)' }, { transform:'scale(1)' }], { duration: 320, easing: 'ease-out' });
-}
-function setBadge(el, val) {
-  if (!el) return;
-  el.textContent = (typeof val === 'number' ? String(val) : '–');
-}
+function badgePulse(el) { if (!el) return; el.animate([{transform:'scale(1)'},{transform:'scale(1.15)'},{transform:'scale(1)'}],{duration:320,easing:'ease-out'}); }
+function setBadge(el, val) { if (!el) return; el.textContent = (typeof val === 'number' ? String(val) : '–'); }
 
 /*──────── 3) PUSHOVER ────────*/
 function getUserKey() { try { return (GM_getValue('tpUserKey') || '').trim(); } catch (_) { return ''; } }
@@ -178,37 +172,27 @@ function takeLock() {
   localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() })); return true;
 }
 
-/*──────── 5) NOTIFY HELPERS (vis alle stigninger; pending) ────────*/
+/*──────── 5) NOTIFY HELPERS ────────*/
 function handleCount(channel, newCount, enableKey, stateKey, msgBuilder) {
   const st = loadJson(stateKey, {
-    count: 0,
-    lastPush: 0,
-    lastSent: 0,
-    pendingCount: null,
-    pendingTs: 0
+    count: 0, lastPush: 0, lastSent: 0, pendingCount: null, pendingTs: 0
   });
-
   const enabled = localStorage.getItem(enableKey) === 'true';
   const now = Date.now();
   const canPushNow = (now - st.lastPush > SUPPRESS_MS) && takeLock();
 
-  // Mikro DOM-toast ved stigning (hvis synlig fane) kun hvis vi ikke alligevel viser central toast nu
   const microDomOnRise = (count) => {
     if (document.visibilityState === 'visible' && !canPushNow) showDOMToast(msgBuilder(count));
   };
 
   if (newCount > st.count) {
     microDomOnRise(newCount);
-
     if (canPushNow) {
       const text = msgBuilder(newCount);
       if (enabled) sendPushover(text);
       broadcastToast(channel, text);
       showToastOnce(channel, text);
-      st.lastPush = now;
-      st.lastSent = newCount;
-      st.pendingCount = null;
-      st.pendingTs = 0;
+      st.lastPush = now; st.lastSent = newCount; st.pendingCount = null; st.pendingTs = 0;
     } else {
       st.pendingCount = Math.max(st.pendingCount || 0, newCount);
       if (!st.pendingTs) st.pendingTs = now;
@@ -218,24 +202,19 @@ function handleCount(channel, newCount, enableKey, stateKey, msgBuilder) {
     if (enabled) sendPushover(text);
     broadcastToast(channel, text);
     showToastOnce(channel, text);
-    st.lastPush = now;
-    st.lastSent = st.pendingCount;
-    st.pendingCount = null;
-    st.pendingTs = 0;
+    st.lastPush = now; st.lastSent = st.pendingCount; st.pendingCount = null; st.pendingTs = 0;
   }
-
-  // Ved fald: ingen notifikation. Nulstil suppression så næste stigning kan komme hurtigt igennem.
   if (newCount < st.count) st.lastPush = 0;
 
   st.count = newCount;
   saveJson(stateKey, st);
-  broadcastCount(channel, newCount); // så non-leaders kan opdatere badges
+  broadcastCount(channel, newCount);
 }
 
 /*──────── 6) POLLERS ────────*/
 function jitter(base) { return base + Math.floor(Math.random()*0.25*base); }
 
-/* — BESKED — (leder + non-leader, let JSON) */
+/* — BESKED — (leder + non-leader) */
 function pollMessages(tabRole='leader') {
   fetch(MSG_URL + '&ts=' + Date.now(), {
     credentials: 'same-origin',
@@ -245,15 +224,11 @@ function pollMessages(tabRole='leader') {
   .then(r => r.json())
   .then(d => {
     const n  = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
-
     const stPrev = loadJson(ST_MSG_KEY, {count:0});
     handleCount('msg', n, 'tpPushEnableMsg', ST_MSG_KEY, (c)=>'🔔 Du har nu ' + c + ' ulæst(e) Temponizer-besked(er).');
-
-    // Badge i lokal fane
     const badge = document.getElementById('tpMsgCountBadge');
     setBadge(badge, n);
     if (n > stPrev.count) badgePulse(badge);
-
     console.info('[TP-besked]['+tabRole+']', n, new Date().toLocaleTimeString());
   })
   .catch(e => console.warn('[TP][ERR][MSG]['+tabRole+']', e));
@@ -261,31 +236,22 @@ function pollMessages(tabRole='leader') {
 
 /* — INTERESSE — (KUN leader laver HEAD/GET) */
 const HTML_URL = location.origin + '/index.php?page=freevagter';
-const INT_FORCE_GET_MS = 30000; // tving fuld GET mindst hver 30s
+const INT_FORCE_GET_MS = 30000; // mindst hver 30s fuld parse
 let lastParseTs = Number(localStorage.getItem('tpIntLastFull') || 0);
 let lastETagSeen = null;
-
-function mustForceParse() {
-  const now = Date.now();
-  return (now - lastParseTs) > INT_FORCE_GET_MS;
-}
-function markParsedNow() {
-  lastParseTs = Date.now();
-  localStorage.setItem('tpIntLastFull', String(lastParseTs));
-}
+function mustForceParse() { return (Date.now() - lastParseTs) > INT_FORCE_GET_MS; }
+function markParsedNow() { lastParseTs = Date.now(); localStorage.setItem('tpIntLastFull', String(lastParseTs)); }
 function parseInterestHTML(html) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
   let boxes = Array.from(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
   if (!boxes.length) boxes = Array.from(doc.querySelectorAll('[id*="interesse"][id*="display_number"]'));
-  const c = boxes.reduce((s, el) => {
+  return boxes.reduce((s, el) => {
     const v = parseInt((el.textContent || '').replace(/\D+/g,''), 10);
     return s + (isNaN(v) ? 0 : v);
   }, 0);
-  return c;
 }
 function pollInterestLeader() {
   const force = mustForceParse();
-
   fetch(HTML_URL, {
     method: 'HEAD',
     credentials: 'same-origin',
@@ -296,38 +262,30 @@ function pollInterestLeader() {
     const et = h.headers.get('ETag') || null;
     const changed = et && et !== lastETagSeen;
     lastETagSeen = et || lastETagSeen || null;
-
     if (changed || h.status !== 304 || force || !et) {
       return fetch(HTML_URL + '&_=' + Date.now(), {
-        credentials: 'same-origin',
-        cache: 'no-store',
-        headers: { 'Cache-Control':'no-cache', 'Pragma':'no-cache', 'Range':'bytes=0-30000' } // hent kun toppen
+        credentials: 'same-origin', cache: 'no-store',
+        headers: { 'Cache-Control':'no-cache', 'Pragma':'no-cache', 'Range':'bytes=0-30000' }
       })
       .then(r => r.text())
       .then(html => {
         const c = parseInterestHTML(html);
         markParsedNow();
-
         const stPrev = loadJson(ST_INT_KEY, {count:0});
         handleCount('int', c, 'tpPushEnableInt', ST_INT_KEY, x=>'👀 ' + x + ' vikar(er) har vist interesse for ledige vagter');
-
-        // Badge i lokal (leader) fane
         const badgeI = document.getElementById('tpIntCountBadge');
         setBadge(badgeI, c);
         if (c > stPrev.count) badgePulse(badgeI);
-
         console.info('[TP-interesse][leader]', c, new Date().toLocaleTimeString());
       });
     } else {
       console.info('[TP-interesse][leader] 304', new Date().toLocaleTimeString());
     }
   })
-  .catch(e => {
-    console.warn('[TP][ERR][INT][leader][HEAD]', e);
-  });
+  .catch(e => console.warn('[TP][ERR][INT][leader][HEAD]', e));
 }
 
-/* Non-leader: ingen GET — opdater badges via storage events */
+/* Non-leader: ingen GET — opdater via events */
 window.addEventListener('storage', (e) => {
   try {
     if (e.key === COUNT_INT_EVT && e.newValue) {
@@ -336,7 +294,6 @@ window.addEventListener('storage', (e) => {
       const badgeI = document.getElementById('tpIntCountBadge');
       setBadge(badgeI, c);
       if (c > stPrev.count) badgePulse(badgeI);
-      // Spejl count lokalt, så UI matcher
       const st = loadJson(ST_INT_KEY, {count:0}); st.count = c; saveJson(ST_INT_KEY, st);
     }
     if (e.key === COUNT_MSG_EVT && e.newValue) {
@@ -355,7 +312,18 @@ function now() { return Date.now(); }
 function getLeader() { try { return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null'); } catch (_) { return null; } }
 function setLeader(obj) { localStorage.setItem(LEADER_KEY, JSON.stringify(obj)); }
 function isLeader() { const L = getLeader(); return !!(L && L.id === TAB_ID && L.until > now()); }
-function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.until || 0) <= t) { setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); if (isLeader()) console.info('[TP][LEADER] Denne fane er nu leader:', TAB_ID);} }
+function tryBecomeLeader() {
+  const L = getLeader(), t = now();
+  if (!L || (L.until || 0) <= t) {
+    setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t });
+    if (isLeader()) {
+      console.info('[TP][LEADER] Denne fane er nu leader:', TAB_ID);
+      // v7.9.21: poll med det samme, så UI ikke viser "–"
+      pollMessages('leader');
+      pollInterestLeader();
+    }
+  }
+}
 function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
 window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*no-op*/} });
 
@@ -363,8 +331,7 @@ window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*no-op*/} 
 function gmGET(url) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
-      method: 'GET',
-      url,
+      method: 'GET', url,
       headers: { 'Accept': '*/*', 'Referer': location.href },
       onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
       onerror: e => reject(e)
@@ -374,9 +341,7 @@ function gmGET(url) {
 function gmGETArrayBuffer(url) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
-      method: 'GET',
-      url,
-      responseType: 'arraybuffer',
+      method: 'GET', url, responseType: 'arraybuffer',
       headers: {
         'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel;q=0.9, */*;q=0.8',
         'Referer': location.href
@@ -389,9 +354,7 @@ function gmGETArrayBuffer(url) {
 function gmPOSTArrayBuffer(url, body) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
-      method: 'POST',
-      url,
-      responseType: 'arraybuffer',
+      method: 'POST', url, responseType: 'arraybuffer',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel;q=0.9, */*;q=0.8',
@@ -447,7 +410,8 @@ function parsePhonebookCSV(text) {
   const header = rows[0].map(h => h.toLowerCase());
   const idxId   = header.findIndex(h => /(vikar.*nr|vikar[_ ]?id|^id$)/.test(h));
   const idxName = header.findIndex(h => /(navn|name)/.test(h));
-  const phoneCols = header.map((h, idx) => ({ h, idx })).filter(x => /(telefon(?:nummer)?|^tlf\.?$|mobil|cell(?:phone)?|mobile|phone)/.test(x.h));
+  const phoneCols = header.map((h, idx) => ({ h, idx }))
+    .filter(x => /(telefon(?:nummer)?|^tlf\.?$|mobil|cell(?:phone)?|mobile|phone)/.test(x.h));
   if (idxId < 0 || phoneCols.length === 0) return { map, header };
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
@@ -497,7 +461,6 @@ async function callerPopIfNeeded() {
     const phone8 = normPhone(digitsRaw);
     if (!phone8) { silentSelfClose('bad-number'); return; }
 
-    // Hent CSV RAW → cache
     let csvText = '';
     try { csvText = await gmGET(RAW_PHONEBOOK + '?t=' + Date.now()); if (csvText) GM_setValue(CACHE_KEY_CSV, csvText); } catch(_) {}
     if (!csvText) csvText = GM_getValue(CACHE_KEY_CSV) || '';
@@ -509,7 +472,6 @@ async function callerPopIfNeeded() {
 
     const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(rec.id)}#stamoplysninger`;
     if (OPEN_NEW_TAB_ON_INBOUND) { window.open(url, '_blank', 'noopener'); } else { location.assign(url); }
-    // Communicator lukker typisk selv “launcher”-fanen. Ellers:
     setTimeout(() => silentSelfClose('after-open'), 120);
   } catch (e) {
     console.warn('[TP][CALLER] error', e);
@@ -712,10 +674,7 @@ async function toggleSmsInIframe(wantOn, timeoutMs=15000, pollMs=500) {
 const sms = {
   _busy: false,
   _last: null,
-  async refresh(cb) {
-    const st = await getSmsStatus();
-    this._last = st; cb && cb(st);
-  },
+  async refresh(cb) { const st = await getSmsStatus(); this._last = st; cb && cb(st); },
   async setEnabled(wantOn, uiBusy, cb) {
     if (this._busy) return;
     this._busy = true;
@@ -748,9 +707,7 @@ function makeDraggable(el, storageKey, handleSelector) {
   let anchor = null;
   try { anchor = JSON.parse(localStorage.getItem(storageKey) || 'null'); } catch(_) {}
   if (anchor && anchor.anchor) applyAnchor(el, anchor);
-  else if (anchor && typeof anchor.left === 'number') { // legacy
-    el.style.position='fixed'; el.style.left=anchor.left+'px'; el.style.top=anchor.top+'px';
-  }
+  else if (anchor && typeof anchor.left === 'number') { el.style.position='fixed'; el.style.left=anchor.left+'px'; el.style.top=anchor.top+'px'; }
 
   let moving=false,startX=0,startY=0,baseLeft=0,baseTop=0;
 
@@ -864,6 +821,12 @@ function injectUI() {
   i.checked = localStorage.getItem('tpPushEnableInt') === 'true';
   m.onchange = () => localStorage.setItem('tpPushEnableMsg', m.checked ? 'true' : 'false');
   i.onchange = () => localStorage.setItem('tpPushEnableInt', i.checked ? 'true' : 'false');
+
+  // v7.9.21: Sæt badges fra sidste kendte state (ikke “–”)
+  const stMsg = loadJson(ST_MSG_KEY, {count:0});
+  const stInt = loadJson(ST_INT_KEY, {count:0});
+  setBadge(d.querySelector('#tpMsgCountBadge'), Number(stMsg.count||0));
+  setBadge(d.querySelector('#tpIntCountBadge'), Number(stInt.count||0));
 
   // ── SMS UI
   const smsAction  = d.querySelector('#smsAction');
@@ -1100,16 +1063,13 @@ function schedulePollers(){
   const role = leaderNow ? 'leader' : 'nonleader';
   const base = leaderNow ? POLL_MS_LEADER : POLL_MS_NONLEADER;
 
-  // Beskeder: begge roller
   pollMessages(role);
-  // Interesse: kun leader
   if (leaderNow) pollInterestLeader();
 
   setTimeout(schedulePollers, jitter(base));
 }
 schedulePollers();
 
-// Øjeblikkelig re-poll når fanen bliver synlig
 document.addEventListener('visibilitychange', () => {
   const leaderNow = isLeader();
   if (document.visibilityState === 'visible') {
@@ -1118,55 +1078,99 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-/*──────── 15) HOVER “Intet Svar” ────────*/
+/*──────── 15) HOVER “Intet Svar” (robust) ────────*/
 (function () {
-  var auto = false, icon = null, menu = null, hideT = null;
+  let auto = false, iconEl = null, menu = null, hideT = null;
+
+  function getClickable(el){ return el && el.closest ? (el.closest('a[href],button,[onclick]') || el) : el; }
+  function findIcon(n) {
+    while (n && n !== document) {
+      if (n.getAttribute) {
+        const t = (n.getAttribute('title') || n.getAttribute('aria-label') || '').trim();
+        if (/Registrer opkald til vikar/i.test(t)) return n;
+      }
+      n = n.parentNode;
+    }
+    return null;
+  }
   function mkMenu() {
     if (menu) return menu;
     menu = document.createElement('div');
     Object.assign(menu.style, { position: 'fixed', zIndex: 2147483647, background: '#fff', border: '1px solid #ccc', borderRadius: '4px', boxShadow: '0 2px 8px rgba(0,0,0,.25)', fontSize: '12px', fontFamily: 'sans-serif' });
-    var btn = document.createElement('div');
+    const btn = document.createElement('div');
     btn.textContent = 'Registrér “Intet Svar”';
     btn.style.cssText = 'padding:6px 12px;white-space:nowrap;cursor:default';
-    btn.onmouseenter = function () { btn.style.background = '#f0f0f0'; };
-    btn.onmouseleave = function () { btn.style.background = ''; };
-    btn.onclick = function () { auto = true; if (icon) icon.click(); hide(); };
-    menu.appendChild(btn); document.body.appendChild(menu); return menu;
+    btn.onmouseenter = () => { btn.style.background = '#f0f0f0'; };
+    btn.onmouseleave = () => { btn.style.background = ''; };
+    btn.onclick = function () {
+      auto = true;
+      if (iconEl) {
+        const target = getClickable(iconEl);
+        try { target.dispatchEvent(new MouseEvent('click', { bubbles:true, cancelable:true, view:window })); }
+        catch(_) { try { target.click(); } catch(_){} }
+      }
+      hide();
+    };
+    menu.appendChild(btn);
+    document.body.appendChild(menu);
+    return menu;
   }
-  function show(el) { icon = el; var r = el.getBoundingClientRect(); var m = mkMenu(); m.style.left = r.left + 'px'; m.style.top = r.bottom + 4 + 'px'; m.style.display = 'block'; }
-  function hide() { clearTimeout(hideT); hideT = setTimeout(function () { if (menu) menu.style.display = 'none'; icon = null; }, 120); }
-  function findIcon(n) { while (n && n !== document) { if (n.getAttribute && n.getAttribute('title') === 'Registrer opkald til vikar') return n; n = n.parentNode; } return null; }
+  function show(el) {
+    iconEl = el;
+    const r = el.getBoundingClientRect();
+    const m = mkMenu();
+    m.style.left = r.left + 'px';
+    m.style.top = r.bottom + 4 + 'px';
+    m.style.display = 'block';
+  }
+  function hide() {
+    clearTimeout(hideT);
+    hideT = setTimeout(() => { if (menu) menu.style.display = 'none'; iconEl = null; }, 120);
+  }
 
-  document.addEventListener('mouseover', function (e) { var ic = findIcon(e.target); if (ic) show(ic); }, true);
-  document.addEventListener('mousemove', function (e) {
+  document.addEventListener('mouseover', (e) => { const ic = findIcon(e.target); if (ic) show(ic); }, true);
+  document.addEventListener('mousemove', (e) => {
     if (!menu || menu.style.display !== 'block') return;
-    var overM = menu.contains(e.target);
-    var overI = icon && (icon === e.target || icon.contains(e.target) || e.target.contains(icon));
+    const overM = menu.contains(e.target);
+    const overI = iconEl && (iconEl === e.target || iconEl.contains(e.target) || (e.target.contains && e.target.contains(iconEl)));
     if (!overM && !overI) hide();
   }, true);
 
-  new MutationObserver(function (ml) {
+  const TEXTAREA_SEL = [
+    'textarea[name*="phonetext" i]','textarea[id*="phonetext" i]',
+    'textarea[name*="phone" i]','textarea[id*="phone" i]',
+    'textarea[name*="note" i]','textarea[id*="note" i]',
+    'textarea'
+  ].join(',');
+
+  function findSave(root) {
+    return (
+      root.querySelector('input[type="button"][value*="Gem" i]') ||
+      root.querySelector('input[type="submit"][value*="Gem" i]') ||
+      Array.from(root.querySelectorAll('button')).find(b => /gem registrering/i.test(b.textContent||'') || /^\s*gem\s*$/i.test(b.textContent||''))
+    ) || null;
+  }
+
+  new MutationObserver((ml) => {
     if (!auto) return;
-    ml.forEach(function (m) {
-      m.addedNodes.forEach(function (n) {
-        if (!(n instanceof HTMLElement)) return;
-        const hsWrap = n.closest && n.closest('.highslide-body, .highslide-container');
-        if (hsWrap) { hsWrap.style.opacity = '0'; hsWrap.style.pointerEvents = 'none'; }
-        var ta = (n.matches && n.matches('textarea[name="phonetext"]')) ? n : (n.querySelector && n.querySelector('textarea[name="phonetext"]'));
+    for (const m of ml) {
+      for (const n of m.addedNodes) {
+        if (!(n instanceof HTMLElement)) continue;
+        const container = (n.closest && (n.closest('.highslide-body, .highslide-container, .modal, .ui-dialog, body') || n)) || n;
+        const ta = container.querySelector && container.querySelector(TEXTAREA_SEL);
         if (ta) {
           if (!ta.value.trim()) ta.value = 'Intet Svar';
-          var frm = ta.closest('form');
-          var saveBtn = frm && Array.prototype.find.call(frm.querySelectorAll('input[type="button"]'), function (b) { return /Gem registrering/i.test(b.value || ''); });
-          if (saveBtn) {
-            setTimeout(function () {
-              try { saveBtn.click(); } catch (_) {}
-              try { if (unsafeWindow.hs && unsafeWindow.hs.close) unsafeWindow.hs.close(); } catch (_) {}
-              if (hsWrap) { hsWrap.style.opacity = ''; hsWrap.style.pointerEvents = ''; }
+          const btn = findSave(container);
+          if (btn) {
+            setTimeout(() => {
+              try { btn.click(); } catch(_) {}
+              try { if (unsafeWindow.hs && unsafeWindow.hs.close) unsafeWindow.hs.close(); } catch(_) {}
             }, 30);
+            auto = false;
+            return;
           }
-          auto = false;
         }
-      });
-    });
+      }
+    }
   }).observe(document.body, { childList: true, subtree: true });
 })();
