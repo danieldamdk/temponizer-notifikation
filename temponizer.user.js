@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.10.7
+// @version      7.10.9
 // @description  Push (leader + suppression), OS/DOM toast (ingen dubletter, virker på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop, Excel→CSV→Upload m. warm-up, RAW CSV lookup + navne i Interesse. SMS-toggle på alle sider (iframe). UI kompakt, én SMS-knap, default nederst-højre.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.10.7';
+const TP_VERSION = '7.10.9';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'REDACTED_REVOKED_CREDENTIAL';
@@ -688,7 +688,7 @@ async function fetchExcelAsCSVAndUpload() {
 }
 
 /*──────── 12) UI (panel + gear + SMS) ────────*/
-const POS_KEY = 'tpPanelPosV2';
+const POS_KEY = 'tpPanelPosV3';
 function injectUI() {
   if (document.getElementById('tpPanel')) return;
 
@@ -1124,6 +1124,16 @@ function initSMSControls(root){
     await sms.setEnabled(wantOn, setBusy, paint);
   });
   (async()=>{ setBusy(true,'indlæser…'); await sms.refresh(paint); setBusy(false); })();
+}
+
+/* Test-knap (Pushover) */
+function tpTestPushoverBoth(){
+  const userKey = getUserKey();
+  if (!userKey) { showToast('Indsæt din USER-token i ⚙️-menuen før test.'); return; }
+  const ts = new Date().toLocaleTimeString();
+  sendPushover('🧪 [TEST] Besked-kanal OK — ' + ts);
+  setTimeout(() => sendPushover('🧪 [TEST] Interesse-kanal OK — ' + ts), 800);
+  showToast('Sendte Pushover-test (Besked + Interesse). Tjek Pushover.');
 }
 
 /*──────── 14) STARTUP ────────*/
