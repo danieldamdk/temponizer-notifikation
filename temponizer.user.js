@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.10.2
+// @version      7.10.3
 // @description  Push (leader, suppression), OS/DOM toast, “Intet Svar”-auto-gem (uden popup), telefonbog m. inbound caller-pop (nyt faneblad), Excel→CSV→Upload til GitHub, RAW CSV lookup. Statusbanner, navne i interesse-notifikationer og “Søg efter opdatering” i ⚙️. Overlevering fjernet. UI clamp + gear-menu viewport-fix. SMS toggle via skjult iframe (virker på alle sider).
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -20,7 +20,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.10.2';
+const TP_VERSION = '7.10.3';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -853,8 +853,8 @@ function injectUI() {
   d.id = 'tpPanel';
   d.style.cssText = [
     'position:fixed','z-index:2147483645','background:#fff','border:1px solid #d7d7d7',
-    'padding:10px','border-radius:10px','font-size:12px','font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
-    'box-shadow:0 8px 24px rgba(0,0,0,.15)','max-width:320px','min-width:220px','line-height:1.35'
+    'padding:8px','border-radius:8px','font-size:12px','font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
+    'box-shadow:0 8px 24px rgba(0,0,0,.15)','max-width:280px','min-width:200px','line-height:1.35'
   ].join(';');
 
   d.innerHTML =
@@ -864,21 +864,20 @@ function injectUI() {
     '</div>' +
     // Pushover toggles + badges
     '<div style="display:flex; align-items:center; gap:8px; margin:6px 0 2px 0;">' +
-      '<label style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="tpEnableMsg"> Besked (Pushover)</label>' +
+      '<label style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="tpEnableMsg"> Besked</label>' +
       '<span id="tpMsgCountBadge" style="margin-left:auto;min-width:18px;text-align:center;background:#eef;border:1px solid #cbd; padding:0 6px;border-radius:999px;">0</span>' +
     '</div>' +
     '<div style="display:flex; align-items:center; gap:8px; margin:2px 0 8px 0;">' +
-      '<label style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="tpEnableInt"> Interesse (Pushover)</label>' +
+      '<label style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="tpEnableInt"> Interesse</label>' +
       '<span id="tpIntCountBadge" style="margin-left:auto;min-width:18px;text-align:center;background:#eef;border:1px solid #cbd; padding:0 6px;border-radius:999px;">0</span>' +
     '</div>' +
     // SMS (kompakt, auto-bredde)
-    '<div id="tpSMS" style="border-top:1px solid #eee;padding-top:8px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">' +
-      '<div id="tpSMSLabel" style="font-weight:600;">SMS</div>' +
-      '<div id="tpSMSStatus" style="font-size:12px; color:#888;">indlæser…</div>' +
-      '<div style="margin-left:auto; display:flex; gap:6px; flex-wrap:wrap;">' +
-        '<button id="tpSMSOn"  style="padding:4px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Aktivér</button>' +
-        '<button id="tpSMSOff" style="padding:4px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Deaktivér</button>' +
+    ''<div id="tpSMS" style="border-top:1px solid #eee;padding-top:8px;display:flex;flex-direction:column;gap:6px;">' +
+      '<div style="display:flex;align-items:center;gap:6px">' +
+        '<div id="tpSMSLabel" style="font-weight:600;">SMS</div>' +
+        '<div id="tpSMSStatus" style="font-size:12px;color:#888;flex:1;">indlæser…</div>' +
       '</div>' +
+      '<button id="tpSMSToggle" style="align-self:flex-start;padding:4px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Aktivér</button>' +
     '</div>';
 
   document.body.appendChild(d);
@@ -1172,13 +1171,10 @@ function badgePulse(el){
 /* SMS UI controls (via iframe-metoden) */
 function initSMSControls(root){
   const lbl   = root.querySelector('#tpSMSStatus');
-  const btnOn = root.querySelector('#tpSMSOn');
-  const btnOff= root.querySelector('#tpSMSOff');
+  const btn   = root.querySelector('#tpSMSToggle');
 
   function setBusy(b, text){
-    btnOn.disabled = b; btnOff.disabled = b;
-    btnOn.style.opacity = b ? .6 : 1;
-    btnOff.style.opacity = b ? .6 : 1;
+    if (btn){ btn.disabled = b; btn.style.opacity = b ? .6 : 1; }
     if (b && text) lbl.textContent = text;
   }
   function paint(state){
@@ -1186,32 +1182,28 @@ function initSMSControls(root){
     if (st === 'active') {
       lbl.textContent = phone ? `aktiv – ${phone}` : 'aktiv';
       lbl.style.color = '#0a7a35';
-      btnOn.disabled = true; btnOff.disabled = false;
+      if (btn) btn.textContent = 'Deaktiver';
     } else if (st === 'inactive') {
       lbl.textContent = phone ? `ikke aktiv – ${phone}` : 'ikke aktiv';
       lbl.style.color = '#a33';
-      btnOn.disabled = false; btnOff.disabled = true;
+      if (btn) btn.textContent = 'Aktivér';
     } else {
       lbl.textContent = 'ukendt';
       lbl.style.color = '#666';
-      btnOn.disabled = false; btnOff.disabled = false;
+      if (btn) btn.textContent = 'Aktivér';
     }
   }
 
   (async function boot(){
     setBusy(true, 'indlæser…');
-    const st = await sms.refresh(paint);
+    await sms.refresh(paint);
     setBusy(false);
   })();
 
-  btnOn.addEventListener('click', async () => {
-    setBusy(true, 'aktiverer…');
-    await sms.setEnabled(true, setBusy, paint);
-    setBusy(false);
-  });
-  btnOff.addEventListener('click', async () => {
-    setBusy(true, 'deaktiverer…');
-    await sms.setEnabled(false, setBusy, paint);
+  if (btn) btn.addEventListener('click', async () => {
+    const wantOn = (sms._last?.state !== 'active');
+    setBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
+    await sms.setEnabled(wantOn, setBusy, paint);
     setBusy(false);
   });
 }
@@ -1304,3 +1296,4 @@ console.info('[TP] kører version', TP_VERSION);
     });
   }).observe(document.body, { childList: true, subtree: true });
 })();
+```
