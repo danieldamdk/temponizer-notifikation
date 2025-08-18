@@ -8,6 +8,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
+// @noframes
 // @connect      api.pushover.net
 // @connect      raw.githubusercontent.com
 // @connect      api.github.com
