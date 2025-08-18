@@ -1,4 +1,4 @@
-// ==UserScript==
+// ==/UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
 // @version      7.11.3
