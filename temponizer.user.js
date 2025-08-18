@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.11.0
+// @version      7.11.1
 // @description  Push (leader + suppression + pending flush), OS/DOM toast (cross-tab, no dupes), “Intet Svar”-auto-gem, caller-pop via RAW CSV, Excel→CSV→Upload (robust, with warm-up) + clearer GitHub errors. SMS mini-toggle. Compact UI.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.11.0';
+const TP_VERSION = '7.11.1';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -445,6 +445,33 @@ function gmGET(url) {
     });
   });
 }
+
+// NEW (CSV-only scope): CSRF + fælles AJAX-headers til Temponizer POST/Excel
+function getCsrfToken() {
+  const m = document.querySelector('meta[name="csrf-token"]');
+  if (m && m.content) return m.content.trim();
+  const i = document.querySelector('input[name="csrf-token"], input[name="csrf_token"], input[name="token"]');
+  if (i && i.value) return i.value.trim();
+  return '';
+}
+function commonAjaxHeaders() {
+  const h = { 'X-Requested-With': 'XMLHttpRequest', 'Referer': location.href };
+  const t = getCsrfToken(); if (t) h['x-csrf-token'] = t;
+  return h;
+}
+function gmPOST(url, body) {
+  return new Promise((resolve, reject) => {
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url,
+      headers: { ...commonAjaxHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
+      data: body,
+      onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
+      onerror: e => reject(e)
+    });
+  });
+}
+
 function gmGETArrayBuffer(url) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
@@ -452,8 +479,8 @@ function gmGETArrayBuffer(url) {
       url,
       responseType: 'arraybuffer',
       headers: {
+        ...commonAjaxHeaders(),
         'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel;q=0.9, */*;q=0.8',
-        'Referer': location.href,
         'Cache-Control':'no-cache','Pragma':'no-cache'
       },
       onload: r => (r.status>=200 && r.status<300) ? resolve(r.response) : reject(new Error('HTTP '+r.status)),
@@ -468,9 +495,9 @@ function gmPOSTArrayBuffer(url, body) {
       url,
       responseType: 'arraybuffer',
       headers: {
+        ...commonAjaxHeaders(),
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel;q=0.9, */*;q=0.8',
-        'Referer': location.href,
         'Cache-Control':'no-cache','Pragma':'no-cache'
       },
       data: body,
@@ -668,7 +695,77 @@ async function tryExcelPOST(params) {
   const url = `${location.origin}/index.php?page=print_vikar_list_custom_excel`;
   return await gmPOSTArrayBuffer(url, params);
 }
+
+// NEW (CSV-only scope): rigtig warm-up der “varmer” printlisten på serveren
+function fmtTodayDK() {
+  const d = new Date();
+  const dd = String(d.getDate()).padStart(2,'0');
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const yyyy = d.getFullYear();
+  return `${dd}.${mm}.${yyyy}`;
+}
+async function warmUpVikarListSession() {
+  const today = encodeURIComponent(fmtTodayDK());
+  const body =
+    'page=vikarlist_get' +
+    '&ajax=true' +
+    '&showheader=true' +
+    '&printlist=true' +
+    '&fieldset_filtre=closed' +
+    '&fieldset_aktivitet=closed' +
+    '&kunder_id=0' +
+    '&kunde_afdeling_id=' +
+    '&arbejdssteder_id=' +
+    '&searchFromUrl=false' +
+    '&query=' +
+    '&query_vikar_nr=' +
+    '&postnummer_fra=' +
+    '&postnummer_til=' +
+    '&fetchIds=' +
+    '&days_to_birthday=2' +
+    '&vagtonskeridag_dato=i+dag' +
+    '&vagtoenskeridag_starttidspunkt=' +
+    '&vagtoenskeridag_sluttidspunkt=' +
+    '&vagtoenskeridag_dag=true' +
+    '&vagtoenskeridag_aften=true' +
+    '&vagtoenskeridag_nat=true' +
+    '&vagtoenskeridag_heledag=true' +
+    '&ansaettelsesdato_datofra=' +
+    '&ansaettelsesdato_datotil=' +
+    '&ingenvagterfra=' +
+    '&ingenvagtertil=' +
+    '&medvagterfra=' +
+    '&medvagtertil=' +
+    '&medgodkendtevagterfra=' +
+    '&medgodkendtevagtertil=' +
+    '&afholdte_dato=' + today +
+    '&ingenvagtoenskerfra=' +
+    '&ingenvagtoenskertil=' +
+    '&sex=both' +
+    '&kontor_id=-1' +
+    '&udbetalingsmetode=-1' +
+    '&loenkorsel_id=0' +
+    '&kunde_radius_search=0' +
+    '&vikar_rolle=0' +
+    '&booking_grupper_id=-1' +
+    '&kunder_sel_width=400' +
+    '&kunder_sel_id=0' +
+    '&kunder_select_search=' +
+    '&kunder_id_0=0' +
+    '&vagterfra=' +
+    '&vagtertil=' +
+    '&list_uddannelse_id_all=true' +
+    '&uddannelse_gyldig=' + today +
+    '&kompetencegyldig=' + today;
+
+  await gmPOST(`${location.origin}/index.php`, body);
+}
+
 async function fetchExcelAsCSVText() {
+  // RIGTIG warm-up (POST) før Excel-eksport
+  try { await warmUpVikarListSession(); } catch (e) { console.warn('[TP][PB] warmUp (POST) fejlede — fortsætter:', e); }
+
+  // Behold eksisterende “blid” warm-up og GET-forsøg
   await warmupExcelEndpoints();
   const tries = [
     { fn: tryExcelGET,  params: 'id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag' },
@@ -684,6 +781,8 @@ async function fetchExcelAsCSVText() {
       if (csv) return csv;
     } catch (_) {}
   }
+
+  // Gentag blid warm-up og prøv POST-forsøg
   await warmupExcelEndpoints();
   const postTries = [
     { fn: tryExcelPOST, params: 'id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag' },
@@ -955,21 +1054,16 @@ function injectUI() {
   intr.onchange = () => localStorage.setItem('tpPushEnableInt', intr.checked ? 'true' : 'false');
 
   // drag
-  makeDraggable(d, POS_KEY, '#tpHeader'); ensureFullyVisible(d);
+  makeDraggable(d, POS_KEY, '#tpHeader');
+
+  // **Always start bottom-right (still draggable)**
+  d.style.bottom = '12px';
+  d.style.right  = '8px';
+  d.style.top    = 'auto';
+  d.style.left   = 'auto';
 
   // SMS UI
   initSMSControls(d);
-
-  // Default: nederst-højre hvis ingen gemt placering
-  try {
-    const pos = JSON.parse(localStorage.getItem(POS_KEY) || 'null');
-    if (!pos) {
-      d.style.bottom = '12px';
-      d.style.right  = '8px';
-      d.style.top    = 'auto';
-      d.style.left   = 'auto';
-    }
-  } catch(_) {}
 
   // initial badges
   setBadge(document.getElementById('tpMsgCountBadge'), Number(loadJson(ST_MSG_KEY,{count:0}).count||0));
