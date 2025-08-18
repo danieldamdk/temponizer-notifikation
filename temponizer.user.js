@@ -1,4 +1,4 @@
-// ==/UserScript==
+// ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
 // @version      7.11.3
@@ -17,7 +17,7 @@
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
-// ==/UserScript>
+// ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
 const TP_VERSION = '7.11.3';
