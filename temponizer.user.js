@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.10.9
-// @description  Push (leader + suppression), OS/DOM toast (ingen dubletter, virker på tværs af faner), “Intet Svar”-auto-gem, telefonbog m. inbound caller-pop, Excel→CSV→Upload m. warm-up, RAW CSV lookup + navne i Interesse. SMS-toggle på alle sider (iframe). UI kompakt, én SMS-knap, default nederst-højre.
+// @version      7.11.0
+// @description  Push (leader + suppression + pending flush), OS/DOM toast (cross-tab, no dupes), “Intet Svar”-auto-gem, caller-pop via RAW CSV, Excel→CSV→Upload (robust, with warm-up) + clearer GitHub errors. SMS mini-toggle. Compact UI.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -19,7 +19,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.10.9';
+const TP_VERSION = '7.11.0';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -95,7 +95,6 @@ function showToastOnce(key, msg) {
   showToast(msg);
 }
 function showToast(msg) {
-  // Kun leader laver OS-popup (garanterer 1 global). Alligevel broadcaster vi til DOM i andre faner.
   if (isLeader() && 'Notification' in window) {
     if (Notification.permission === 'granted') {
       try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
@@ -104,12 +103,8 @@ function showToast(msg) {
         if (p === 'granted') try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
         else showDOMToast(msg);
       });
-    } else {
-      showDOMToast(msg);
-    }
-  } else {
-    showDOMToast(msg);
-  }
+    } else { showDOMToast(msg); }
+  } else { showDOMToast(msg); }
 }
 function showDOMToast(msg) {
   const el = document.createElement('div');
@@ -171,6 +166,7 @@ const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
 const ST_MSG_KEY = 'tpPushState';
 const ST_INT_KEY = 'tpInterestState';
+
 function loadJson(key, fallback) { try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch (_) { return JSON.parse(JSON.stringify(fallback)); } }
 function saveJsonIfLeader(key, obj) { if (isLeader()) localStorage.setItem(key, JSON.stringify(obj)); }
 function takeLock() {
@@ -179,27 +175,54 @@ function takeLock() {
   localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() })); return true;
 }
 
+/* Pending flush (fix for “missed notifications”) */
+function maybeFlushPending(kind, pushEnableKey, stateKey, buildMsg) {
+  const st = loadJson(stateKey, {count:0,lastPush:0,lastSent:0,pending:0});
+  if (st.pending && st.pending > (st.lastSent||0)) {
+    if (Date.now() - st.lastPush > SUPPRESS_MS && takeLock()) {
+      const text = (typeof buildMsg === 'function') ? buildMsg(st.pending) : buildMsg;
+      const enabled = localStorage.getItem(pushEnableKey) === 'true';
+      if (enabled) sendPushover(text);
+      showToastOnce(kind, text);
+      st.lastPush = Date.now();
+      st.lastSent = st.pending;
+      st.pending  = 0;
+      saveJsonIfLeader(stateKey, st);
+      return true;
+    }
+  }
+  return false;
+}
+
 /*──────── 5) POLLERS: BESKED ────────*/
 function pollMessagesLeader() {
+  // Try flush any pending first
+  maybeFlushPending('msg', 'tpPushEnableMsg', ST_MSG_KEY, (n) => `🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`);
+
   fetch(MSG_URL + '&ts=' + Date.now(), { credentials: 'same-origin', cache: 'no-store', headers: {'Cache-Control':'no-cache','Pragma':'no-cache'} })
     .then(r => r.json())
     .then(d => {
-      const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
+      const st = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
       const n  = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
       const en = localStorage.getItem('tpPushEnableMsg') === 'true';
-      if (n > stMsg.count && n !== stMsg.lastSent) {
-        const canPush = (Date.now() - stMsg.lastPush > SUPPRESS_MS) && takeLock();
+
+      if (n > st.count && n !== st.lastSent) {
+        const canPush = (Date.now() - st.lastPush > SUPPRESS_MS) && takeLock();
         if (canPush) {
           const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
           if (en) sendPushover(m);
           showToastOnce('msg', m);
-          stMsg.lastPush = Date.now();
-          stMsg.lastSent = n;
-        } else stMsg.lastSent = n;
-      } else if (n < stMsg.count) {
-        stMsg.lastPush = 0;
+          st.lastPush = Date.now();
+          st.lastSent = n;
+        } else {
+          st.pending = Math.max(st.pending||0, n); // queue til senere flush
+        }
+      } else if (n < st.count) {
+        st.lastPush = 0;
+        if (st.pending && n <= st.pending) st.pending = 0; // reset pending hvis tæller falder
       }
-      stMsg.count = n; saveJsonIfLeader(ST_MSG_KEY, stMsg);
+
+      st.count = n; saveJsonIfLeader(ST_MSG_KEY, st);
 
       const badge = document.getElementById('tpMsgCountBadge'); setBadge(badge, n);
       const prevBadge = Number(localStorage.getItem('tpMsgPrevBadge')||0);
@@ -219,7 +242,6 @@ let lastIntParseTS = 0;
 function markParsedNow(){ lastIntParseTS = Date.now(); }
 function mustForceParse(){ return (Date.now() - lastIntParseTS) > (POLL_MS * 2); }
 
-/* Sum af alle interessebokse */
 function parseInterestHTML(html) {
   const doc   = new DOMParser().parseFromString(html, 'text/html');
   let boxes = Array.prototype.slice.call(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
@@ -227,7 +249,6 @@ function parseInterestHTML(html) {
   const c = boxes.reduce((s, el) => { const v = parseInt((el.textContent||'').replace(/\D+/g,''), 10); return s + (isNaN(v) ? 0 : v); }, 0);
   return c;
 }
-/* Per-vagt map: { vagtId: count } */
 function parseInterestPerMap(html) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
   const map = {};
@@ -244,17 +265,25 @@ function parseInterestPerMap(html) {
   return map;
 }
 
-/* Interesse-navne konfig/state */
-const INT_NAMES_CACHE_TTL_MS = 120000;  // 2 min cache pr. vagt
-const INT_NAMES_MAX_VAGTER   = 3;       // max vagt_id’er vi navne-henter pr. polling
-const INT_NAMES_MAX_NAMES    = 2;       // hvor mange navne vi viser før “+ N andre”
-let gIntPerPrev = {};                   // { vagtId: count }
-const gIntNamesCache = new Map();       // vagtId -> { ts, names: ["Navn", ...] }
-let INT_NAME_HINT = '';                 // én-gangs tekst til næste notifikation
+/* Interesse-navne */
+const INT_NAMES_CACHE_TTL_MS = 120000;
+const INT_NAMES_MAX_VAGTER   = 3;
+const INT_NAMES_MAX_NAMES    = 2;
+let gIntPerPrev = {};
+const gIntNamesCache = new Map();
+let INT_NAME_HINT = '';
 
 function fetchInterestPopupHTML(vagtAvailId) {
   const url = `${location.origin}/index.php?page=update_vikar_synlighed_from_list&ajax=true&vagt_type=single&vagt_avail_id=${encodeURIComponent(vagtAvailId)}&t=${Date.now()}`;
   return gmGET(url);
+}
+function csvLookupByVikarIdFactory() {
+  try {
+    const csv = GM_getValue(CACHE_KEY_CSV) || '';
+    const parsed = parsePhonebookCSV(csv);
+    const map = parsed.vikarsById || new Map();
+    return (vikarId) => map.get(String(vikarId)) || null;
+  } catch(_){ return null; }
 }
 function parseInterestPopupNames(html, csvLookupByVikarId) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -282,14 +311,6 @@ function parseInterestPopupNames(html, csvLookupByVikarId) {
   for (const n of out) { const k = n.toLowerCase(); if (!seen.has(k)) { seen.add(k); uniq.push(n); } }
   return uniq;
 }
-function csvLookupByVikarIdFactory() {
-  try {
-    const csv = GM_getValue(CACHE_KEY_CSV) || '';
-    const parsed = parsePhonebookCSV(csv);
-    const map = parsed.vikarsById || new Map();
-    return (vikarId) => map.get(String(vikarId)) || null;
-  } catch(_){ return null; }
-}
 function summarizeNames(names) {
   if (!names || !names.length) return '';
   const a = names.slice(0, INT_NAMES_MAX_NAMES);
@@ -311,6 +332,9 @@ function buildInterestMsg(count) {
 }
 
 function pollInterestLeader() {
+  // Try flush any pending first
+  maybeFlushPending('int', 'tpPushEnableInt', ST_INT_KEY, buildInterestMsg);
+
   const force = mustForceParse();
   fetch(HTML_URL, {
     method: 'HEAD',
@@ -365,11 +389,27 @@ function pollInterestLeader() {
           const summary = summarizeNames(merged);
           if (summary) namesHint = summary;
         }
-
         if (namesHint) INT_NAME_HINT = namesHint;
 
-        const stPrev = loadJson(ST_INT_KEY, {count:0});
-        handleCount('int', total, 'tpPushEnableInt', ST_INT_KEY, buildInterestMsg);
+        // handle count with pending
+        const st = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
+        if (total > st.count && total !== st.lastSent) {
+          const canPush = (Date.now() - st.lastPush > SUPPRESS_MS) && takeLock();
+          if (canPush) {
+            const text = buildInterestMsg(total);
+            const en = localStorage.getItem('tpPushEnableInt') === 'true';
+            if (en) sendPushover(text);
+            showToastOnce('int', text);
+            st.lastPush = Date.now(); st.lastSent = total;
+          } else {
+            st.pending = Math.max(st.pending||0, total);
+          }
+        } else if (total < st.count) {
+          st.lastPush = 0;
+          if (st.pending && total <= st.pending) st.pending = 0;
+        }
+        st.count = total; saveJsonIfLeader(ST_INT_KEY, st);
+
         const badgeI = document.getElementById('tpIntCountBadge'); setBadge(badgeI, total);
         const prevBadge = Number(localStorage.getItem('tpIntPrevBadge')||0);
         if (total > prevBadge) badgePulse(badgeI);
@@ -382,25 +422,6 @@ function pollInterestLeader() {
     }
   })
   .catch(e => console.warn('[TP][ERR][INT][leader][HEAD]', e));
-}
-
-function handleCount(kind, count, pushEnableKey, stateKey, builderOrFn) {
-  const st = loadJson(stateKey, {count:0,lastPush:0,lastSent:0});
-  const prev = st.count;
-  const text = (typeof builderOrFn === 'function') ? builderOrFn(count) : builderOrFn;
-  if (count > prev && count !== st.lastSent) {
-    const canPush = (Date.now() - st.lastPush > SUPPRESS_MS) && takeLock();
-    if (canPush) {
-      const enabled = localStorage.getItem(pushEnableKey) === 'true';
-      if (enabled) sendPushover(text);
-      showToastOnce(kind, text);
-      st.lastPush = Date.now();
-      st.lastSent = count;
-    } else st.lastSent = count;
-  } else if (count < prev) {
-    st.lastPush = 0;
-  }
-  st.count = count; saveJsonIfLeader(stateKey, st);
 }
 
 /*──────── 7) LEADER-ELECTION ────────*/
@@ -559,9 +580,11 @@ function b64encodeUtf8(str) {
   const bytes = new TextEncoder().encode(str);
   let bin=''; bytes.forEach(b=>bin+=String.fromCharCode(b)); return btoa(bin);
 }
+function getGitPAT(){ return (GM_getValue('tpGitPAT') || '').trim(); }
+
 function ghGetSha(owner, repo, path, ref) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`;
-  const token = (GM_getValue('tpGitPAT') || '').trim();
+  const token = getGitPAT();
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
       method: 'GET', url,
@@ -571,9 +594,11 @@ function ghGetSha(owner, repo, path, ref) {
         'X-GitHub-Api-Version': '2022-11-28'
       },
       onload: r => {
-        if (r.status === 200) { try { const js = JSON.parse(r.responseText); resolve({ sha: js.sha, exists: true }); } catch(_) { resolve({ sha:null, exists:true }); } }
-        else if (r.status === 404) resolve({ sha:null, exists:false });
-        else reject(new Error('GitHub GET sha: HTTP '+r.status));
+        if (r.status === 200) {
+          try { const js = JSON.parse(r.responseText); resolve({ sha: js.sha, exists: true }); }
+          catch(_) { resolve({ sha:null, exists:true }); }
+        } else if (r.status === 404) resolve({ sha:null, exists:false });
+        else reject(new Error('GitHub GET sha: HTTP '+r.status+' :: '+String(r.responseText||'').slice(0,160)));
       },
       onerror: e => reject(e)
     });
@@ -581,7 +606,7 @@ function ghGetSha(owner, repo, path, ref) {
 }
 function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`;
-  const token = (GM_getValue('tpGitPAT') || '').trim();
+  const token = getGitPAT();
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
       method: 'PUT', url,
@@ -592,7 +617,10 @@ function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
         'Content-Type': 'application/json;charset=UTF-8'
       },
       data: JSON.stringify({ message, content: base64Content, branch, ...(sha ? { sha } : {}) }),
-      onload: r => { (r.status===200 || r.status===201) ? resolve(r.responseText) : reject(new Error('GitHub PUT: HTTP '+r.status+' '+(r.responseText||''))); },
+      onload: r => {
+        if (r.status===200 || r.status===201) resolve(r.responseText);
+        else reject(new Error('GitHub PUT: HTTP '+r.status+' :: '+String(r.responseText||'').slice(0,260)));
+      },
       onerror: e => reject(e)
     });
   });
@@ -675,6 +703,10 @@ async function fetchExcelAsCSVText() {
   return null;
 }
 async function fetchExcelAsCSVAndUpload() {
+  // guard: PAT must exist
+  const pat = getGitPAT();
+  if (!pat) { showToast('Indsæt GitHub PAT i ⚙️ først.'); throw new Error('Missing GitHub PAT'); }
+
   const text = await fetchExcelAsCSVText();
   if (!text) { showToastOnce('csv', 'Temponizer gav ingen rækker – beholdt eksisterende CSV.'); return; }
   const lines = (text || '').trim().split(/\r?\n/).filter(Boolean);
@@ -724,7 +756,7 @@ function injectUI() {
 
   document.body.appendChild(d);
 
-  // Gear (flydende, tæt ved panel)
+  // Gear
   if (!document.getElementById('tpGear')) {
     const gear = document.createElement('div');
     gear.id = 'tpGear'; gear.title = 'Indstillinger'; gear.innerHTML = '⚙️';
@@ -806,10 +838,15 @@ function injectUI() {
       inp.addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); GM_setValue('tpUserKey',(inp.value||'').trim()); showToast('USER-token gemt.'); }});
 
       pat.value = (GM_getValue('tpGitPAT') || '');
-      pat.addEventListener('change', () => GM_setValue('tpGitPAT', pat.value || ''));
+      // persist PAT on input (no need to blur)
+      pat.addEventListener('input', () => GM_setValue('tpGitPAT', pat.value || ''));
 
+      // Upload selected local CSV → GitHub
       up.addEventListener('click', async () => {
         try {
+          // ensure PAT is persisted now
+          GM_setValue('tpGitPAT', (pat.value||'').trim());
+          if (!getGitPAT()) { showToast('Indsæt GitHub PAT i ⚙️ først.'); return; }
           if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
           const text = await file.files[0].text();
           const base64 = b64encodeUtf8(text);
@@ -818,19 +855,31 @@ function injectUI() {
           await ghPutFile(PB_OWNER, PB_REPO, PB_CSV, base64, 'sync: upload CSV via TM', sha, PB_BRANCH);
           GM_setValue(CACHE_KEY_CSV, text);
           pbh.textContent = 'CSV uploadet. RAW opdateres om få sek.'; showToast('CSV uploadet.');
-        } catch (e) { console.warn('[TP][PB][CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved CSV upload.'; showToast('Fejl – se konsol.'); }
+        } catch (e) {
+          console.warn('[TP][PB][CSV-UPLOAD]', e);
+          pbh.textContent = 'Fejl ved CSV upload (se konsol).';
+          showToast('GitHub-fejl: ' + (e && e.message ? e.message : 'ukendt'));
+        }
       });
 
+      // Auto: Excel → CSV → Upload
       csvUp.addEventListener('click', async () => {
         try {
+          // ensure PAT is persisted now
+          GM_setValue('tpGitPAT', (pat.value||'').trim());
           pbh.textContent = 'Henter Excel, konverterer og uploader CSV …';
           const t0 = Date.now();
           await fetchExcelAsCSVAndUpload();
           const ms = Date.now()-t0;
           pbh.textContent = `Færdig på ${ms} ms.`;
-        } catch (e) { console.warn('[TP][PB][EXCEL→CSV-UPLOAD]', e); pbh.textContent = 'Fejl ved Excel→CSV upload.'; showToast('Fejl – se konsol.'); }
+        } catch (e) {
+          console.warn('[TP][PB][EXCEL→CSV-UPLOAD]', e);
+          pbh.textContent = 'Fejl ved Excel→CSV upload (se konsol).';
+          showToast('GitHub/Excel-fejl: ' + (e && e.message ? e.message : 'ukendt'));
+        }
       });
 
+      // TEST lookup (RAW CSV)
       tBtn.addEventListener('click', async () => {
         try {
           const raw = (tIn.value||'').trim();
@@ -857,7 +906,7 @@ function injectUI() {
           const m = raw.match(/@version\s+([0-9.]+)/);
           if (!m) { showToast('Kunne ikke læse remote version.'); return; }
           const remote = m[1];
-          if (remote === TP_VERSION) showToast('Du kører allerede nyeste version ('+remote+')..');
+          if (remote === TP_VERSION) showToast('Du kører allerede nyeste version ('+remote+').');
           else { showToast('Ny version tilgængelig: '+remote+' (du kører '+TP_VERSION+'). Åbner opdatering…'); window.open(SCRIPT_RAW_URL, '_blank'); }
         } catch(_) { showToast('Update-tjek fejlede.'); }
       });
@@ -1140,8 +1189,8 @@ function tpTestPushoverBoth(){
 document.addEventListener('click', e => {
   const a = e.target.closest && e.target.closest('a');
   if (a && /Beskeder/.test(a.textContent || '')) {
-    const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
-    stMsg.lastPush = stMsg.lastSent = 0; saveJsonIfLeader(ST_MSG_KEY, stMsg);
+    const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
+    stMsg.lastPush = stMsg.lastSent = 0; stMsg.pending = 0; saveJsonIfLeader(ST_MSG_KEY, stMsg);
   }
 });
 tryBecomeLeader();
