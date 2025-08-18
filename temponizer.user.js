@@ -2,7 +2,7 @@
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
 // @version      7.11.2
-// @description  Push (leader + suppression + pending flush), OS/DOM toast (global anti-dupe; virker på tværs af faner), “Intet Svar”-auto-gem, caller-pop via RAW CSV, Excel→CSV→Upload (robust, warm-up) + tydelige GitHub-fejl. SMS mini-toggle (én knap). Kompakt UI nederst-højre. ⚙️-menu clamp + “klik-udenfor for at lukke”.
+// @description  Pushover + OS/DOM toast (no dupes, works across tabs & when minimized). Pending-flush for bursts. “Intet Svar”-auto, caller-pop via RAW CSV, Excel→CSV→Upload (med warm-up), navne i Interesse, én SMS-aktiver/deaktiver-knap (iframe). Kompakt UI nederst-højre. ⚙️-menu klamper til viewport og lukker ved klik udenfor.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -25,10 +25,10 @@ const TP_VERSION = '7.11.2';
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
 const POLL_MS     = 15000;
-const SUPPRESS_MS = 45000;
-const LOCK_MS     = SUPPRESS_MS + 5000;
+const SUPPRESS_MS = 45000; // “cooldown” for at undgå spam
+const LOCK_MS     = SUPPRESS_MS + 5000; // toast-lås
 
-// Cross-tab leader
+// (Leader bevares til evt. fremtid, men pollers kører nu i ALLE faner)
 const LEADER_KEY = 'tpLeaderV1';
 const HEARTBEAT_MS = 5000;
 const LEASE_MS     = 15000;
@@ -69,7 +69,6 @@ async function primeCSVCache(){
 }
 
 /*──────── 2) TOASTS (OS + DOM) + cross-tab broadcast ────────*/
-// Global anti-duplication + cross-tab broadcast
 const TOAST_EVT_KEY = 'tpToastEventV1';
 function broadcastToast(type, msg) {
   try {
@@ -84,7 +83,8 @@ window.addEventListener('storage', e => {
     const seenKey = 'tpToastSeen_' + ev.id;
     if (localStorage.getItem(seenKey)) return;
     localStorage.setItem(seenKey, '1');
-    showDOMToast(ev.msg); // alle non-origin tabs viser kun DOM-toast
+    // vis DOM toast i andre faner
+    showDOMToast(ev.msg);
   } catch (_) {}
 });
 
@@ -97,15 +97,18 @@ function showToastOnce(key, msg) {
   showToast(msg);
 }
 
-// OS notifikation må nu ske i ALLE faner (anti-dupe via lock ovenfor)
+// VIGTIGT: OS-notifikation TILLADES i ALLE faner (ikke kun leader)
+// → så du får popup selv hvis den “udpegede” fane er throttlet/sovende.
 function showToast(msg) {
   if ('Notification' in window) {
     if (Notification.permission === 'granted') {
-      try { new Notification('Temponizer', { body: msg }); return; } catch (_) {}
+      try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
+      return;
     } else if (Notification.permission !== 'denied') {
       Notification.requestPermission().then(p => {
-        if (p === 'granted') { try { new Notification('Temponizer', { body: msg }); return; } catch (_) {} }
-        showDOMToast(msg);
+        if (p === 'granted') {
+          try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
+        } else showDOMToast(msg);
       }).catch(()=> showDOMToast(msg));
       return;
     }
@@ -167,33 +170,33 @@ function sendPushover(msg) {
   });
 }
 
-/*──────── 4) STATE + LOCK + PENDING FLUSH ────────*/
+/*──────── 4) STATE + LOCK ────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
 const ST_MSG_KEY = 'tpPushState';
 const ST_INT_KEY = 'tpInterestState';
-
 function loadJson(key, fallback) { try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch (_) { return JSON.parse(JSON.stringify(fallback)); } }
-function saveJsonIfLeader(key, obj) { if (isLeader()) localStorage.setItem(key, JSON.stringify(obj)); }
+function saveJson(key, obj) { localStorage.setItem(key, JSON.stringify(obj)); }
+
 function takeLock() {
   const l = JSON.parse(localStorage.getItem('tpPushLock') || '{"t":0}');
   if (Date.now() - l.t < LOCK_MS) return false;
   localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() })); return true;
 }
 
-/* Pending flush så “bursts” ikke går tabt */
+/* Pending flush (løser “missed” ved suppression/locked) */
 function maybeFlushPending(kind, pushEnableKey, stateKey, buildMsg) {
   const st = loadJson(stateKey, {count:0,lastPush:0,lastSent:0,pending:0});
   if (st.pending && st.pending > (st.lastSent||0)) {
     if (Date.now() - st.lastPush > SUPPRESS_MS && takeLock()) {
-      const text = (typeof buildMsg === 'function') ? buildMsg(st.pending) : buildMsg;
+      const text = (typeof buildMsg === 'function') ? buildMsg(st.pending) : String(buildMsg);
       const enabled = localStorage.getItem(pushEnableKey) === 'true';
       if (enabled) sendPushover(text);
       showToastOnce(kind, text);
       st.lastPush = Date.now();
       st.lastSent = st.pending;
       st.pending  = 0;
-      saveJsonIfLeader(stateKey, st);
+      saveJson(stateKey, st);
       return true;
     }
   }
@@ -201,8 +204,8 @@ function maybeFlushPending(kind, pushEnableKey, stateKey, buildMsg) {
 }
 
 /*──────── 5) POLLERS: BESKED ────────*/
-function pollMessagesLeader() {
-  // flush evt. ventende burst først
+function pollMessages() {
+  // flush evt. pending
   maybeFlushPending('msg', 'tpPushEnableMsg', ST_MSG_KEY, (n)=>`🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`);
 
   fetch(MSG_URL + '&ts=' + Date.now(), { credentials: 'same-origin', cache: 'no-store', headers: {'Cache-Control':'no-cache','Pragma':'no-cache'} })
@@ -221,14 +224,15 @@ function pollMessagesLeader() {
           st.lastPush = Date.now();
           st.lastSent = n;
         } else {
-          st.pending = Math.max(st.pending||0, n); // kø til senere flush
+          // VIGTIGT: ikke sæt lastSent — vi køer til flush
+          st.pending = Math.max(st.pending||0, n);
         }
       } else if (n < st.count) {
         st.lastPush = 0;
         if (st.pending && n <= st.pending) st.pending = 0;
       }
 
-      st.count = n; saveJsonIfLeader(ST_MSG_KEY, st);
+      st.count = n; saveJson(ST_MSG_KEY, st);
 
       const badge = document.getElementById('tpMsgCountBadge'); setBadge(badge, n);
       const prevBadge = Number(localStorage.getItem('tpMsgPrevBadge')||0);
@@ -335,8 +339,8 @@ function buildInterestMsg(count) {
     : `👀 ${count} vikar(er) har vist interesse for ledige vagter.`;
 }
 
-function pollInterestLeader() {
-  // flush evt. ventende burst først
+function pollInterest() {
+  // flush evt. pending
   maybeFlushPending('int', 'tpPushEnableInt', ST_INT_KEY, buildInterestMsg);
 
   const force = mustForceParse();
@@ -369,7 +373,7 @@ function pollInterestLeader() {
         gIntPerPrev = perNow;
         markParsedNow();
 
-        // hent navne for de første stigende vagter
+        // Navne-hint for et udsnit af stigende vagter
         let namesHint = '';
         if (rising.length) {
           const toFetch = rising.slice(0, INT_NAMES_MAX_VAGTER);
@@ -395,7 +399,7 @@ function pollInterestLeader() {
         }
         if (namesHint) INT_NAME_HINT = namesHint;
 
-        // pending/locking + badges
+        // pending/lock logik
         const st = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
         if (total > st.count && total !== st.lastSent) {
           const canPush = (Date.now() - st.lastPush > SUPPRESS_MS) && takeLock();
@@ -412,7 +416,7 @@ function pollInterestLeader() {
           st.lastPush = 0;
           if (st.pending && total <= st.pending) st.pending = 0;
         }
-        st.count = total; saveJsonIfLeader(ST_INT_KEY, st);
+        st.count = total; saveJson(ST_INT_KEY, st);
 
         const badgeI = document.getElementById('tpIntCountBadge'); setBadge(badgeI, total);
         const prevBadge = Number(localStorage.getItem('tpIntPrevBadge')||0);
@@ -421,17 +425,17 @@ function pollInterestLeader() {
       });
     }
   })
-  .catch(e => console.warn('[TP][ERR][INT][leader][HEAD]', e));
+  .catch(e => console.warn('[TP][ERR][INT][HEAD]', e));
 }
 
-/*──────── 7) LEADER-ELECTION ────────*/
+/*──────── 7) LEADER-ELECTION (beholdt, men ikke kritisk) ────────*/
 function now() { return Date.now(); }
 function getLeader() { try { return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null'); } catch (_) { return null; } }
 function setLeader(obj) { localStorage.setItem(LEADER_KEY, JSON.stringify(obj)); }
 function isLeader() { const L = getLeader(); return !!(L && L.id === TAB_ID && L.until > now()); }
 function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.until || 0) <= t) { setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); } }
 function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
-window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*no-op*/} });
+window.addEventListener('storage', () => { /* noop */ });
 
 /*──────── 8) HTTP helpers ────────*/
 function gmGET(url) {
@@ -440,7 +444,19 @@ function gmGET(url) {
       method: 'GET',
       url,
       headers: { 'Accept': '*/*', 'Referer': location.href, 'Cache-Control':'no-cache','Pragma':'no-cache' },
-      onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status+' :: '+(r.responseText||'').slice(0,200))),
+      onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
+      onerror: e => reject(e)
+    });
+  });
+}
+function gmPOST(url, body) {
+  return new Promise((resolve, reject) => {
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded','Referer': location.href },
+      data: body,
+      onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
       onerror: e => reject(e)
     });
   });
@@ -580,7 +596,6 @@ function b64encodeUtf8(str) {
   let bin=''; bytes.forEach(b=>bin+=String.fromCharCode(b)); return btoa(bin);
 }
 function getGitPAT(){ return (GM_getValue('tpGitPAT') || '').trim(); }
-
 function ghGetSha(owner, repo, path, ref) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`;
   const token = getGitPAT();
@@ -593,10 +608,8 @@ function ghGetSha(owner, repo, path, ref) {
         'X-GitHub-Api-Version': '2022-11-28'
       },
       onload: r => {
-        if (r.status === 200) {
-          try { const js = JSON.parse(r.responseText); resolve({ sha: js.sha, exists: true }); }
-          catch(_) { resolve({ sha:null, exists:true }); }
-        } else if (r.status === 404) resolve({ sha:null, exists:false });
+        if (r.status === 200) { try { const js = JSON.parse(r.responseText); resolve({ sha: js.sha, exists: true }); } catch(_) { resolve({ sha:null, exists:true }); } }
+        else if (r.status === 404) resolve({ sha:null, exists:false });
         else reject(new Error('GitHub GET sha: HTTP '+r.status+' :: '+String(r.responseText||'').slice(0,160)));
       },
       onerror: e => reject(e)
@@ -625,7 +638,7 @@ function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
   });
 }
 
-/*──────── 11) EXCEL → CSV (warm-up) ────────*/
+/*──────── 11) EXCEL → CSV (auto) + warm-up ────────*/
 async function warmupExcelEndpoints(){
   try { await gmGET(location.origin + '/index.php?page=showmy_settings&t=' + Date.now()); } catch(_){}
   try { await gmGET(location.origin + '/index.php?page=print_vikar_list_custom_excel&t=' + Date.now()); } catch(_){}
@@ -666,8 +679,28 @@ async function tryExcelPOST(params) {
   const url = `${location.origin}/index.php?page=print_vikar_list_custom_excel`;
   return await gmPOSTArrayBuffer(url, params);
 }
+
+// RIGTIG warm-up (POST) der “varmer” printlisten
+function fmtTodayDK() {
+  const d = new Date();
+  const dd = String(d.getDate()).padStart(2,'0');
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const yyyy = d.getFullYear();
+  return `${dd}.${mm}.${yyyy}`;
+}
+async function warmUpVikarListSession() {
+  const today = encodeURIComponent(fmtTodayDK());
+  const body =
+    'page=vikarlist_get&ajax=true&showheader=true&printlist=true'+
+    '&fieldset_filtre=closed&fieldset_aktivitet=closed&kunder_id=0&kontor_id=-1&loenkorsel_id=0'+
+    '&sex=both&vagterfra=&vagtertil=&uddannelse_gyldig='+today+'&kompetencegyldig='+today;
+  await gmPOST(`${location.origin}/index.php`, body);
+}
+
 async function fetchExcelAsCSVText() {
+  try { await warmUpVikarListSession(); } catch(_){}
   await warmupExcelEndpoints();
+
   const tries = [
     { fn: tryExcelGET,  params: 'id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag' },
     { fn: tryExcelGET,  params: 'id=true&name=true&phone=true&cellphone=true' },
@@ -682,6 +715,7 @@ async function fetchExcelAsCSVText() {
       if (csv) return csv;
     } catch (_) {}
   }
+
   await warmupExcelEndpoints();
   const postTries = [
     { fn: tryExcelPOST, params: 'id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag' },
@@ -701,7 +735,6 @@ async function fetchExcelAsCSVText() {
   return null;
 }
 async function fetchExcelAsCSVAndUpload() {
-  // guard: PAT must exist
   const pat = getGitPAT();
   if (!pat) { showToast('Indsæt GitHub PAT i ⚙️ først.'); throw new Error('Missing GitHub PAT'); }
 
@@ -727,8 +760,7 @@ function injectUI() {
   d.style.cssText = [
     'position:fixed','z-index:2147483645','background:#fff','border:1px solid #d7d7d7',
     'padding:8px','border-radius:8px','font-size:12px','font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
-    'box-shadow:0 8px 24px rgba(0,0,0,.15)','max-width:240px','min-width:170px','line-height:1.25',
-    'bottom:12px','right:8px'  // start nederst-højre
+    'box-shadow:0 8px 24px rgba(0,0,0,.15)','max-width:240px','min-width:170px','line-height:1.25'
   ].join(';');
 
   d.innerHTML =
@@ -755,7 +787,7 @@ function injectUI() {
 
   document.body.appendChild(d);
 
-  // Gear (flydende, tæt ved panel) — altid clampet i viewport
+  // Gear
   if (!document.getElementById('tpGear')) {
     const gear = document.createElement('div');
     gear.id = 'tpGear'; gear.title = 'Indstillinger'; gear.innerHTML = '⚙️';
@@ -836,14 +868,12 @@ function injectUI() {
       save.addEventListener('click', () => { GM_setValue('tpUserKey', (inp.value||'').trim()); showToast('USER-token gemt.'); });
       inp.addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); GM_setValue('tpUserKey',(inp.value||'').trim()); showToast('USER-token gemt.'); }});
 
-      // PAT gemmes live (input) og persisteres igen lige inden uploads
       pat.value = (GM_getValue('tpGitPAT') || '');
       pat.addEventListener('input', () => GM_setValue('tpGitPAT', pat.value || ''));
 
-      // Upload valgt CSV → GitHub
       up.addEventListener('click', async () => {
         try {
-          GM_setValue('tpGitPAT', (pat.value||'').trim()); // persist nu
+          GM_setValue('tpGitPAT', (pat.value||'').trim());
           if (!getGitPAT()) { showToast('Mangler GitHub PAT i ⚙️ → Telefonbog.'); return; }
           if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
           const text = await file.files[0].text();
@@ -860,11 +890,9 @@ function injectUI() {
         }
       });
 
-      // Auto: Excel → CSV → Upload
       csvUp.addEventListener('click', async () => {
         try {
-          GM_setValue('tpGitPAT', (pat.value||'').trim()); // persist nu
-          if (!getGitPAT()) { pbh.textContent = 'Mangler GitHub PAT – indsæt først.'; showToast('Mangler GitHub PAT i ⚙️ → Telefonbog.'); return; }
+          GM_setValue('tpGitPAT', (pat.value||'').trim());
           pbh.textContent = 'Henter Excel, konverterer og uploader CSV …';
           const t0 = Date.now();
           await fetchExcelAsCSVAndUpload();
@@ -877,7 +905,6 @@ function injectUI() {
         }
       });
 
-      // TEST lookup (RAW CSV)
       tBtn.addEventListener('click', async () => {
         try {
           const raw = (tIn.value||'').trim();
@@ -905,78 +932,57 @@ function injectUI() {
           if (!m) { showToast('Kunne ikke læse remote version.'); return; }
           const remote = m[1];
           if (remote === TP_VERSION) showToast('Du kører allerede nyeste version ('+remote+').');
-          else { showToast('Ny version: '+remote+' (din: '+TP_VERSION+'). Åbner…'); window.open(SCRIPT_RAW_URL, '_blank'); }
+          else { showToast('Ny version tilgængelig: '+remote+' (du kører '+TP_VERSION+'). Åbner opdatering…'); window.open(SCRIPT_RAW_URL, '_blank'); }
         } catch(_) { showToast('Update-tjek fejlede.'); }
       });
 
       return menu;
     }
 
-    function clamp(x, min, max){ return Math.max(min, Math.min(max, x)); }
-
     function positionMenu(menu) {
       const pr = d.getBoundingClientRect();
       const mw = Math.min(menu.offsetWidth || 380, window.innerWidth - 16);
-      const mh = Math.min(menu.offsetHeight || 420, Math.floor(window.innerHeight * 0.7));
+      const mh = Math.min(menu.offsetHeight || 320, Math.floor(window.innerHeight * 0.7));
       let top = pr.top - mh - 10;
       let below = false;
       if (top < 8) { top = pr.bottom + 8; below = true; }
       let left = pr.right - mw;
-      left = clamp(left, 8, window.innerWidth - mw - 8);
+      if (left < 8) left = 8;
+      if (left + mw > window.innerWidth - 8) left = window.innerWidth - 8 - mw;
       if (below && top + mh > window.innerHeight - 8) top = Math.max(8, window.innerHeight - 8 - mh);
       Object.assign(menu.style, { left:left+'px', top:top+'px', right:'auto', bottom:'auto', display:'block', maxWidth:'calc(100vw - 16px)', maxHeight:'70vh' });
     }
 
     function toggleMenu(show) {
       const mnu = buildMenu();
-      if (show === false) { mnu.style.display = 'none'; cleanupOutside(); return; }
-      if (mnu.style.display === 'block') { mnu.style.display = 'none'; cleanupOutside(); return; }
-      mnu.style.display = 'block'; mnu.style.visibility = 'hidden';
-      setTimeout(() => { positionMenu(mnu); mnu.style.visibility = 'visible'; }, 0);
-      bindOutside();
+      if (show === false) { mnu.style.display = 'none'; return; }
+      mnu.style.display = (mnu.style.display === 'block' ? 'none' : 'block');
+      if (mnu.style.display === 'block') {
+        mnu.style.visibility = 'hidden';
+        positionMenu(mnu); mnu.style.visibility = 'visible';
+        const inp  = mnu.querySelector('#tpUserKeyMenu');
+        const pat  = mnu.querySelector('#tpGitPAT');
+        inp.value = getUserKey();
+        pat.value = (GM_getValue('tpGitPAT') || '');
+
+        // klik udenfor → luk
+        const outside = (e) => {
+          if (!mnu || mnu.style.display !== 'block') return cleanup();
+          if (e.target === mnu || mnu.contains(e.target) || e.target === gear) return;
+          mnu.style.display = 'none'; cleanup();
+        };
+        const esc = (e) => { if (e.key === 'Escape') { if (mnu) mnu.style.display='none'; cleanup(); } };
+        function cleanup(){ document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', esc, true); }
+        document.addEventListener('mousedown', outside, true);
+        document.addEventListener('keydown', esc, true);
+      }
     }
     gear.addEventListener('click', () => toggleMenu());
 
-    // “klik udenfor” + ESC + scroll/resize → luk
-    let outsideBound = false;
-    function cleanupOutside(){
-      if (!outsideBound) return;
-      document.removeEventListener('mousedown', outsideHandler, true);
-      document.removeEventListener('keydown', escHandler, true);
-      window.removeEventListener('scroll', resizeScrollHandler, true);
-      window.removeEventListener('resize', resizeScrollHandler, true);
-      outsideBound = false;
-    }
-    function bindOutside(){
-      if (outsideBound) return;
-      outsideBound = true;
-      document.addEventListener('mousedown', outsideHandler, true);
-      document.addEventListener('keydown', escHandler, true);
-      window.addEventListener('scroll', resizeScrollHandler, true);
-      window.addEventListener('resize', resizeScrollHandler, true);
-    }
-    function outsideHandler(e){
-      const mnu = document.querySelector('#tpGear').nextSibling; // rough
-      const menu = document.querySelector('div[style*="Indstillinger"]') || mnu; // fallback
-      const realMenu = document.querySelector('#tpGear') ? document.querySelectorAll('div').length && document.querySelectorAll('div')[0] : null;
-      const mm = document.body.querySelector('div[style*="Indstillinger"]') || document.body; // not reliable, use buildMenu ref
-      const ref = buildMenu();
-      if (!ref || ref.style.display !== 'block') { cleanupOutside(); return; }
-      if (ref.contains(e.target) || gear.contains(e.target)) return;
-      ref.style.display = 'none'; cleanupOutside();
-    }
-    function escHandler(e){ if (e.key === 'Escape') { const ref = buildMenu(); ref.style.display='none'; cleanupOutside(); } }
-    function resizeScrollHandler(){ const ref = buildMenu(); if (ref.style.display === 'block') { ref.style.display='none'; cleanupOutside(); } }
-
-    // Gear tæt ved panel — clamp i viewport
     function positionGearNearPanel(){
       const r = d.getBoundingClientRect();
-      let gx = r.right - 11;
-      let gy = r.top   - 11;
-      gx = clamp(gx, 8, window.innerWidth - 22 - 8);
-      gy = clamp(gy, 8, window.innerHeight - 22 - 8);
-      gear.style.left = gx + 'px';
-      gear.style.top  = gy + 'px';
+      gear.style.left = Math.min(Math.max(8, r.right - 11), window.innerWidth - 22 - 8) + 'px';
+      gear.style.top  = Math.max(8, r.top - 11) + 'px';
     }
     window.addEventListener('resize', positionGearNearPanel);
     positionGearNearPanel();
@@ -992,6 +998,12 @@ function injectUI() {
 
   // drag
   makeDraggable(d, POS_KEY, '#tpHeader');
+
+  // **Always start bottom-right (still draggable)**
+  d.style.bottom = '12px';
+  d.style.right  = '8px';
+  d.style.top    = 'auto';
+  d.style.left   = 'auto';
 
   // SMS UI
   initSMSControls(d);
@@ -1022,14 +1034,7 @@ function makeDraggable(el, storageKey, handleSelector) {
     el.style.left = x + 'px'; el.style.top = y + 'px';
     el.style.right='auto'; el.style.bottom='auto';
     savePos(x, y);
-    const gear = document.getElementById('tpGear');
-    if (gear) {
-      const r = el.getBoundingClientRect();
-      let gx = Math.min(window.innerWidth - 30, Math.max(8, r.right - 11));
-      let gy = Math.min(window.innerHeight - 30, Math.max(8, r.top - 11));
-      gear.style.left = gx + 'px';
-      gear.style.top  = gy + 'px';
-    }
+    positionGearNearPanel();
   });
   document.addEventListener('mouseup', () => drag = null);
   window.addEventListener('resize', clampPanelIntoView);
@@ -1048,6 +1053,29 @@ function clampPanelIntoView(){
   d.style.left = x + 'px'; d.style.top = y + 'px';
   d.style.right='auto'; d.style.bottom='auto';
   savePos(x, y);
+  positionGearNearPanel();
+}
+function positionGearNearPanel(){
+  const d = document.getElementById('tpPanel'); const gear = document.getElementById('tpGear');
+  if (!d || !gear) return;
+  const r = d.getBoundingClientRect();
+  gear.style.left = Math.min(Math.max(8, r.right - 11), window.innerWidth - 22 - 8) + 'px';
+  gear.style.top  = Math.max(8, r.top - 11) + 'px';
+}
+function ensureFullyVisible(el, margin = 8) {
+  if (!el) return;
+  const r = el.getBoundingClientRect();
+  let left = r.left, top = r.top;
+  const w = r.width, h = r.height;
+  if (left < margin) left = margin;
+  if (top  < margin) top  = margin;
+  if (left + w > window.innerWidth  - margin) left = Math.max(margin, window.innerWidth  - margin - w);
+  if (top  + h > window.innerHeight - margin) top = Math.max(margin, window.innerHeight - margin - h);
+  el.style.position = 'fixed';
+  el.style.left = left + 'px';
+  el.style.top  = top  + 'px';
+  el.style.right  = 'auto';
+  el.style.bottom = 'auto';
 }
 
 /* Badges */
@@ -1165,6 +1193,7 @@ const sms = {
   }
 };
 function initSMSControls(root){
+  const row   = root.querySelector('#tpSMS');
   const lbl   = root.querySelector('#tpSMSStatus');
   const btn   = root.querySelector('#tpSMSOneBtn');
   function setBusy(on, text){ btn.disabled = on; btn.style.opacity = on ? .6 : 1; if (on && text) lbl.textContent = text; }
@@ -1198,38 +1227,31 @@ document.addEventListener('click', e => {
   const a = e.target.closest && e.target.closest('a');
   if (a && /Beskeder/.test(a.textContent || '')) {
     const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
-    stMsg.lastPush = stMsg.lastSent = 0; stMsg.pending = 0; saveJsonIfLeader(ST_MSG_KEY, stMsg);
+    stMsg.lastPush = stMsg.lastSent = 0; stMsg.pending = 0; saveJson(ST_MSG_KEY, stMsg);
   }
 });
+
+// Leader liv, men ikke afgørende længere
 tryBecomeLeader();
 setInterval(heartbeatIfLeader, HEARTBEAT_MS);
 setInterval(tryBecomeLeader, HEARTBEAT_MS + 1200);
 
+// Caller-pop + UI + CSV prime
 callerPopIfNeeded().catch(()=>{});
 injectUI();
 try { primeCSVCache(); } catch(_){}
 
-// Første kørsel + løbende poll (kun leader)
-function leaderLoop(){
-  if (!isLeader()) return;
-  pollMessagesLeader();
-  pollInterestLeader();
-}
-leaderLoop();
-setInterval(() => { if (isLeader()) pollMessagesLeader(); }, POLL_MS);
-setInterval(() => { if (isLeader()) pollInterestLeader(); }, POLL_MS);
+// Pollers kører i ALLE faner (dup-beskyttet via lock/pending/once)
+function doPoll() { pollMessages(); pollInterest(); }
+doPoll();
+setInterval(doPoll, POLL_MS);
 
-// Når vinduet får fokus → prøv at flushe pending
-window.addEventListener('focus', () => {
-  if (isLeader()) {
-    maybeFlushPending('msg', 'tpPushEnableMsg', ST_MSG_KEY, (n)=>`🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`);
-    maybeFlushPending('int', 'tpPushEnableInt', ST_INT_KEY, buildInterestMsg);
-  }
-});
+// Ekstra: poll lige når man vender tilbage til tab (hurtig catch-up)
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') doPoll(); });
 
 console.info('[TP] kører version', TP_VERSION);
 
-/*──────── 15) “Intet Svar” (auto-gem uden popup) ────────*/
+/*──────── 15) HOVER “Intet Svar” (auto-gem uden popup) ────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
   function mkMenu() {
