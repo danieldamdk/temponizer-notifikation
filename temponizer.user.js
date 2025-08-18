@@ -1,26 +1,26 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.11.1
-// @description  Push (leader + suppression + pending flush), OS/DOM toast (cross-tab, no dupes), “Intet Svar”-auto-gem, caller-pop via RAW CSV, Excel→CSV→Upload (robust, with warm-up) + clearer GitHub errors. SMS mini-toggle. Compact UI.
+// @version      7.11.2
+// @description  Push (leader + suppression + pending flush), OS/DOM toast (global anti-dupe; virker på tværs af faner), “Intet Svar”-auto-gem, caller-pop via RAW CSV, Excel→CSV→Upload (robust, warm-up) + tydelige GitHub-fejl. SMS mini-toggle (én knap). Kompakt UI nederst-højre. ⚙️-menu clamp + “klik-udenfor for at lukke”.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
-// @noframes
 // @connect      api.pushover.net
 // @connect      raw.githubusercontent.com
 // @connect      api.github.com
 // @connect      ajourcare.temponizer.dk
 // @run-at       document-idle
+// @noframes
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.11.1';
+const TP_VERSION = '7.11.2';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -69,6 +69,7 @@ async function primeCSVCache(){
 }
 
 /*──────── 2) TOASTS (OS + DOM) + cross-tab broadcast ────────*/
+// Global anti-duplication + cross-tab broadcast
 const TOAST_EVT_KEY = 'tpToastEventV1';
 function broadcastToast(type, msg) {
   try {
@@ -83,7 +84,7 @@ window.addEventListener('storage', e => {
     const seenKey = 'tpToastSeen_' + ev.id;
     if (localStorage.getItem(seenKey)) return;
     localStorage.setItem(seenKey, '1');
-    if (!isLeader()) showDOMToast(ev.msg); // non-leader viser kun DOM
+    showDOMToast(ev.msg); // alle non-origin tabs viser kun DOM-toast
   } catch (_) {}
 });
 
@@ -95,17 +96,21 @@ function showToastOnce(key, msg) {
   broadcastToast(key, msg);
   showToast(msg);
 }
+
+// OS notifikation må nu ske i ALLE faner (anti-dupe via lock ovenfor)
 function showToast(msg) {
-  if (isLeader() && 'Notification' in window) {
+  if ('Notification' in window) {
     if (Notification.permission === 'granted') {
-      try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
+      try { new Notification('Temponizer', { body: msg }); return; } catch (_) {}
     } else if (Notification.permission !== 'denied') {
       Notification.requestPermission().then(p => {
-        if (p === 'granted') try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
-        else showDOMToast(msg);
-      });
-    } else { showDOMToast(msg); }
-  } else { showDOMToast(msg); }
+        if (p === 'granted') { try { new Notification('Temponizer', { body: msg }); return; } catch (_) {} }
+        showDOMToast(msg);
+      }).catch(()=> showDOMToast(msg));
+      return;
+    }
+  }
+  showDOMToast(msg);
 }
 function showDOMToast(msg) {
   const el = document.createElement('div');
@@ -162,7 +167,7 @@ function sendPushover(msg) {
   });
 }
 
-/*──────── 4) STATE + LOCK ────────*/
+/*──────── 4) STATE + LOCK + PENDING FLUSH ────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
 const MSG_KEYS = ['vagt_unread', 'generel_unread'];
 const ST_MSG_KEY = 'tpPushState';
@@ -176,7 +181,7 @@ function takeLock() {
   localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() })); return true;
 }
 
-/* Pending flush (fix for “missed notifications”) */
+/* Pending flush så “bursts” ikke går tabt */
 function maybeFlushPending(kind, pushEnableKey, stateKey, buildMsg) {
   const st = loadJson(stateKey, {count:0,lastPush:0,lastSent:0,pending:0});
   if (st.pending && st.pending > (st.lastSent||0)) {
@@ -197,8 +202,8 @@ function maybeFlushPending(kind, pushEnableKey, stateKey, buildMsg) {
 
 /*──────── 5) POLLERS: BESKED ────────*/
 function pollMessagesLeader() {
-  // Try flush any pending first
-  maybeFlushPending('msg', 'tpPushEnableMsg', ST_MSG_KEY, (n) => `🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`);
+  // flush evt. ventende burst først
+  maybeFlushPending('msg', 'tpPushEnableMsg', ST_MSG_KEY, (n)=>`🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`);
 
   fetch(MSG_URL + '&ts=' + Date.now(), { credentials: 'same-origin', cache: 'no-store', headers: {'Cache-Control':'no-cache','Pragma':'no-cache'} })
     .then(r => r.json())
@@ -210,17 +215,17 @@ function pollMessagesLeader() {
       if (n > st.count && n !== st.lastSent) {
         const canPush = (Date.now() - st.lastPush > SUPPRESS_MS) && takeLock();
         if (canPush) {
-          const m = '🔔 Du har nu ' + n + ' ulæst(e) Temponizer-besked(er).';
+          const m = `🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`;
           if (en) sendPushover(m);
           showToastOnce('msg', m);
           st.lastPush = Date.now();
           st.lastSent = n;
         } else {
-          st.pending = Math.max(st.pending||0, n); // queue til senere flush
+          st.pending = Math.max(st.pending||0, n); // kø til senere flush
         }
       } else if (n < st.count) {
         st.lastPush = 0;
-        if (st.pending && n <= st.pending) st.pending = 0; // reset pending hvis tæller falder
+        if (st.pending && n <= st.pending) st.pending = 0;
       }
 
       st.count = n; saveJsonIfLeader(ST_MSG_KEY, st);
@@ -229,8 +234,6 @@ function pollMessagesLeader() {
       const prevBadge = Number(localStorage.getItem('tpMsgPrevBadge')||0);
       if (n > prevBadge) badgePulse(badge);
       localStorage.setItem('tpMsgPrevBadge', String(n));
-
-      console.info('[TP-besked][leader]', n, new Date().toLocaleTimeString());
     })
     .catch(e => console.warn('[TP][ERR][MSG]', e));
 }
@@ -333,7 +336,7 @@ function buildInterestMsg(count) {
 }
 
 function pollInterestLeader() {
-  // Try flush any pending first
+  // flush evt. ventende burst først
   maybeFlushPending('int', 'tpPushEnableInt', ST_INT_KEY, buildInterestMsg);
 
   const force = mustForceParse();
@@ -366,7 +369,7 @@ function pollInterestLeader() {
         gIntPerPrev = perNow;
         markParsedNow();
 
-        // hent navne for et lille udsnit af stigende vagter
+        // hent navne for de første stigende vagter
         let namesHint = '';
         if (rising.length) {
           const toFetch = rising.slice(0, INT_NAMES_MAX_VAGTER);
@@ -392,7 +395,7 @@ function pollInterestLeader() {
         }
         if (namesHint) INT_NAME_HINT = namesHint;
 
-        // handle count with pending
+        // pending/locking + badges
         const st = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
         if (total > st.count && total !== st.lastSent) {
           const canPush = (Date.now() - st.lastPush > SUPPRESS_MS) && takeLock();
@@ -415,11 +418,7 @@ function pollInterestLeader() {
         const prevBadge = Number(localStorage.getItem('tpIntPrevBadge')||0);
         if (total > prevBadge) badgePulse(badgeI);
         localStorage.setItem('tpIntPrevBadge', String(total));
-
-        console.info('[TP-interesse][leader]', total, rising.length ? `rising=${rising.join(',')}` : '', new Date().toLocaleTimeString());
       });
-    } else {
-      console.info('[TP-interesse][leader] 304', new Date().toLocaleTimeString());
     }
   })
   .catch(e => console.warn('[TP][ERR][INT][leader][HEAD]', e));
@@ -430,7 +429,7 @@ function now() { return Date.now(); }
 function getLeader() { try { return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null'); } catch (_) { return null; } }
 function setLeader(obj) { localStorage.setItem(LEADER_KEY, JSON.stringify(obj)); }
 function isLeader() { const L = getLeader(); return !!(L && L.id === TAB_ID && L.until > now()); }
-function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.until || 0) <= t) { setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); if (isLeader()) console.info('[TP][LEADER] Denne fane er nu leader:', TAB_ID);} }
+function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.until || 0) <= t) { setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); } }
 function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
 window.addEventListener('storage', e => { if (e.key === LEADER_KEY) {/*no-op*/} });
 
@@ -441,38 +440,11 @@ function gmGET(url) {
       method: 'GET',
       url,
       headers: { 'Accept': '*/*', 'Referer': location.href, 'Cache-Control':'no-cache','Pragma':'no-cache' },
-      onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
+      onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status+' :: '+(r.responseText||'').slice(0,200))),
       onerror: e => reject(e)
     });
   });
 }
-
-// NEW (CSV-only scope): CSRF + fælles AJAX-headers til Temponizer POST/Excel
-function getCsrfToken() {
-  const m = document.querySelector('meta[name="csrf-token"]');
-  if (m && m.content) return m.content.trim();
-  const i = document.querySelector('input[name="csrf-token"], input[name="csrf_token"], input[name="token"]');
-  if (i && i.value) return i.value.trim();
-  return '';
-}
-function commonAjaxHeaders() {
-  const h = { 'X-Requested-With': 'XMLHttpRequest', 'Referer': location.href };
-  const t = getCsrfToken(); if (t) h['x-csrf-token'] = t;
-  return h;
-}
-function gmPOST(url, body) {
-  return new Promise((resolve, reject) => {
-    GM_xmlhttpRequest({
-      method: 'POST',
-      url,
-      headers: { ...commonAjaxHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-      data: body,
-      onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
-      onerror: e => reject(e)
-    });
-  });
-}
-
 function gmGETArrayBuffer(url) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
@@ -480,8 +452,8 @@ function gmGETArrayBuffer(url) {
       url,
       responseType: 'arraybuffer',
       headers: {
-        ...commonAjaxHeaders(),
         'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel;q=0.9, */*;q=0.8',
+        'Referer': location.href,
         'Cache-Control':'no-cache','Pragma':'no-cache'
       },
       onload: r => (r.status>=200 && r.status<300) ? resolve(r.response) : reject(new Error('HTTP '+r.status)),
@@ -496,9 +468,9 @@ function gmPOSTArrayBuffer(url, body) {
       url,
       responseType: 'arraybuffer',
       headers: {
-        ...commonAjaxHeaders(),
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel;q=0.9, */*;q=0.8',
+        'Referer': location.href,
         'Cache-Control':'no-cache','Pragma':'no-cache'
       },
       data: body,
@@ -575,7 +547,6 @@ async function callerPopIfNeeded() {
 
     const digitsRaw = rawStr.replace(/\*1500\s*$/,'').replace(/[^\d+]/g, '');
     const phone8 = normPhone(digitsRaw);
-    console.info('[TP][CALLER] Inbound', { raw: rawStr, dir: dirParam, digitsRaw, phone8 });
     tpBanner('Indgående kald: ' + (phone8 || '—') + ' — slår op …', 1600);
 
     if (!phone8) { tpBanner('Ukendt nummerformat: ' + rawStr, 4000); return; }
@@ -654,7 +625,7 @@ function ghPutFile(owner, repo, path, base64Content, message, sha, branch) {
   });
 }
 
-/*──────── 11) EXCEL → CSV (auto) + warm-up ────────*/
+/*──────── 11) EXCEL → CSV (warm-up) ────────*/
 async function warmupExcelEndpoints(){
   try { await gmGET(location.origin + '/index.php?page=showmy_settings&t=' + Date.now()); } catch(_){}
   try { await gmGET(location.origin + '/index.php?page=print_vikar_list_custom_excel&t=' + Date.now()); } catch(_){}
@@ -683,7 +654,6 @@ function pickBestSheetCSV(wb) {
     csv = normalizePhonebookHeader(csv);
     const lines = csv.trim().split(/\r?\n/).filter(Boolean);
     const dataRows = Math.max(0, lines.length - 1);
-    console.info('[TP][PB] Sheet:', name, 'rows:', dataRows);
     if (dataRows > best.rows) best = { rows: dataRows, csv };
   }
   return best.rows >= 1 ? best.csv : null;
@@ -696,77 +666,7 @@ async function tryExcelPOST(params) {
   const url = `${location.origin}/index.php?page=print_vikar_list_custom_excel`;
   return await gmPOSTArrayBuffer(url, params);
 }
-
-// NEW (CSV-only scope): rigtig warm-up der “varmer” printlisten på serveren
-function fmtTodayDK() {
-  const d = new Date();
-  const dd = String(d.getDate()).padStart(2,'0');
-  const mm = String(d.getMonth()+1).padStart(2,'0');
-  const yyyy = d.getFullYear();
-  return `${dd}.${mm}.${yyyy}`;
-}
-async function warmUpVikarListSession() {
-  const today = encodeURIComponent(fmtTodayDK());
-  const body =
-    'page=vikarlist_get' +
-    '&ajax=true' +
-    '&showheader=true' +
-    '&printlist=true' +
-    '&fieldset_filtre=closed' +
-    '&fieldset_aktivitet=closed' +
-    '&kunder_id=0' +
-    '&kunde_afdeling_id=' +
-    '&arbejdssteder_id=' +
-    '&searchFromUrl=false' +
-    '&query=' +
-    '&query_vikar_nr=' +
-    '&postnummer_fra=' +
-    '&postnummer_til=' +
-    '&fetchIds=' +
-    '&days_to_birthday=2' +
-    '&vagtonskeridag_dato=i+dag' +
-    '&vagtoenskeridag_starttidspunkt=' +
-    '&vagtoenskeridag_sluttidspunkt=' +
-    '&vagtoenskeridag_dag=true' +
-    '&vagtoenskeridag_aften=true' +
-    '&vagtoenskeridag_nat=true' +
-    '&vagtoenskeridag_heledag=true' +
-    '&ansaettelsesdato_datofra=' +
-    '&ansaettelsesdato_datotil=' +
-    '&ingenvagterfra=' +
-    '&ingenvagtertil=' +
-    '&medvagterfra=' +
-    '&medvagtertil=' +
-    '&medgodkendtevagterfra=' +
-    '&medgodkendtevagtertil=' +
-    '&afholdte_dato=' + today +
-    '&ingenvagtoenskerfra=' +
-    '&ingenvagtoenskertil=' +
-    '&sex=both' +
-    '&kontor_id=-1' +
-    '&udbetalingsmetode=-1' +
-    '&loenkorsel_id=0' +
-    '&kunde_radius_search=0' +
-    '&vikar_rolle=0' +
-    '&booking_grupper_id=-1' +
-    '&kunder_sel_width=400' +
-    '&kunder_sel_id=0' +
-    '&kunder_select_search=' +
-    '&kunder_id_0=0' +
-    '&vagterfra=' +
-    '&vagtertil=' +
-    '&list_uddannelse_id_all=true' +
-    '&uddannelse_gyldig=' + today +
-    '&kompetencegyldig=' + today;
-
-  await gmPOST(`${location.origin}/index.php`, body);
-}
-
 async function fetchExcelAsCSVText() {
-  // RIGTIG warm-up (POST) før Excel-eksport
-  try { await warmUpVikarListSession(); } catch (e) { console.warn('[TP][PB] warmUp (POST) fejlede — fortsætter:', e); }
-
-  // Behold eksisterende “blid” warm-up og GET-forsøg
   await warmupExcelEndpoints();
   const tries = [
     { fn: tryExcelGET,  params: 'id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag' },
@@ -782,8 +682,6 @@ async function fetchExcelAsCSVText() {
       if (csv) return csv;
     } catch (_) {}
   }
-
-  // Gentag blid warm-up og prøv POST-forsøg
   await warmupExcelEndpoints();
   const postTries = [
     { fn: tryExcelPOST, params: 'id=true&name=true&phone=true&cellphone=true&gdage_dato=i+dag' },
@@ -829,7 +727,8 @@ function injectUI() {
   d.style.cssText = [
     'position:fixed','z-index:2147483645','background:#fff','border:1px solid #d7d7d7',
     'padding:8px','border-radius:8px','font-size:12px','font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
-    'box-shadow:0 8px 24px rgba(0,0,0,.15)','max-width:240px','min-width:170px','line-height:1.25'
+    'box-shadow:0 8px 24px rgba(0,0,0,.15)','max-width:240px','min-width:170px','line-height:1.25',
+    'bottom:12px','right:8px'  // start nederst-højre
   ].join(';');
 
   d.innerHTML =
@@ -856,7 +755,7 @@ function injectUI() {
 
   document.body.appendChild(d);
 
-  // Gear
+  // Gear (flydende, tæt ved panel) — altid clampet i viewport
   if (!document.getElementById('tpGear')) {
     const gear = document.createElement('div');
     gear.id = 'tpGear'; gear.title = 'Indstillinger'; gear.innerHTML = '⚙️';
@@ -937,16 +836,15 @@ function injectUI() {
       save.addEventListener('click', () => { GM_setValue('tpUserKey', (inp.value||'').trim()); showToast('USER-token gemt.'); });
       inp.addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); GM_setValue('tpUserKey',(inp.value||'').trim()); showToast('USER-token gemt.'); }});
 
+      // PAT gemmes live (input) og persisteres igen lige inden uploads
       pat.value = (GM_getValue('tpGitPAT') || '');
-      // persist PAT on input (no need to blur)
       pat.addEventListener('input', () => GM_setValue('tpGitPAT', pat.value || ''));
 
-      // Upload selected local CSV → GitHub
+      // Upload valgt CSV → GitHub
       up.addEventListener('click', async () => {
         try {
-          // ensure PAT is persisted now
-          GM_setValue('tpGitPAT', (pat.value||'').trim());
-          if (!getGitPAT()) { showToast('Indsæt GitHub PAT i ⚙️ først.'); return; }
+          GM_setValue('tpGitPAT', (pat.value||'').trim()); // persist nu
+          if (!getGitPAT()) { showToast('Mangler GitHub PAT i ⚙️ → Telefonbog.'); return; }
           if (!file.files || !file.files[0]) { showToast('Vælg en CSV-fil først.'); return; }
           const text = await file.files[0].text();
           const base64 = b64encodeUtf8(text);
@@ -965,8 +863,8 @@ function injectUI() {
       // Auto: Excel → CSV → Upload
       csvUp.addEventListener('click', async () => {
         try {
-          // ensure PAT is persisted now
-          GM_setValue('tpGitPAT', (pat.value||'').trim());
+          GM_setValue('tpGitPAT', (pat.value||'').trim()); // persist nu
+          if (!getGitPAT()) { pbh.textContent = 'Mangler GitHub PAT – indsæt først.'; showToast('Mangler GitHub PAT i ⚙️ → Telefonbog.'); return; }
           pbh.textContent = 'Henter Excel, konverterer og uploader CSV …';
           const t0 = Date.now();
           await fetchExcelAsCSVAndUpload();
@@ -1007,40 +905,78 @@ function injectUI() {
           if (!m) { showToast('Kunne ikke læse remote version.'); return; }
           const remote = m[1];
           if (remote === TP_VERSION) showToast('Du kører allerede nyeste version ('+remote+').');
-          else { showToast('Ny version tilgængelig: '+remote+' (du kører '+TP_VERSION+'). Åbner opdatering…'); window.open(SCRIPT_RAW_URL, '_blank'); }
+          else { showToast('Ny version: '+remote+' (din: '+TP_VERSION+'). Åbner…'); window.open(SCRIPT_RAW_URL, '_blank'); }
         } catch(_) { showToast('Update-tjek fejlede.'); }
       });
 
       return menu;
     }
 
+    function clamp(x, min, max){ return Math.max(min, Math.min(max, x)); }
+
     function positionMenu(menu) {
       const pr = d.getBoundingClientRect();
-      const mw = menu.offsetWidth, mh = menu.offsetHeight;
-      let left = Math.max(8, Math.min(window.innerWidth - mw - 8, pr.right - mw));
-      let top  = Math.max(8, Math.min(window.innerHeight - mh - 8, pr.top - mh - 10 < 8 ? pr.bottom + 8 : pr.top - mh - 10));
-      Object.assign(menu.style, { left:left+'px', top:top+'px', right:'auto', bottom:'auto', position:'fixed' });
+      const mw = Math.min(menu.offsetWidth || 380, window.innerWidth - 16);
+      const mh = Math.min(menu.offsetHeight || 420, Math.floor(window.innerHeight * 0.7));
+      let top = pr.top - mh - 10;
+      let below = false;
+      if (top < 8) { top = pr.bottom + 8; below = true; }
+      let left = pr.right - mw;
+      left = clamp(left, 8, window.innerWidth - mw - 8);
+      if (below && top + mh > window.innerHeight - 8) top = Math.max(8, window.innerHeight - 8 - mh);
+      Object.assign(menu.style, { left:left+'px', top:top+'px', right:'auto', bottom:'auto', display:'block', maxWidth:'calc(100vw - 16px)', maxHeight:'70vh' });
     }
 
     function toggleMenu(show) {
       const mnu = buildMenu();
-      if (show === false) { mnu.style.display = 'none'; return; }
-      mnu.style.display = (mnu.style.display === 'block' ? 'none' : 'block');
-      if (mnu.style.display === 'block') {
-        mnu.style.visibility = 'hidden';
-        positionMenu(mnu); mnu.style.visibility = 'visible';
-        const inp  = mnu.querySelector('#tpUserKeyMenu');
-        const pat  = mnu.querySelector('#tpGitPAT');
-        inp.value = getUserKey();
-        pat.value = (GM_getValue('tpGitPAT') || '');
-      }
+      if (show === false) { mnu.style.display = 'none'; cleanupOutside(); return; }
+      if (mnu.style.display === 'block') { mnu.style.display = 'none'; cleanupOutside(); return; }
+      mnu.style.display = 'block'; mnu.style.visibility = 'hidden';
+      setTimeout(() => { positionMenu(mnu); mnu.style.visibility = 'visible'; }, 0);
+      bindOutside();
     }
     gear.addEventListener('click', () => toggleMenu());
 
+    // “klik udenfor” + ESC + scroll/resize → luk
+    let outsideBound = false;
+    function cleanupOutside(){
+      if (!outsideBound) return;
+      document.removeEventListener('mousedown', outsideHandler, true);
+      document.removeEventListener('keydown', escHandler, true);
+      window.removeEventListener('scroll', resizeScrollHandler, true);
+      window.removeEventListener('resize', resizeScrollHandler, true);
+      outsideBound = false;
+    }
+    function bindOutside(){
+      if (outsideBound) return;
+      outsideBound = true;
+      document.addEventListener('mousedown', outsideHandler, true);
+      document.addEventListener('keydown', escHandler, true);
+      window.addEventListener('scroll', resizeScrollHandler, true);
+      window.addEventListener('resize', resizeScrollHandler, true);
+    }
+    function outsideHandler(e){
+      const mnu = document.querySelector('#tpGear').nextSibling; // rough
+      const menu = document.querySelector('div[style*="Indstillinger"]') || mnu; // fallback
+      const realMenu = document.querySelector('#tpGear') ? document.querySelectorAll('div').length && document.querySelectorAll('div')[0] : null;
+      const mm = document.body.querySelector('div[style*="Indstillinger"]') || document.body; // not reliable, use buildMenu ref
+      const ref = buildMenu();
+      if (!ref || ref.style.display !== 'block') { cleanupOutside(); return; }
+      if (ref.contains(e.target) || gear.contains(e.target)) return;
+      ref.style.display = 'none'; cleanupOutside();
+    }
+    function escHandler(e){ if (e.key === 'Escape') { const ref = buildMenu(); ref.style.display='none'; cleanupOutside(); } }
+    function resizeScrollHandler(){ const ref = buildMenu(); if (ref.style.display === 'block') { ref.style.display='none'; cleanupOutside(); } }
+
+    // Gear tæt ved panel — clamp i viewport
     function positionGearNearPanel(){
       const r = d.getBoundingClientRect();
-      gear.style.left = (r.right - 11) + 'px';
-      gear.style.top  = (r.top   - 11) + 'px';
+      let gx = r.right - 11;
+      let gy = r.top   - 11;
+      gx = clamp(gx, 8, window.innerWidth - 22 - 8);
+      gy = clamp(gy, 8, window.innerHeight - 22 - 8);
+      gear.style.left = gx + 'px';
+      gear.style.top  = gy + 'px';
     }
     window.addEventListener('resize', positionGearNearPanel);
     positionGearNearPanel();
@@ -1056,12 +992,6 @@ function injectUI() {
 
   // drag
   makeDraggable(d, POS_KEY, '#tpHeader');
-
-  // **Always start bottom-right (still draggable)**
-  d.style.bottom = '12px';
-  d.style.right  = '8px';
-  d.style.top    = 'auto';
-  d.style.left   = 'auto';
 
   // SMS UI
   initSMSControls(d);
@@ -1092,7 +1022,14 @@ function makeDraggable(el, storageKey, handleSelector) {
     el.style.left = x + 'px'; el.style.top = y + 'px';
     el.style.right='auto'; el.style.bottom='auto';
     savePos(x, y);
-    positionGearNearPanel();
+    const gear = document.getElementById('tpGear');
+    if (gear) {
+      const r = el.getBoundingClientRect();
+      let gx = Math.min(window.innerWidth - 30, Math.max(8, r.right - 11));
+      let gy = Math.min(window.innerHeight - 30, Math.max(8, r.top - 11));
+      gear.style.left = gx + 'px';
+      gear.style.top  = gy + 'px';
+    }
   });
   document.addEventListener('mouseup', () => drag = null);
   window.addEventListener('resize', clampPanelIntoView);
@@ -1111,29 +1048,6 @@ function clampPanelIntoView(){
   d.style.left = x + 'px'; d.style.top = y + 'px';
   d.style.right='auto'; d.style.bottom='auto';
   savePos(x, y);
-  positionGearNearPanel();
-}
-function positionGearNearPanel(){
-  const d = document.getElementById('tpPanel'); const gear = document.getElementById('tpGear');
-  if (!d || !gear) return;
-  const r = d.getBoundingClientRect();
-  gear.style.left = (r.right - 11) + 'px';
-  gear.style.top  = (r.top   - 11) + 'px';
-}
-function ensureFullyVisible(el, margin = 8) {
-  if (!el) return;
-  const r = el.getBoundingClientRect();
-  let left = r.left, top = r.top;
-  const w = r.width, h = r.height;
-  if (left < margin) left = margin;
-  if (top  < margin) top  = margin;
-  if (left + w > window.innerWidth  - margin) left = Math.max(margin, window.innerWidth  - margin - w);
-  if (top  + h > window.innerHeight - margin) top = Math.max(margin, window.innerHeight - margin - h);
-  el.style.position = 'fixed';
-  el.style.left = left + 'px';
-  el.style.top  = top  + 'px';
-  el.style.right  = 'auto';
-  el.style.bottom = 'auto';
 }
 
 /* Badges */
@@ -1251,7 +1165,6 @@ const sms = {
   }
 };
 function initSMSControls(root){
-  const row   = root.querySelector('#tpSMS');
   const lbl   = root.querySelector('#tpSMSStatus');
   const btn   = root.querySelector('#tpSMSOneBtn');
   function setBusy(on, text){ btn.disabled = on; btn.style.opacity = on ? .6 : 1; if (on && text) lbl.textContent = text; }
@@ -1296,6 +1209,7 @@ callerPopIfNeeded().catch(()=>{});
 injectUI();
 try { primeCSVCache(); } catch(_){}
 
+// Første kørsel + løbende poll (kun leader)
 function leaderLoop(){
   if (!isLeader()) return;
   pollMessagesLeader();
@@ -1305,9 +1219,17 @@ leaderLoop();
 setInterval(() => { if (isLeader()) pollMessagesLeader(); }, POLL_MS);
 setInterval(() => { if (isLeader()) pollInterestLeader(); }, POLL_MS);
 
+// Når vinduet får fokus → prøv at flushe pending
+window.addEventListener('focus', () => {
+  if (isLeader()) {
+    maybeFlushPending('msg', 'tpPushEnableMsg', ST_MSG_KEY, (n)=>`🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`);
+    maybeFlushPending('int', 'tpPushEnableInt', ST_INT_KEY, buildInterestMsg);
+  }
+});
+
 console.info('[TP] kører version', TP_VERSION);
 
-/*──────── 15) HOVER “Intet Svar” (auto-gem uden popup) ────────*/
+/*──────── 15) “Intet Svar” (auto-gem uden popup) ────────*/
 (function () {
   var auto = false, icon = null, menu = null, hideT = null;
   function mkMenu() {
