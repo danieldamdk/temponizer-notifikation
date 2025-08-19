@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.11.3
-// @description  Pushover + OS/DOM toast (no dupes, works across tabs & when minimized). “Intet Svar”-auto, caller-pop via RAW CSV, Excel→CSV→Upload (warm-up), navne i Interesse, én SMS-aktiver/deaktiver-knap (iframe). Kompakt UI nederst-højre. ⚙️-menu klamper til viewport og lukker ved klik udenfor.
+// @version      7.11.4
+// @description  Pushover + OS/DOM toast (no dupes, på tværs af faner & når Chrome er minimeret). Pending-flush for bursts. “Intet Svar”-auto, caller-pop via RAW CSV, Excel→CSV→Upload (med warm-up), navne i Interesse, én SMS-aktiver/deaktiver-knap (iframe). Kompakt UI nederst-højre. ⚙️-menu klamper til viewport og lukker ved klik udenfor.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -20,15 +20,15 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.11.3';
+const TP_VERSION = '7.11.4';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
 const POLL_MS     = 15000;
-const SUPPRESS_MS = 45000; // Pushover-cooldown
-const LOCK_MS     = SUPPRESS_MS + 5000; // toast/OS-lås
+const SUPPRESS_MS = 45000; // “cooldown” for at undgå spam
+const LOCK_MS     = SUPPRESS_MS + 5000; // toast-lås
 
-// (Leader bevares til evt. fremtid, men pollers kører i ALLE faner)
+// (Leader bevares til evt. fremtid, men pollers kører nu i ALLE faner)
 const LEADER_KEY = 'tpLeaderV1';
 const HEARTBEAT_MS = 5000;
 const LEASE_MS     = 15000;
@@ -97,28 +97,17 @@ function showToastOnce(key, msg) {
   showToast(msg);
 }
 
-// Global OS-lås: kun 1 OS-notifikation ad gangen på tværs af alt
-function canShowOS() {
-  const key = 'tpOSLock';
-  try {
-    const o = JSON.parse(localStorage.getItem(key) || '{"t":0}');
-    return (Date.now() - o.t) > LOCK_MS;
-  } catch(_) { return true; }
-}
-function markOSShown() {
-  try { localStorage.setItem('tpOSLock', JSON.stringify({ t: Date.now() })); } catch(_) {}
-}
-
-// Viser OS hvis muligt, ellers DOM
+// OS-notifikation tillades i ALLE faner
 function showToast(msg) {
-  const osAllowed = canShowOS();
-  if (osAllowed && 'Notification' in window) {
+  if ('Notification' in window) {
     if (Notification.permission === 'granted') {
-      try { new Notification('Temponizer', { body: msg }); markOSShown(); return; } catch (_) { /* fallback til DOM */ }
+      try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
+      return;
     } else if (Notification.permission !== 'denied') {
       Notification.requestPermission().then(p => {
-        if (p === 'granted') { try { new Notification('Temponizer', { body: msg }); markOSShown(); } catch(_) { showDOMToast(msg); } }
-        else showDOMToast(msg);
+        if (p === 'granted') {
+          try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
+        } else showDOMToast(msg);
       }).catch(()=> showDOMToast(msg));
       return;
     }
@@ -188,38 +177,78 @@ const ST_INT_KEY = 'tpInterestState';
 function loadJson(key, fallback) { try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch (_) { return JSON.parse(JSON.stringify(fallback)); } }
 function saveJson(key, obj) { localStorage.setItem(key, JSON.stringify(obj)); }
 
-// Global “spam-lås” kun for Pushover (ikke for toast)
-function takePushLock() {
-  const l = JSON.parse(localStorage.getItem('tpPushLock') || '{"t":0}');
+// Per-kanal lock
+function takeLock(kind = 'global') {
+  const key = 'tpPushLock_' + kind;
+  const l = JSON.parse(localStorage.getItem(key) || '{"t":0}');
   if (Date.now() - l.t < LOCK_MS) return false;
-  localStorage.setItem('tpPushLock', JSON.stringify({ t: Date.now() })); return true;
+  localStorage.setItem(key, JSON.stringify({ t: Date.now() }));
+  return true;
+}
+
+/* Heal/normalisér state ved opstart */
+(function healStates(){
+  const fix = (key) => {
+    const st = loadJson(key, {count:0,lastPush:0,lastSent:0,pending:0});
+    if (typeof st.pending !== 'number') st.pending = 0;
+    if (st.lastSent > st.count) st.lastSent = st.count;
+    saveJson(key, st);
+  };
+  fix(ST_MSG_KEY);
+  fix(ST_INT_KEY);
+  // ryd gamle globale locks, hvis de findes
+  try { localStorage.removeItem('tpPushLock'); } catch(_) {}
+})();
+
+/* Pending flush (løser “missed” ved suppression/lock) */
+function maybeFlushPending(kind, pushEnableKey, stateKey, buildMsg) {
+  const st = loadJson(stateKey, {count:0,lastPush:0,lastSent:0,pending:0});
+  const shouldFlush = st.pending && (st.pending > (st.lastSent || 0) || st.pending > (st.count || 0));
+  if (shouldFlush) {
+    if (Date.now() - st.lastPush > SUPPRESS_MS && takeLock(kind)) {
+      const text = (typeof buildMsg === 'function') ? buildMsg(st.pending) : String(buildMsg);
+      const enabled = localStorage.getItem(pushEnableKey) === 'true';
+      if (enabled) sendPushover(text);
+      showToastOnce(kind, text);
+      st.lastPush = Date.now();
+      st.lastSent = st.pending;
+      st.pending  = 0;
+      saveJson(stateKey, st);
+      return true;
+    }
+  }
+  return false;
 }
 
 /*──────── 5) POLLERS: BESKED ────────*/
 function pollMessages() {
+  // flush evt. pending
+  maybeFlushPending('msg', 'tpPushEnableMsg', ST_MSG_KEY, (n)=>`🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`);
+
   fetch(MSG_URL + '&ts=' + Date.now(), { credentials: 'same-origin', cache: 'no-store', headers: {'Cache-Control':'no-cache','Pragma':'no-cache'} })
     .then(r => r.json())
     .then(d => {
-      const st = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
+      const st = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
       const n  = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
       const en = localStorage.getItem('tpPushEnableMsg') === 'true';
 
       if (n > st.count && n !== st.lastSent) {
-        const text = `🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`;
-
-        // Pushover respekterer cooldown + global push-lock
-        if ((Date.now() - st.lastPush > SUPPRESS_MS) && takePushLock()) {
-          if (en) sendPushover(text);
+        const canPush = (Date.now() - st.lastPush > SUPPRESS_MS) && takeLock('msg');
+        if (canPush) {
+          const m = `🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`;
+          if (en) sendPushover(m);
+          showToastOnce('msg', m);
           st.lastPush = Date.now();
+          st.lastSent = n;
+        } else {
+          // kø til flush
+          st.pending = Math.max(st.pending||0, n);
         }
-
-        // Toast/OS vises ALTID (dupes styres af showToastOnce + global OS-lås)
-        showToastOnce('msg', text);
-
-        st.lastSent = n;
       } else if (n < st.count) {
-        // Reset push-cooldown, så næste stigning kan pushe igen
+        // fald i count → tillad ny notifikation ved næste stigning
         st.lastPush = 0;
+        st.lastSent = n;
+        if (st.pending && n <= st.pending) st.pending = 0;
       }
 
       st.count = n; saveJson(ST_MSG_KEY, st);
@@ -330,6 +359,9 @@ function buildInterestMsg(count) {
 }
 
 function pollInterest() {
+  // flush evt. pending
+  maybeFlushPending('int', 'tpPushEnableInt', ST_INT_KEY, buildInterestMsg);
+
   const force = mustForceParse();
   fetch(HTML_URL, {
     method: 'HEAD',
@@ -386,23 +418,23 @@ function pollInterest() {
         }
         if (namesHint) INT_NAME_HINT = namesHint;
 
-        const st = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0});
+        // pending/lock logik
+        const st = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
         if (total > st.count && total !== st.lastSent) {
-          const text = buildInterestMsg(total);
-
-          // Pushover med cooldown + global push-lock
-          if ((Date.now() - st.lastPush > SUPPRESS_MS) && takePushLock()) {
+          const canPush = (Date.now() - st.lastPush > SUPPRESS_MS) && takeLock('int');
+          if (canPush) {
+            const text = buildInterestMsg(total);
             const en = localStorage.getItem('tpPushEnableInt') === 'true';
             if (en) sendPushover(text);
-            st.lastPush = Date.now();
+            showToastOnce('int', text);
+            st.lastPush = Date.now(); st.lastSent = total;
+          } else {
+            st.pending = Math.max(st.pending||0, total);
           }
-
-          // Toast/OS ALTID
-          showToastOnce('int', text);
-
-          st.lastSent = total;
         } else if (total < st.count) {
           st.lastPush = 0;
+          st.lastSent = total; // ← vigtigt
+          if (st.pending && total <= st.pending) st.pending = 0;
         }
         st.count = total; saveJson(ST_INT_KEY, st);
 
@@ -987,7 +1019,7 @@ function injectUI() {
   // drag
   makeDraggable(d, POS_KEY, '#tpHeader');
 
-  // Always start bottom-right (draggable)
+  // **Always start bottom-right (still draggable)**
   d.style.bottom = '12px';
   d.style.right  = '8px';
   d.style.top    = 'auto';
@@ -1213,8 +1245,8 @@ function tpTestPushoverBoth(){
 document.addEventListener('click', e => {
   const a = e.target.closest && e.target.closest('a');
   if (a && /Beskeder/.test(a.textContent || '')) {
-    const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0});
-    stMsg.lastPush = stMsg.lastSent = 0; saveJson(ST_MSG_KEY, stMsg);
+    const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
+    stMsg.lastPush = stMsg.lastSent = 0; stMsg.pending = 0; saveJson(ST_MSG_KEY, stMsg);
   }
 });
 
@@ -1226,14 +1258,21 @@ setInterval(tryBecomeLeader, HEARTBEAT_MS + 1200);
 // Caller-pop + UI + CSV prime
 callerPopIfNeeded().catch(()=>{});
 injectUI();
-try { primeCSVCache(); } catch(_){}
+try {
+  primeCSVCache();
+  // Ryd gamle toast/lock-låse én gang ved opstart af denne version
+  Object.keys(localStorage).forEach(k => {
+    if (k.startsWith('tpToastLock_')) localStorage.removeItem(k);
+    if (k === 'tpPushLock' || k.startsWith('tpPushLock_')) localStorage.removeItem(k);
+  });
+} catch(_){}
 
-// Pollers i ALLE faner (dupe-beskyttet via toast- og OS-låse + push-lock)
+// Pollers kører i ALLE faner (dup-beskyttet via lock/pending/once)
 function doPoll() { pollMessages(); pollInterest(); }
 doPoll();
 setInterval(doPoll, POLL_MS);
 
-// Ekstra: poll når man vender tilbage til tab (hurtig catch-up)
+// Ekstra: poll lige når man vender tilbage til tab (hurtig catch-up)
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') doPoll(); });
 
 console.info('[TP] kører version', TP_VERSION);
