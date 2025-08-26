@@ -32,16 +32,16 @@
 
   // 1) Notifikationer (besked + interesse + Pushover)
   TPNotifs.install({
-    pushoverToken: 'a27du13k8h2yf8p4wabxeukthr1fu7',
-    pollMs: 15000,
-    suppressMs: 45000,
-    msgUrl: location.origin + '/index.php?page=get_comcenter_counters&ajax=true',
-    interestUrl: location.origin + '/index.php?page=freevagter',
-    enableInterestNameHints: true,
-    rawPhonebookUrl: 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/vikarer.csv',
-    cacheKeyCSV: 'tpCSVCache'
+  pushoverToken: 'a27du13k8h2yf8p4wabxeukthr1fu7',
+  pollMs: 15000,
+  suppressMs: 45000,
+  msgUrl: location.origin + '/index.php?page=get_comcenter_counters&ajax=true',
+  interestUrl: location.origin + '/index.php?page=freevagter',
+  enableInterestNameHints: true,
+  rawPhonebookUrl: 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/vikarer.csv',
+  cacheKeyCSV: 'tpCSVCache'
   });
-
+  
   // 2) SMS-toggle (har egen lille fallback-UI hvis #tpSMS ikke findes)
   TPSms.install({ settingsUrl: location.origin + '/index.php?page=showmy_settings' });
 
