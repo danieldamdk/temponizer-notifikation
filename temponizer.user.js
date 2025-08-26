@@ -12,16 +12,15 @@
 // @connect      raw.githubusercontent.com
 // @connect      api.github.com
 // @connect      ajourcare.temponizer.dk
-// @connect      cdn.jsdelivr.net
 // @run-at       document-idle
 // @noframes
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js
+// @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/notifs.module.js
+// @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/sms.module.js
+// @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/excel.module.js
+// @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/caller.module.js
 // ==/UserScript==
 
 /* eslint-env browser */
