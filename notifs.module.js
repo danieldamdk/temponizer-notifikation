@@ -384,6 +384,7 @@
     showToastOnce('testok', 'Sendte Pushover-test (Besked + Interesse). Tjek Pushover.');
   }
 
-  const TPNotifs = { install, start, stop, testPushover, _cfg:()=>({ ...CFG }) };
-  try { window.TPNotifs = Object.freeze(TPNotifs); } catch(_){ window.TPNotifs = TPNotifs; }
+    const TPNotifs = { install, start, stop, testPushover, _cfg:()=>({ ...CFG }) };
+    const _root = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
+    try { _root.TPNotifs = Object.freeze(TPNotifs); } catch(_) { _root.TPNotifs = TPNotifs; }
 })();
