@@ -1,5 +1,5 @@
 /* eslint-env browser */
-/* global GM_xmlhttpRequest, GM_getValue, GM_setValue */
+/* global GM_xmlhttpRequest, GM_getValue, GM_setValue, unsafeWindow */
 // TPNotifs — komplet modul for besked- og interesse-notifikationer + Pushover + toasts
 // Selvstændigt: kaldes via TPNotifs.install({...}). Ingen afhængighed til andre moduler.
 // Funktioner:
