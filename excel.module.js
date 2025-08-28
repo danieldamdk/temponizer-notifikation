@@ -1,4 +1,16 @@
 /* eslint-env browser */
+/* eslint no-console: "off" */
+(function () {
+  'use strict';
+  const MOD = 'excel.module';           // ← skift til sms.module / excel.module / caller.module
+  const VER = 'v2025-08-28-01';          // ← valgfrit versionsstempel
+  const debug = localStorage.getItem('tpDebug') === '1';
+  const log = (...a) => { if (debug) console.info('[TP]', MOD, VER, ...a); };
+
+  log('loaded at', new Date().toISOString());
+  // ... resten af modulet ...
+})();
+
 /* global GM_xmlhttpRequest, GM_getValue, GM_setValue, XLSX */
 // TPExcel: Excel→CSV→Upload (GitHub) + CSV cache + test-lookup i telefonbog
 // Brug: TPExcel.install(opts) og/eller TPExcel.attachToMenu(menuEl)
