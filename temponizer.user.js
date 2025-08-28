@@ -2,7 +2,7 @@
 // @name         Temponizer → Pushover + Toast + Caller-Toast + SMS-toggle + Excel→CSV (AjourCare)
 // @namespace    ajourcare.dk
 // @version      7.11.5
-// @description  Modulært setup: (1) Besked/Interesse + Pushover + toasts (TPNotifs). (2) Caller-toast via Communicator-beacon (TPCaller) med klik-åbn profil i nyt faneblad. (3) SMS on/off via skjult iframe (TPSms). (4) Excel→CSV→Upload + test-lookup (TPExcel). Kompakt UI + ⚙️-menu.
+// @description  Modulært setup: Notifikationer (Besked/Interesse + Pushover), Caller-toast (klik for at åbne profil i nyt faneblad), SMS on/off, Excel→CSV→GitHub. Kompakt UI + ⚙️.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -10,17 +10,17 @@
 // @grant        unsafeWindow
 // @connect      api.pushover.net
 // @connect      api.github.com
-// @connect      ajourcare.temponizer.dk
 // @connect      cdn.jsdelivr.net
+// @connect      ajourcare.temponizer.dk
 // @run-at       document-idle
 // @noframes
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=7175
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=7175
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=7175
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=7175
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=7180
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=7180
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=7180
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=7180
 // ==/UserScript==
 
 /* eslint-env browser */
@@ -29,15 +29,12 @@
 (function () {
   'use strict';
 
-  /*──────── 0) Version + små helpers ────────*/
   const TP_VERSION = '7.11.5';
   function getUserKey() { try { return (GM_getValue('tpUserKey') || '').trim(); } catch (_) { return ''; } }
-  function setUserKey(v) { try { GM_SetValue ? GM_SetValue('tpUserKey', (v || '').trim()) : GM_setValue('tpUserKey', (v || '').trim()); } catch (_) {} }
+  function setUserKey(v) { try { GM_setValue('tpUserKey', (v || '').trim()); } catch (_) {} }
 
-  /*──────── 1) UI (kompakt panel + ⚙️) ────────*/
   function injectUI() {
     if (document.getElementById('tpPanel')) return;
-
     const wrap = document.createElement('div');
     wrap.id = 'tpPanel';
     wrap.style.cssText = [
@@ -56,10 +53,8 @@
         '<div id="tpSMSStatus" style="color:#666;margin-bottom:6px">Indlæser SMS-status…</div>' +
         '<button id="tpSMSOneBtn" style="padding:5px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Aktivér</button>' +
       '</div>';
-
     document.body.appendChild(wrap);
 
-    // Sync toggles (styrer kun Pushover – toasts vises altid)
     const cbMsg = wrap.querySelector('#tpEnableMsg');
     const cbInt = wrap.querySelector('#tpEnableInt');
     cbMsg.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
@@ -67,10 +62,8 @@
     cbMsg.onchange = () => localStorage.setItem('tpPushEnableMsg', cbMsg.checked ? 'true' : 'false');
     cbInt.onchange = () => localStorage.setItem('tpPushEnableInt', cbInt.checked ? 'true' : 'false');
 
-    // ⚙️ menu
     const gear = wrap.querySelector('#tpGearBtn');
     let menu = null;
-
     function buildMenu() {
       if (menu) return menu;
       menu = document.createElement('div');
@@ -106,29 +99,19 @@
         '</div>' +
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
         '<div style="font-size:11px;color:#666">Kører v.' + TP_VERSION + '</div>';
-
       document.body.appendChild(menu);
 
-      // Wire pushover token
       const inp = menu.querySelector('#tpUserKeyMenu');
       const save = menu.querySelector('#tpSaveUserKeyMenu');
       inp.value = getUserKey();
-      save.addEventListener('click', () => { setUserKey(inp.value); toast('USER-token gemt.'); });
-      inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); setUserKey(inp.value); toast('USER-token gemt.'); } });
+      save.addEventListener('click', () => { setUserKey(inp.value); try { new Notification('Temponizer', { body: 'USER-token gemt.' }); } catch(_){} });
+      inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); setUserKey(inp.value); try { new Notification('Temponizer', { body: 'USER-token gemt.' }); } catch(_){} } });
 
-      // Excel/CSV via modul (binder knapper/inputs i menuen)
       if (window.TPExcel && typeof window.TPExcel.attachToMenu === 'function') {
         window.TPExcel.attachToMenu(menu);
       }
       return menu;
     }
-
-    function toast(t) {
-      if ('Notification' in window) {
-        try { new Notification('Temponizer', { body: t }); } catch (_) { /* stille */ }
-      }
-    }
-
     function toggleMenu() {
       const m = buildMenu();
       m.style.display = (m.style.display === 'block') ? 'none' : 'block';
@@ -140,14 +123,17 @@
         document.addEventListener('keydown', esc, true);
       }
     }
+    const gear = wrap.querySelector('#tpGearBtn');
     gear.addEventListener('click', toggleMenu);
   }
 
-  /*──────── 2) Boot moduler ────────*/
   function boot() {
     injectUI();
 
-    // 2a) Notifikationer (besked + interesse + pushover)
+    // Brug jsDelivr til CSV (slipper for @connect raw.githubusercontent.com)
+    const CSV_JSDELIVR = 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/vikarer.csv';
+
+    // Notifikationer (besked + interesse + Pushover)
     TPNotifs.install({
       pushoverToken: 'a27du13k8h2yf8p4wabxeukthr1fu7',
       pollMs: 15000,
@@ -155,14 +141,14 @@
       msgUrl: location.origin + '/index.php?page=get_comcenter_counters&ajax=true',
       interestUrl: location.origin + '/index.php?page=freevagter',
       enableInterestNameHints: true,
-      rawPhonebookUrl: 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/vikarer.csv',
+      rawPhonebookUrl: CSV_JSDELIVR,
       cacheKeyCSV: 'tpCSVCache'
     });
 
-    // 2b) SMS toggle (binder på #tpSMS*)
+    // SMS toggle
     TPSms.install({ settingsUrl: location.origin + '/index.php?page=showmy_settings' });
 
-    // 2c) Excel/CSV/GitHub – init konfiguration (gear-menu binder sig selv via attachToMenu)
+    // Excel/CSV/GitHub
     TPExcel.install({
       owner: 'danieldamdk',
       repo: 'temponizer-notifikation',
@@ -173,23 +159,23 @@
       settingsUrl: location.origin + '/index.php?page=showmy_settings'
     });
 
-    // 2d) Caller-toast (Communicator beacon fanen auto-lukker)
+    // Caller-toast
     TPCaller.install({
       queueSuffix: '*1500',
       queueCode: '1500',
-      rawPhonebookUrl: 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/vikarer.csv',
+      rawPhonebookUrl: CSV_JSDELIVR,
       cacheKeyCSV: 'tpCSVCache',
       openInNewTab: true,
       debounceMs: 10000,
       autohideMs: 8000
     });
 
-    // 2e) Hvis vi er i beacon-fanen, så behandl og luk
+    // Hvis vi står i beacon-fanen, så behandl URL og luk
     if (TPCaller && typeof TPCaller.processFromUrl === 'function') {
       TPCaller.processFromUrl().catch(()=>{});
     }
 
-    // 2f) Bridge til page-window for Console-debug
+    // Bridge til page-window (så du kan kalde fra Console)
     try {
       const root = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
       root.TPNotifs = TPNotifs;
