@@ -1,16 +1,17 @@
 /* eslint-env browser */
 /* global GM_xmlhttpRequest, GM_getValue, GM_setValue, unsafeWindow */
 // Caller module for Temponizer (IPNordic Communicator integration)
-// v7.12.6-03 — beacon ACK + self-toast fallback (minimerer "tom fane"-problem)
-// - Communicator åbner URL med ?tp_caller=<nummer> (evt. + *1500). Denne fanes script udsender event til andre faner.
-// - Hvis ingen andre faner svarer (ACK) inden kort tid, vises toast i beacon-fanen og lukkes derefter automatisk.
-// - Nummer normaliseres (+45 fjernes, *suffix fjernes, sidste 8 cifre bruges). CSV-telefonbog bruges til navneopslag.
+// v7.12.6-04 — fix: no more about:blank, visible self-toast, smarter close/redirect
+// - Beacon udsender event; andre faner viser toast og kvitterer (ACK)
+// - Hvis ingen ACK: beacon viser SELV toast og redirect'er bagefter (ingen about:blank)
+// - Hvis ACK men denne fane er synlig (manuelt indsat URL): vis også kort toast her (mirror), og redirect
+// - Normaliserer nummer (+45, mellemrum, *suffix). Opslår navn i CSV. Debounce pr. nummer.
 
 (function(){
   'use strict';
   if (window.TPCaller?.installed) return;
 
-  const VER = 'v7.12.6-03';
+  const VER = 'v7.12.6-04';
   const NS  = `[TP][Caller ${VER}]`;
   const debug = localStorage.getItem('tpDebug') === '1';
   const dlog  = (...a) => { if (debug) console.info(NS, ...a); };
@@ -26,8 +27,11 @@
     eventKey: 'tpCallerEvtV2',
     ackPrefix: 'tpCallerAckV2:',
     lastKey: 'tpCallerLastV2',
-    waitAckMs: 280,           // hvor længe beacon venter på svar
-    selfToastMs: 1800,        // hurtig auto-luk når beacon viser selv
+    waitAckMs: 280,             // hvor længe beacon venter på svar
+    selfToastMs: 1800,          // varighed af toast når beacon selv viser
+    mirrorOnAckWhenVisible: true, // vis også i beacon hvis denne fane er aktiv
+    ackMirrorMs: 900,           // kort varighed ved ACK-mirror
+    frontUrl: '/index.php?page=front',
     z: 2147483646
   });
 
@@ -172,9 +176,14 @@
     return m ? m[1] : '';
   }
 
-  function tryClose(){
-    try{ window.close(); }catch(_){/* ignore */}
-    try{ setTimeout(()=>{ try{ window.open('','_self'); window.close(); }catch(_){} }, 50); }catch(_){/* ignore */}
+  function softClose(afterMs){
+    setTimeout(()=>{
+      let closed = false;
+      try{ window.close(); closed = window.closed === true; }catch(_){/* ignore */}
+      if (!closed){
+        try{ location.replace(CFG.frontUrl); }catch(_){/* ignore */}
+      }
+    }, Math.max(0, Number(afterMs)||0));
   }
 
   async function processFromUrl(){
@@ -185,18 +194,29 @@
       const p8 = hasDigits ? normPhone(raw) : '';
       const payload = hasDigits ? { phone8: p8 } : { secret:true };
       const ev = { id: Math.random().toString(36).slice(2)+now(), ts: now(), payload };
-      // gem seneste event (så en fane der åbnes få sekunder senere kan opfange den)
       try { localStorage.setItem(CFG.lastKey, JSON.stringify(ev)); } catch(_){/* ignore */}
       broadcast(ev);
       dlog('beacon broadcast', ev);
 
-      // vent kort på ACK — hvis ingen svar, vis selv og luk
       setTimeout(async ()=>{
-        const ack = localStorage.getItem(CFG.ackPrefix+ev.id);
-        if (!ack){
+        const acked = !!localStorage.getItem(CFG.ackPrefix+ev.id);
+        const p8key = payload.phone8 || (payload.secret ? 'secret' : 'x');
+        const seenKey = 'tpCallerSeen_'+p8key;
+
+        if (!acked){
+          // Beacon viser selv toast og markerer som set
+          try { localStorage.setItem(seenKey, String(now())); } catch(_){/* ignore */}
           await resolveAndShow(payload, CFG.selfToastMs);
+          softClose(CFG.selfToastMs + 200);
+        } else {
+          // Andre faner viser — men hvis denne fane er synlig (manuelt åbnet), så mirror kort
+          if (CFG.mirrorOnAckWhenVisible && document.visibilityState === 'visible'){
+            await resolveAndShow(payload, CFG.ackMirrorMs);
+            softClose(CFG.ackMirrorMs + 120);
+          } else {
+            softClose(40);
+          }
         }
-        tryClose();
       }, CFG.waitAckMs);
       return true;
     }catch(e){ dlog('processFromUrl error', e); return false; }
