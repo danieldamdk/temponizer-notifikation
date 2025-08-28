@@ -38,7 +38,7 @@
     cacheKeyCSV: 'tpCSVCache'           // hvor CSV-cachen bor i GM storage
   });
 
-  let CFG = { ...DEF };
+  let CFG = { .DEF };
 
   // ---------- State keys ----------
   const ST_MSG_KEY   = 'tpNotifs_msgStateV1';      // {count,lastPush,lastSent,pending}
@@ -338,12 +338,12 @@
             const collected = [];
             for (const vagtId of toFetch){
               const cached = gIntNamesCache.get(vagtId);
-              if (cached && (ts - cached.ts) < INT_NAMES_CACHE_TTL_MS && cached.names?.length){ collected.push(...cached.names); continue; }
+              if (cached && (ts - cached.ts) < INT_NAMES_CACHE_TTL_MS && cached.names?.length){ collected.push(.cached.names); continue; }
               try {
                 const popup = await fetchInterestPopupHTML(vagtId);
                 const names = parseInterestPopupNames(popup, lookup);
                 gIntNamesCache.set(vagtId, { ts, names });
-                if (names.length) collected.push(...names);
+                if (names.length) collected.push(.names);
               } catch(_){ /* ignore */ }
             }
             const merged = Array.from(new Set(collected));
@@ -379,7 +379,7 @@
   let _timer = null;
   function start(){ if (_timer) return; const tick = ()=>{ try { pollMessages(); pollInterest(); } catch(_){ /* noop */ } }; tick(); _timer = setInterval(tick, CFG.pollMs); document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') tick(); }); }
   function stop(){ if (_timer){ clearInterval(_timer); _timer = null; } }
-  function install(opts={}){ CFG = { ...DEF, ...(opts||{}) }; // heal
+  function install(opts={}){ CFG = { .DEF, ...(opts||{}) }; // heal
     const heal = (key)=>{ const st = loadJson(key, {count:0,lastPush:0,lastSent:0,pending:0}); if (typeof st.pending !== 'number') st.pending = 0; if (st.lastSent > st.count) st.lastSent = st.count; saveJson(key, st); };
     heal(ST_MSG_KEY); heal(ST_INT_KEY);
     try { localStorage.removeItem('tpPushLock'); } catch(_){ }
