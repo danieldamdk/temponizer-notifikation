@@ -5,7 +5,7 @@
   const MOD = 'sms.module';           // ← skift til sms.module / excel.module / caller.module
   const VER = 'v2025-08-28-01';          // ← valgfrit versionsstempel
   const debug = localStorage.getItem('tpDebug') === '1';
-  const log = (...a) => { if (debug) console.info('[TP]', MOD, VER, ...a); };
+  const log = (.a) => { if (debug) console.info('[TP]', MOD, VER, .a); };
 
   log('loaded at', new Date().toISOString());
   // ... resten af modulet ...
@@ -19,7 +19,7 @@
   'use strict';
 
   const DEF = Object.freeze({ settingsUrl: location.origin + '/index.php?page=showmy_settings' });
-  let CFG = { ...DEF };
+  let CFG = { .DEF };
   let _busy = false;
 
   function hasDisplayBlock(el){ if(!el) return false; const s=(el.getAttribute('style')||'').replace(/\s+/g,'').toLowerCase(); if (s.includes('display:none')) return false; if (s.includes('display:block')) return true; return false; }
@@ -96,7 +96,7 @@
   }
 
   const TPSms = {
-    install(opts={}){ CFG = { ...DEF, ...(opts||{}) }; const sec = ensureSection(); bindUI(sec); },
+    install(opts={}){ CFG = { .DEF, .(opts||{}) }; const sec = ensureSection(); bindUI(sec); },
     setEnabled: toggleSmsInIframe,
     getStatus: getSmsStatus,
   };
