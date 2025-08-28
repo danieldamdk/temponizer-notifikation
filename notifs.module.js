@@ -1,10 +1,9 @@
 /* eslint-env browser */
 /* global GM_xmlhttpRequest, GM_getValue, GM_setValue */
-// TPNotifs — besked- og interesse-notifikationer + Pushover + DOM-toasts + badges events
+// TPNotifs — besked- & interesse-notifikationer + Pushover + toasts + name-hints
 (function(){
   'use strict';
-  const VER = '2025-08-28-04';
-  try { console.info('[TP] notifs.module v'+VER+' loaded at', new Date().toISOString()); } catch(_) {}
+  console.info('[TP] notifs.module v2025-08-28-02 loaded at', new Date().toISOString());
 
   // ---------- Konfig ----------
   const DEF = Object.freeze({
@@ -15,23 +14,21 @@
     msgUrl: location.origin + '/index.php?page=get_comcenter_counters&ajax=true',
     interestUrl: location.origin + '/index.php?page=freevagter',
     enableInterestNameHints: true,
-    // Brug CDN som standard, så @connect raw.githubusercontent.com ikke er påkrævet
-    rawPhonebookUrl: 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/vikarer.csv',
+    rawPhonebookUrl: 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@v7.12.0/vikarer.csv',
     cacheKeyCSV: 'tpCSVCache'
   });
   let CFG = { ...DEF };
 
-  // ---------- Keys ----------
+  // ---------- State ----------
   const ST_MSG_KEY   = 'tpNotifs_msgStateV1';
   const ST_INT_KEY   = 'tpNotifs_intStateV1';
   const ETag_KEY     = 'tpNotifs_lastETagV1';
   const TOAST_EVTKEY = 'tpNotifs_toastEventV1';
 
-  // ---------- Utils ----------
-  const now = () => Date.now();
+  const now = ()=>Date.now();
   const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
-  function loadJson(key, fb){ try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fb)); } catch(_) { return JSON.parse(JSON.stringify(fb)); } }
-  function saveJson(key, obj){ localStorage.setItem(key, JSON.stringify(obj)); }
+  const loadJson = (k,fb)=>{ try{ return JSON.parse(localStorage.getItem(k)||JSON.stringify(fb)); } catch(_){ return JSON.parse(JSON.stringify(fb)); } };
+  const saveJson = (k,o)=> localStorage.setItem(k, JSON.stringify(o));
 
   function gmGET(url){
     return new Promise((resolve, reject) => {
@@ -52,7 +49,7 @@
     return true;
   }
 
-  // ---------- Toasts ----------
+  // ---------- Toasts (OS/DOM + cross-tab) ----------
   function showDOMToast(msg){
     const el = document.createElement('div');
     el.textContent = msg;
@@ -67,27 +64,25 @@
     setTimeout(()=>{ el.style.opacity=0; el.style.transform='translateY(8px)'; setTimeout(()=>el.remove(), 260); }, 4200);
   }
   function showToast(msg){
-    if ('Notification' in window) {
-      if (Notification.permission === 'granted') {
-        try { new Notification('Temponizer', { body: msg }); }
-        catch(_) { showDOMToast(msg); }
-        return;
-      } else if (Notification.permission !== 'denied') {
-        Notification.requestPermission()
-          .then(p => { if (p === 'granted') { try { new Notification('Temponizer', { body: msg }); } catch(_) { showDOMToast(msg); } else { showDOMToast(msg); } })
-          .catch(() => showDOMToast(msg));
+    if ('Notification' in window){
+      if (Notification.permission === 'granted') { try { new Notification('Temponizer', { body: msg }); } catch(_) { showDOMToast(msg); } return; }
+      if (Notification.permission !== 'denied'){
+        Notification.requestPermission().then(p=>{
+          if (p==='granted'){ try { new Notification('Temponizer', { body: msg }); } catch(_) { showDOMToast(msg); } else showDOMToast(msg);
+          }
+        }).catch(()=> showDOMToast(msg));
         return;
       }
     }
     showDOMToast(msg);
   }
-  function broadcastToast(key, msg){
-    try{
-      const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, key, msg, ts: Date.now() };
+  function broadcastToast(type, msg){
+    try {
+      const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, type, msg, ts: Date.now() };
       localStorage.setItem(TOAST_EVTKEY, JSON.stringify(ev));
-    } catch(_){ /* noop */ }
+    } catch(_){}
   }
-  window.addEventListener('storage', e => {
+  window.addEventListener('storage', e=>{
     if (e.key !== TOAST_EVTKEY || !e.newValue) return;
     try {
       const ev = JSON.parse(e.newValue);
@@ -95,8 +90,9 @@
       if (localStorage.getItem(seenKey)) return;
       localStorage.setItem(seenKey, '1');
       showDOMToast(ev.msg);
-    } catch(_){ /* noop */ }
+    } catch(_){}
   });
+
   function showToastOnce(key, msg){
     const lk = 'tpNotifs_toastLock_'+key;
     const o  = JSON.parse(localStorage.getItem(lk) || '{"t":0}');
@@ -107,13 +103,13 @@
   }
 
   // ---------- Pushover ----------
-  function getUserKey(){ try { return (GM_getValue('tpUserKey') || '').trim(); } catch(_) { return ''; } }
+  function getUserKey(){ try { return (GM_getValue('tpUserKey')||'').trim(); } catch(_) { return ''; } }
   function sendPushover(msg){
     const token = (CFG.pushoverToken||'').trim();
     const user  = getUserKey();
     if (!token || !user) return;
-    const body = 'token=' + encodeURIComponent(token) + '&user=' + encodeURIComponent(user) + '&message=' + encodeURIComponent(msg);
-    GM_xmlhttpRequest({ method:'POST', url:'https://api.pushover.net/1/messages.json', headers:{ 'Content-Type':'application/x-www-form-urlencoded' }, data: body });
+    const body = 'token='+encodeURIComponent(token)+'&user='+encodeURIComponent(user)+'&message='+encodeURIComponent(msg);
+    GM_xmlhttpRequest({ method:'POST', url:'https://api.pushover.net/1/messages.json', headers:{'Content-Type':'application/x-www-form-urlencoded'}, data: body });
   }
 
   // ---------- Pending flush ----------
@@ -126,28 +122,47 @@
       const enabled = localStorage.getItem(pushEnableKey) === 'true';
       if (enabled) sendPushover(text);
       showToastOnce(kind, text);
-      st.lastPush = Date.now(); st.lastSent = st.pending; st.pending  = 0;
-      saveJson(stateKey, st);
+      st.lastPush = Date.now(); st.lastSent = st.pending; st.pending = 0; saveJson(stateKey, st);
       return true;
     }
     return false;
   }
 
-  // ---------- CSV helpers ----------
-  function parseCSV(text){ if (!text) return []; text=text.replace(/^\uFEFF/,''); const first=(text.split(/\r?\n/)[0]||''); const delim=(first.indexOf(';')>first.indexOf(','))?';':(first.includes(';')?';':','); const rows=[]; let i=0,f='',row=[],q=false; while(i<text.length){ const c=text[i]; if(q){ if(c==='"'){ if(text[i+1]==='"'){ f+='"'; i+=2; continue;} q=false; i++; continue;} f+=c; i++; continue;} if(c==='"'){ q=true; i++; continue;} if(c==='\r'){ i++; continue;} if(c==='\n'){ row.push(f.trim()); rows.push(row); row=[]; f=''; i++; continue;} if(c===delim){ row.push(f.trim()); f=''; i++; continue;} f+=c; i++; } if(f.length||row.length){ row.push(f.trim()); rows.push(row);} return rows.filter(r=>r.length&&r.some(x=>x!=='')); }
-  function buildVikarIdMap(csv){ const rows=parseCSV(csv); const res=new Map(); if(!rows.length) return res; const hdr=rows[0].map(h=>h.toLowerCase()); const idxId=hdr.findIndex(h=>/(vikar.*nr|vikar[_ ]?id|^id$)/.test(h)); const idxName=hdr.findIndex(h=>/(navn|name)/.test(h)); if(idxId<0) return res; for(let r=1;r<rows.length;r++){ const row=rows[r]; const id=(row[idxId]||'').trim(); const name=idxName>=0?(row[idxName]||'').trim():''; if(id) res.set(String(id), name||''); } return res; }
-  let _vikarNameById = null;
-  async function ensureVikarNameMap(){
-    if (_vikarNameById && _vikarNameById.size) return _vikarNameById;
-    let csv = '';
-    try { csv = await gmGET(CFG.rawPhonebookUrl + '?t=' + Date.now()); if (csv) GM_setValue(CFG.cacheKeyCSV, csv); }
-    catch(_){ /* fallback */ }
-    if (!csv) csv = GM_getValue(CFG.cacheKeyCSV) || '';
-    _vikarNameById = buildVikarIdMap(csv);
-    return _vikarNameById;
+  // ---------- Messages ----------
+  const MSG_KEYS = ['vagt_unread','generel_unread'];
+  function pollMessages(){
+    maybeFlushPending('msg', 'tpPushEnableMsg', ST_MSG_KEY, (n)=>`🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`);
+
+    fetch(CFG.msgUrl + '&ts=' + Date.now(), { credentials:'same-origin', cache:'no-store', headers:{'Cache-Control':'no-cache','Pragma':'no-cache'} })
+      .then(r=>r.json())
+      .then(d=>{
+        const st = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
+        const n  = MSG_KEYS.reduce((s,k)=> s + Number(d[k]||0), 0);
+        const en = localStorage.getItem('tpPushEnableMsg') === 'true';
+
+        if (n > st.count && n !== st.lastSent){
+          const canPush = (Date.now()-st.lastPush > CFG.suppressMs) && takeLock('msg');
+          if (canPush){
+            const m = `🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`;
+            if (en) sendPushover(m);
+            showToastOnce('msg', m);
+            st.lastPush = Date.now();
+            st.lastSent = n;
+          } else {
+            st.pending = Math.max(st.pending||0, n);
+          }
+        } else if (n < st.count) {
+          st.lastPush = 0;
+          st.lastSent = n;
+          if (st.pending && n <= st.pending) st.pending = 0;
+        }
+        st.count = n; saveJson(ST_MSG_KEY, st);
+        try { document.dispatchEvent(new CustomEvent('tp:msg-count', { detail:{ count:n } })); } catch(_){}
+      })
+      .catch(e=> console.warn('[TPNotifs][MSG]', e));
   }
 
-  // ---------- Interesse parsing ----------
+  // ---------- Interesse ----------
   let lastETagSeen = localStorage.getItem(ETag_KEY) || null;
   let lastIntParseTS = 0;
   let gIntPerPrev = {};
@@ -182,6 +197,19 @@
     return map;
   }
 
+  // CSV helpers
+  function parseCSV(text){ if (!text) return []; text=text.replace(/^\uFEFF/,''); const first=(text.split(/\r?\n/)[0]||''); const delim=(first.indexOf(';')>first.indexOf(','))?';':(first.includes(';')?';':','); const rows=[]; let i=0,f='',row=[],q=false; while(i<text.length){ const c=text[i]; if(q){ if(c==='"'){ if(text[i+1]==='"'){ f+='"'; i+=2; continue;} q=false; i++; continue;} f+=c; i++; continue;} if(c==='"'){ q=true; i++; continue;} if(c==='\r'){ i++; continue;} if(c==='\n'){ row.push(f.trim()); rows.push(row); row=[]; f=''; i++; continue;} if(c===delim){ row.push(f.trim()); f=''; i++; continue;} f+=c; i++; } if(f.length||row.length){ row.push(f.trim()); rows.push(row);} return rows.filter(r=>r.length&&r.some(x=>x!=='')); }
+  function buildVikarIdMap(csv){ const rows=parseCSV(csv); const res=new Map(); if(!rows.length) return res; const hdr=rows[0].map(h=>h.toLowerCase()); const idxId=hdr.findIndex(h=>/(vikar.*nr|vikar[_ ]?id|^id$)/.test(h)); const idxName=hdr.findIndex(h=>/(navn|name)/.test(h)); if(idxId<0) return res; for(let r=1;r<rows.length;r++){ const row=rows[r]; const id=(row[idxId]||'').trim(); const name=idxName>=0?(row[idxName]||'').trim():''; if(id) res.set(String(id), name||''); } return res; }
+  let _vikarNameById = null;
+  async function ensureVikarNameMap(){
+    if (_vikarNameById && _vikarNameById.size) return _vikarNameById;
+    let csv = '';
+    try { csv = await gmGET(CFG.rawPhonebookUrl + '?t=' + Date.now()); if (csv) GM_setValue(CFG.cacheKeyCSV, csv); } catch(_){}
+    if (!csv) csv = GM_getValue(CFG.cacheKeyCSV) || '';
+    _vikarNameById = buildVikarIdMap(csv);
+    return _vikarNameById;
+  }
+
   function summarizeNames(names){
     if (!names || !names.length) return '';
     const a = names.slice(0, INT_NAMES_MAX_NAMES);
@@ -193,10 +221,8 @@
     const main = short.join(', ');
     return rest>0 ? `${main} + ${rest} andre` : main;
   }
-
   function buildInterestMsg(count, hint){
-    return hint ? `👀 ${hint} har vist interesse for ledige vagter.`
-                : `👀 ${count} vikar(er) har vist interesse for ledige vagter.`;
+    return hint ? `👀 ${hint} har vist interesse for ledige vagter.` : `👀 ${count} vikar(er) har vist interesse for ledige vagter.`;
   }
 
   function fetchInterestPopupHTML(vagtAvailId){
@@ -220,8 +246,7 @@
       }
       let name = (row.querySelector('.vikar_interresse_list_navn_container')||{}).textContent?.trim() || '';
       if (name.endsWith('...') && vikarId && lookupByVikarId){
-        const nm = lookupByVikarId(vikarId);
-        if (nm) name = nm;
+        const nm = lookupByVikarId(vikarId); if (nm) name = nm;
       }
       if (name) out.push(name);
     }
@@ -230,70 +255,35 @@
     return uniq;
   }
 
-  // ---------- Pollers ----------
-  const MSG_KEYS = ['vagt_unread','generel_unread'];
-
-  function pollMessages(){
-    maybeFlushPending('msg', 'tpPushEnableMsg', ST_MSG_KEY, (n)=>`🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`);
-    fetch(CFG.msgUrl + '&ts=' + Date.now(), { credentials:'same-origin', cache:'no-store', headers:{ 'Cache-Control':'no-cache','Pragma':'no-cache' }})
-      .then(r=>r.json())
-      .then(d => {
-        const st = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
-        const n  = MSG_KEYS.reduce((s,k)=> s + Number(d[k]||0), 0);
-        const en = localStorage.getItem('tpPushEnableMsg') === 'true';
-
-        if (n > st.count && n !== st.lastSent){
-          const canPush = (Date.now()-st.lastPush > CFG.suppressMs) && takeLock('msg');
-          if (canPush){
-            const m = `🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`;
-            if (en) sendPushover(m);
-            showToastOnce('msg', m);
-            st.lastPush = Date.now(); st.lastSent = n;
-          } else {
-            st.pending = Math.max(st.pending||0, n);
-          }
-        } else if (n < st.count){
-          st.lastPush = 0; st.lastSent = n;
-          if (st.pending && n <= st.pending) st.pending = 0;
-        }
-
-        st.count = n; saveJson(ST_MSG_KEY, st);
-        try { document.dispatchEvent(new CustomEvent('tp:msg-count', { detail:{ count:n } })); } catch(_){ }
-      })
-      .catch(e => console.warn('[TPNotifs][MSG]', e));
-  }
-
-  let lastInt = 0;
-  function pollInterest(){
+  async function pollInterest(){
     maybeFlushPending('int', 'tpPushEnableInt', ST_INT_KEY, (n)=>buildInterestMsg(n, ''));
 
-    const force = (Date.now() - (lastInt||0)) > (CFG.pollMs*2);
+    const force = mustForceParse();
     fetch(CFG.interestUrl, {
       method:'HEAD', credentials:'same-origin', cache:'no-store',
       headers: { ...(lastETagSeen ? { 'If-None-Match': lastETagSeen } : {}), 'Cache-Control':'no-cache','Pragma':'no-cache' }
     })
-    .then(h => {
+    .then(h=>{
       const et = h.headers.get('ETag') || null;
       const changed = et && et !== lastETagSeen;
       if (et) localStorage.setItem(ETag_KEY, et);
       lastETagSeen = et || lastETagSeen || null;
-
       if (changed || h.status !== 304 || force || !et){
         return fetch(CFG.interestUrl + '&_=' + Date.now(), {
           credentials:'same-origin', cache:'no-store',
           headers: { 'Cache-Control':'no-cache','Pragma':'no-cache','Range':'bytes=0-40000' }
         })
         .then(r=>r.text())
-        .then(async html => {
+        .then(async html=>{
           const total = parseInterestHTML(html);
           const perNow = parseInterestPerMap(html);
           const rising = [];
           for (const [id,cnt] of Object.entries(perNow)){
             const prev = gIntPerPrev[id] || 0; if (cnt > prev) rising.push(id);
           }
-          gIntPerPrev = perNow; lastInt = Date.now();
+          gIntPerPrev = perNow; markParsedNow();
 
-          // Navne-hint
+          // navn-hints
           let namesHint = '';
           if (CFG.enableInterestNameHints && rising.length){
             const toFetch = rising.slice(0, INT_NAMES_MAX_VAGTER);
@@ -309,7 +299,7 @@
                 const names = parseInterestPopupNames(popup, lookup);
                 gIntNamesCache.set(vagtId, { ts, names });
                 if (names.length) collected.push(...names);
-              } catch(_){ /* ignore */ }
+              } catch(_){}
             }
             const merged = Array.from(new Set(collected));
             const summary = summarizeNames(merged);
@@ -332,35 +322,39 @@
             if (st.pending && total <= st.pending) st.pending = 0;
           }
           st.count = total; saveJson(ST_INT_KEY, st);
-          try { document.dispatchEvent(new CustomEvent('tp:int-count', { detail:{ count: total } })); } catch(_){ }
+          try { document.dispatchEvent(new CustomEvent('tp:int-count', { detail:{ count: total } })); } catch(_){}
         });
       }
     })
-    .catch(e => console.warn('[TPNotifs][INT]', e));
+    .catch(e=> console.warn('[TPNotifs][INT]', e));
   }
 
   // ---------- Public API ----------
   let _timer = null;
-  function start(){ if (_timer) return; const tick = ()=>{ try { pollMessages(); pollInterest(); } catch(_){ } }; tick(); _timer = setInterval(tick, CFG.pollMs); document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') tick(); }); }
-  function stop(){ if (_timer){ clearInterval(_timer); _timer = null; } }
+  function start(){ if (_timer) return; const tick=()=>{ try{ pollMessages(); pollInterest(); }catch(_){ } }; tick(); _timer=setInterval(tick, CFG.pollMs); document.addEventListener('visibilitychange', ()=>{ if (document.visibilityState==='visible') tick(); }); }
+  function stop(){ if (_timer){ clearInterval(_timer); _timer=null; } }
   function install(opts={}){
     CFG = { ...DEF, ...(opts||{}) };
-    const heal = (key)=>{ const st = loadJson(key, {count:0,lastPush:0,lastSent:0,pending:0}); if (typeof st.pending !== 'number') st.pending = 0; if (st.lastSent > st.count) st.lastSent = st.count; saveJson(key, st); };
+    const heal = (key)=>{ const st = loadJson(key, {count:0,lastPush:0,lastSent:0,pending:0}); if (typeof st.pending!=='number') st.pending=0; if (st.lastSent>st.count) st.lastSent=st.count; saveJson(key, st); };
     heal(ST_MSG_KEY); heal(ST_INT_KEY);
-    try { localStorage.removeItem('tpPushLock'); } catch(_) {}
-    // prime CSV (til navn-hints)
+    try { localStorage.removeItem('tpPushLock'); } catch(_){}
     ensureVikarNameMap().catch(()=>{});
     start();
   }
 
   function testPushover(){
-    const user = getUserKey(); if (!user) { showToastOnce('test','Indsæt din Pushover USER-token i ⚙️ først.'); return; }
+    showDOMToast('🧪 Sender Pushover test…');
+    const user = getUserKey();
+    if (!user){
+      showToastOnce('test','⚠️ Indsæt din Pushover USER-token i ⚙️ først.');
+      return;
+    }
     const ts = new Date().toLocaleTimeString();
     sendPushover('🧪 [TEST] Besked-kanal OK — ' + ts);
-    setTimeout(()=> sendPushover('🧪 [TEST] Interesse-kanal OK — ' + ts), 500);
-    showToastOnce('testok', 'Sendte Pushover-test (Besked + Interesse). Tjek Pushover.');
+    setTimeout(()=> sendPushover('🧪 [TEST] Interesse-kanal OK — ' + ts), 600);
+    showToastOnce('testok', '✅ Test sendt. Tjek Pushover.');
   }
 
   const TPNotifs = { install, start, stop, testPushover, _cfg:()=>({ ...CFG }) };
-  try { window.TPNotifs = Object.freeze(TPNotifs); } catch(_){ window.TPNotifs = TPNotifs; }
+  try { window.TPNotifs = Object.freeze(TPNotifs); } catch(_) { window.TPNotifs = TPNotifs; }
 })();
