@@ -32,6 +32,33 @@
   const TP_VERSION = '7.11.5';
   function getUserKey() { try { return (GM_getValue('tpUserKey') || '').trim(); } catch (_) { return ''; } }
   function setUserKey(v) { try { GM_setValue('tpUserKey', (v || '').trim()); } catch (_) {} }
+  
+  const SCRIPT_RAW_URL = 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js';
+
+  // Sikker GET der virker med @connect raw.githubusercontent.com
+  function gmGET(url){
+    return new Promise((resolve, reject) => {
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url,
+          headers: { 'Accept': '*/*' },
+          onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
+          onerror: e => reject(e)
+        });
+      } catch (e) { reject(e); }
+    });
+  }
+
+  // Simpel semver sammenligning "a.b.c"
+  function versionCompare(a,b){
+    const pa = String(a).split('.').map(n=>parseInt(n,10)||0);
+    const pb = String(b).split('.').map(n=>parseInt(n,10)||0);
+    const len = Math.max(pa.length, pb.length);
+    for (let i=0;i<len;i++){ const x=pa[i]||0, y=pb[i]||0; if (x>y) return 1; if (x<y) return -1; }
+    return 0;
+  }
+
 
   function injectUI() {
     if (document.getElementById('tpPanel')) return;
@@ -97,8 +124,11 @@
           '</div>' +
           '<div id="tpPBHint" style="margin-top:6px;color:#666"></div>' +
         '</div>' +
-        '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
-        '<div style="font-size:11px;color:#666">Kører v.' + TP_VERSION + '</div>';
+          '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
+          '<button id="tpTestPushoverBtn" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🧪 Test Pushover (Besked + Interesse)</button>' +
+          '<div style="margin-top:8px"><button id="tpCheckUpdate" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🔄 Søg efter opdatering</button></div>' +
+          '<div style="margin-top:6px;font-size:11px;color:#666">Kører v.' + TP_VERSION + '</div>'
+
       document.body.appendChild(menu);
 
       const inp = menu.querySelector('#tpUserKeyMenu');
@@ -110,6 +140,35 @@
       if (window.TPExcel && typeof window.TPExcel.attachToMenu === 'function') {
         window.TPExcel.attachToMenu(menu);
       }
+    // Ekstra knapper i menuen
+      const test = menu.querySelector('#tpTestPushoverBtn');
+      if (test) test.addEventListener('click', () => {
+      try {
+        if (window.TPNotifs && typeof window.TPNotifs.testPushover === 'function') {
+      window.TPNotifs.testPushover();
+    }
+  } catch(_) {}
+  menu.style.display = 'none';
+});
+
+const chk = menu.querySelector('#tpCheckUpdate');
+if (chk) chk.addEventListener('click', async () => {
+  try {
+    const raw = await gmGET(SCRIPT_RAW_URL + '?t=' + Date.now());
+    const m = raw.match(/@version\s+([0-9.]+)/);
+    const remote = m ? m[1] : null;
+    if (!remote) { try { new Notification('Temponizer', { body: 'Kunne ikke læse remote version.' }); } catch(_) {} return; }
+    const cmp = versionCompare(remote, TP_VERSION);
+    if (cmp > 0) {
+      try { new Notification('Temponizer', { body: 'Ny version: ' + remote + ' (du kører ' + TP_VERSION + '). Åbner…' }); } catch(_) {}
+      window.open(SCRIPT_RAW_URL, '_blank', 'noopener');
+    } else {
+      try { new Notification('Temponizer', { body: 'Du kører nyeste version (' + TP_VERSION + ').' }); } catch(_) {}
+    }
+  } catch(e) {
+    try { new Notification('Temponizer', { body: 'Update-tjek fejlede.' }); } catch(_) {}
+  }
+});
       return menu;
     }
     function toggleMenu() {
