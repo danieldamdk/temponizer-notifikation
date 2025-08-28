@@ -1,17 +1,18 @@
 /* eslint-env browser */
-/* global GM_xmlhttpRequest, GM_getValue, GM_setValue, unsafeWindow */
+/* global GM_xmlhttpRequest, GM_getValue, GM_setValue */
 // Caller module for Temponizer (IPNordic Communicator integration)
-// v7.12.6-04 — fix: no more about:blank, visible self-toast, smarter close/redirect
+// v7.12.9 — no about:blank, reliable self/mirror toast, optional OS notifications
 // - Beacon udsender event; andre faner viser toast og kvitterer (ACK)
-// - Hvis ingen ACK: beacon viser SELV toast og redirect'er bagefter (ingen about:blank)
-// - Hvis ACK men denne fane er synlig (manuelt indsat URL): vis også kort toast her (mirror), og redirect
-// - Normaliserer nummer (+45, mellemrum, *suffix). Opslår navn i CSV. Debounce pr. nummer.
+// - Hvis ingen ACK: beacon viser SELV toast og redirect'er bagefter (ingen window.close)
+// - Hvis ACK og denne fane er synlig (manuelt indsat URL): vis kort mirror-toast her, derefter redirect
+// - Nummer normaliseres (+45, mellemrum, *suffix). Opslår navn i CSV. Debounce pr. nummer.
+// - OS-notifikationer (system) som supplement til DOM-toast, så du ser den når Chrome er minimeret.
 
 (function(){
   'use strict';
   if (window.TPCaller?.installed) return;
 
-  const VER = 'v7.12.6-04';
+  const VER = 'v7.12.9';
   const NS  = `[TP][Caller ${VER}]`;
   const debug = localStorage.getItem('tpDebug') === '1';
   const dlog  = (...a) => { if (debug) console.info(NS, ...a); };
@@ -21,18 +22,18 @@
     cacheKeyCSV: 'tpCSVCache',
     queueSuffix: '*1500',
     queueCode:   '1500',
-    openInNewTab: true,
     debounceMs: 10000,
     autohideMs: 8000,
     eventKey: 'tpCallerEvtV2',
     ackPrefix: 'tpCallerAckV2:',
     lastKey: 'tpCallerLastV2',
-    waitAckMs: 280,             // hvor længe beacon venter på svar
-    selfToastMs: 1800,          // varighed af toast når beacon selv viser
-    mirrorOnAckWhenVisible: true, // vis også i beacon hvis denne fane er aktiv
-    ackMirrorMs: 900,           // kort varighed ved ACK-mirror
+    waitAckMs: 300,              // vent kort på svar fra andre faner
+    selfToastMs: 1800,           // varighed af toast når beacon selv viser
+    mirrorOnAckWhenVisible: true,
+    ackMirrorMs: 1100,           // varighed af kort mirror ved ACK
     frontUrl: '/index.php?page=front',
-    z: 2147483646
+    z: 2147483646,
+    osNotifs: true               // vis også OS-notifikationer hvis tilladt
   });
 
   let CFG = { ...DEF };
@@ -41,6 +42,10 @@
 
   const clamp = (n,min,max) => Math.max(min, Math.min(max, n));
   const now   = () => Date.now();
+
+  function absFront(){
+    try { return location.origin + CFG.frontUrl; } catch(_) { return CFG.frontUrl; }
+  }
 
   function normPhone(raw){
     if (!raw) return '';
@@ -73,10 +78,9 @@
 
   function parsePhonebookCSV(txt){
     const map = new Map(); // p8 -> { id, name }
-    let header = [];
     try {
       const lines = txt.split(/\r?\n/);
-      header = (lines.shift()||'').split(';');
+      const header = (lines.shift()||'').split(';');
       const idxName = header.findIndex(h=>/navn/i.test(h));
       const idxPhone= header.findIndex(h=>/tlf|telefon|mobil/i.test(h));
       const idxId   = header.findIndex(h=>/id/i.test(h));
@@ -90,21 +94,36 @@
         if (p8){ map.set(p8,{id,name}); }
       }
     } catch(e){ dlog('CSV parse error', e); }
-    return { map, header };
+    return map;
   }
 
   async function getCSVMap(){
     try{
       const txt = await gmGET(CFG.rawPhonebookUrl + '?t=' + now());
       if (txt && txt.length > 50) GM_SetValueSafe(CFG.cacheKeyCSV, txt);
-      const { map } = parsePhonebookCSV(txt);
+      const map = parsePhonebookCSV(txt);
       if (map.size) return map;
     }catch(e){ dlog('live CSV error', e); }
     try{
       const cached = GM_GetValueSafe(CFG.cacheKeyCSV, '') || '';
-      if (cached){ const { map } = parsePhonebookCSV(cached); if (map.size) return map; }
+      if (cached){ const map = parsePhonebookCSV(cached); if (map.size) return map; }
     }catch(e){ dlog('cache CSV error', e); }
     return new Map();
+  }
+
+  // --------- Notifications ---------
+  function osNotify(title, body){
+    if (!CFG.osNotifs || !('Notification' in window)) return;
+    try{
+      const show = ()=>{ try { new Notification(title||'Indgående opkald', { body: body||'', silent:false }); } catch(_){} };
+      if (Notification.permission === 'granted') return show();
+      if (Notification.permission === 'default'){
+        const asked = localStorage.getItem('tpCallerNotifAsked') === '1';
+        if (!asked){
+          Notification.requestPermission().then(p=>{ try{ localStorage.setItem('tpCallerNotifAsked','1'); }catch(_){/* ignore */} if (p==='granted') show(); });
+        }
+      }
+    }catch(_){/* ignore */}
   }
 
   function showCallerToast(opts){
@@ -121,7 +140,7 @@
       host.innerHTML = '<div style="font-weight:600;margin-bottom:2px;">'+(title||'Indgående opkald')+' ☎️</div>'+
         '<div style="font-size:14px;">'+(primary||'')+'</div>'+
         (secondary?'<div style="opacity:.8;margin-top:2px;">'+secondary+'</div>':'');
-      if (profileUrl){ host.addEventListener('click',()=>{ try{ window.open(profileUrl, CFG.openInNewTab?'_blank':'_self'); }catch(_){} }); }
+      if (profileUrl){ host.addEventListener('click',()=>{ try{ window.open(profileUrl, '_blank'); }catch(_){} }); }
       document.body.appendChild(host);
       requestAnimationFrame(()=>{ host.style.opacity='1'; host.style.transform='translateY(0)'; });
       const ms = clamp(Number(autohideMs||CFG.autohideMs)|0,1200,60000);
@@ -145,6 +164,7 @@
         else { primary = nice; }
       }
       showCallerToast({ title, primary, secondary, profileUrl, autohideMs: ms||CFG.autohideMs });
+      osNotify(title, primary + (secondary ? (' — ' + secondary) : ''));
     }catch(e){ dlog('resolveAndShow error', e); }
   }
 
@@ -176,14 +196,8 @@
     return m ? m[1] : '';
   }
 
-  function softClose(afterMs){
-    setTimeout(()=>{
-      let closed = false;
-      try{ window.close(); closed = window.closed === true; }catch(_){/* ignore */}
-      if (!closed){
-        try{ location.replace(CFG.frontUrl); }catch(_){/* ignore */}
-      }
-    }, Math.max(0, Number(afterMs)||0));
+  function navigateAfter(ms){
+    setTimeout(()=>{ try{ location.replace(absFront()); }catch(_){} }, Math.max(0, Number(ms)||0));
   }
 
   async function processFromUrl(){
@@ -204,17 +218,15 @@
         const seenKey = 'tpCallerSeen_'+p8key;
 
         if (!acked){
-          // Beacon viser selv toast og markerer som set
           try { localStorage.setItem(seenKey, String(now())); } catch(_){/* ignore */}
           await resolveAndShow(payload, CFG.selfToastMs);
-          softClose(CFG.selfToastMs + 200);
+          navigateAfter(CFG.selfToastMs + 100);
         } else {
-          // Andre faner viser — men hvis denne fane er synlig (manuelt åbnet), så mirror kort
           if (CFG.mirrorOnAckWhenVisible && document.visibilityState === 'visible'){
             await resolveAndShow(payload, CFG.ackMirrorMs);
-            softClose(CFG.ackMirrorMs + 120);
+            navigateAfter(CFG.ackMirrorMs + 100);
           } else {
-            softClose(40);
+            navigateAfter(40);
           }
         }
       }, CFG.waitAckMs);
