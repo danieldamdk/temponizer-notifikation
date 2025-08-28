@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Caller-Toast + SMS-toggle + Excel→CSV (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.11.5
+// @version      7.12.0
 // @description  Modulært setup: (1) Besked/Interesse + Pushover + toasts (TPNotifs). (2) Caller-toast via Communicator-beacon (TPCaller) med klik-åbn profil i nyt faneblad. (3) SMS on/off via skjult iframe (TPSms). (4) Excel→CSV→Upload + test-lookup (TPExcel). Kompakt UI + ⚙️-menu.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -9,19 +9,19 @@
 // @grant        GM_setValue
 // @grant        unsafeWindow
 // @connect      api.pushover.net
-// @connect      api.github.com
 // @connect      cdn.jsdelivr.net
+// @connect      api.github.com
 // @connect      ajourcare.temponizer.dk
 // @run-at       document-idle
 // @noframes
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=20250828-04
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=20250828-04
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=20250828-04
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=20250828-04
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/tp-actions.module.js?v=20250828-04
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@v7.12.0/notifs.module.js
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@v7.12.0/sms.module.js
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@v7.12.0/excel.module.js
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@v7.12.0/caller.module.js
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@v7.12.0/tp-actions.module.js
 // ==/UserScript==
 
 /* eslint-env browser */
@@ -30,29 +30,17 @@
 (function () {
   'use strict';
 
-  const TP_VERSION   = '7.11.5';
-  const SCRIPT_RAW   = 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js';
-  const CSV_JSDELIVR = 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/vikarer.csv';
+  const TP_VERSION = '7.12.0';
+  const CSV_JSDELIVR = 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@v7.12.0/vikarer.csv';
 
-  // helpers
-  function notify(text){ try { new Notification('Temponizer', { body: text }); } catch(_) {} }
-  function gmGET(url){
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'GET', url, headers: { 'Accept':'*/*' },
-        onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
-        onerror: e => reject(e)
-      });
-    });
-  }
-  function versionCompare(a,b){
-    const pa=String(a).split('.').map(n=>parseInt(n,10)||0), pb=String(b).split('.').map(n=>parseInt(n,10)||0);
-    const L=Math.max(pa.length,pb.length); for(let i=0;i<L;i++){ const x=pa[i]||0, y=pb[i]||0; if(x>y) return 1; if(x<y) return -1; } return 0;
-  }
+  // simple helpers
+  const notify = (t)=>{ try { new Notification('Temponizer', { body: t }); } catch(_) {} };
+  const setBadge = (el, n)=>{ if(el) el.textContent = String(Number(n||0)); };
+  const pulse = (el)=>{ if(!el) return; el.animate([{transform:'scale(1)'},{transform:'scale(1.12)'},{transform:'scale(1)'}],{duration:320,easing:'ease-out'}); };
   function getUserKey(){ try { return (GM_getValue('tpUserKey')||'').trim(); } catch(_) { return ''; } }
-  function setUserKey(v){ try { GM_setValue('tpUserKey', (v||'').trim()); } catch(_) {} }
+  function setUserKey(v){ try { GM_setValue('tpUserKey',(v||'').trim()); } catch(_) {} }
 
-  /*──────── UI (kompakt panel + ⚙️) ───────*/
+  // UI
   function injectUI(){
     if (document.getElementById('tpPanel')) return;
 
@@ -69,19 +57,16 @@
         '<div style="font-weight:700;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">TP Notifikationer</div>' +
         '<button id="tpGearBtn" title="Indstillinger" style="width:22px;height:22px;line-height:22px;text-align:center;border:1px solid #ccc;border-radius:50%;background:#fff;cursor:pointer">⚙️</button>' +
       '</div>' +
-
-      // linje 1: Besked toggle + badge
-      '<div style="display:flex; align-items:center; gap:6px; margin:2px 0;">' +
-        '<label style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="tpEnableMsg"> <span>Besked</span></label>' +
-        '<span id="tpMsgCountBadge" style="margin-left:auto;min-width:18px;text-align:center;background:#eef;border:1px solid #cbd;padding:0 6px;border-radius:999px;font-weight:600">0</span>' +
+      // Linje 1: Besked toggle + badge
+      '<div style="display:flex; align-items:center; gap:6px; margin:2px 0; white-space:nowrap;">' +
+        '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableMsg"> <span>Besked</span></label>' +
+        '<span id="tpMsgCountBadge" style="margin-left:auto;min-width:18px;text-align:center;background:#eef;border:1px solid #cbd; padding:0 6px;border-radius:999px;font-weight:600">0</span>' +
       '</div>' +
-
-      // linje 2: Interesse toggle + badge
-      '<div style="display:flex; align-items:center; gap:6px; margin:2px 0 6px 0;">' +
-        '<label style="display:flex; align-items:center; gap:6px;"><input type="checkbox" id="tpEnableInt"> <span>Interesse</span></label>' +
-        '<span id="tpIntCountBadge" style="margin-left:auto;min-width:18px;text-align:center;background:#efe;border:1px solid #cbd;padding:0 6px;border-radius:999px;font-weight:600">0</span>' +
+      // Linje 2: Interesse toggle + badge
+      '<div style="display:flex; align-items:center; gap:6px; margin:2px 0 6px 0; white-space:nowrap;">' +
+        '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableInt"> <span>Interesse</span></label>' +
+        '<span id="tpIntCountBadge" style="margin-left:auto;min-width:18px;text-align:center;background:#efe;border:1px solid #cbd; padding:0 6px;border-radius:999px;font-weight:600">0</span>' +
       '</div>' +
-
       // SMS sektion
       '<div id="tpSMS" style="border-top:1px solid #eee;margin-top:6px;padding-top:6px">' +
         '<div id="tpSMSStatus" style="color:#666;margin-bottom:6px">Indlæser SMS-status…</div>' +
@@ -93,34 +78,29 @@
     // toggles
     const cbMsg = wrap.querySelector('#tpEnableMsg');
     const cbInt = wrap.querySelector('#tpEnableInt');
-    cbMsg.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
-    cbInt.checked = localStorage.getItem('tpPushEnableInt') === 'true';
-    cbMsg.onchange = () => localStorage.setItem('tpPushEnableMsg', cbMsg.checked ? 'true' : 'false');
-    cbInt.onchange = () => localStorage.setItem('tpPushEnableInt', cbInt.checked ? 'true' : 'false');
+    cbMsg.checked = (localStorage.getItem('tpPushEnableMsg') === 'true');
+    cbInt.checked = (localStorage.getItem('tpPushEnableInt') === 'true');
+    cbMsg.onchange = ()=> localStorage.setItem('tpPushEnableMsg', cbMsg.checked ? 'true' : 'false');
+    cbInt.onchange = ()=> localStorage.setItem('tpPushEnableInt', cbInt.checked ? 'true' : 'false');
 
-    // badges
+    // badges opdateres fra notifs.module events
     const badgeMsg = wrap.querySelector('#tpMsgCountBadge');
     const badgeInt = wrap.querySelector('#tpIntCountBadge');
-    const setBadge = (el,n)=>{ if(el) el.textContent = String(Number(n||0)); };
-    const pulse = (el)=>{ if(!el) return; el.animate([{transform:'scale(1)'},{transform:'scale(1.12)'},{transform:'scale(1)'}],{duration:320,easing:'ease-out'}); };
-
-    document.addEventListener('tp:msg-count', (e) => {
+    document.addEventListener('tp:msg-count',(e)=>{
       const prev = Number(localStorage.getItem('tpMsgPrevBadge')||0);
-      const cur  = Number(e.detail?.count||0);
-      setBadge(badgeMsg, cur);
-      if (cur > prev) pulse(badgeMsg);
-      localStorage.setItem('tpMsgPrevBadge', String(cur));
+      const n = e.detail?.count||0;
+      setBadge(badgeMsg, n); if (n>prev) pulse(badgeMsg);
+      localStorage.setItem('tpMsgPrevBadge', String(n));
     });
-    document.addEventListener('tp:int-count', (e) => {
+    document.addEventListener('tp:int-count',(e)=>{
       const prev = Number(localStorage.getItem('tpIntPrevBadge')||0);
-      const cur  = Number(e.detail?.count||0);
-      setBadge(badgeInt, cur);
-      if (cur > prev) pulse(badgeInt);
-      localStorage.setItem('tpIntPrevBadge', String(cur));
+      const n = e.detail?.count||0;
+      setBadge(badgeInt, n); if (n>prev) pulse(badgeInt);
+      localStorage.setItem('tpIntPrevBadge', String(n));
     });
 
-    // gear menu
-    const gearBtn = wrap.querySelector('#tpGearBtn');
+    // menu
+    const gear = wrap.querySelector('#tpGearBtn');
     let menu = null;
 
     function buildMenu(){
@@ -135,7 +115,6 @@
       });
       menu.innerHTML = (
         '<div style="font-weight:700;margin-bottom:8px">Indstillinger</div>' +
-
         '<div style="margin-bottom:10px">' +
           '<div style="font-weight:600;margin-bottom:4px">Pushover USER-token</div>' +
           '<input id="tpUserKeyMenu" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:6px">' +
@@ -145,7 +124,6 @@
             '<button id="tpCheckUpdate" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">🔄 Søg opdatering</button>' +
           '</div>' +
         '</div>' +
-
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
         '<div style="font-weight:700;margin-bottom:6px">Telefonbog / CSV</div>' +
         '<div style="margin-bottom:6px">' +
@@ -162,73 +140,82 @@
           '</div>' +
           '<div id="tpPBHint" style="margin-top:6px;color:#666"></div>' +
         '</div>' +
-
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
-        '<div style="font-size:11px;color:#666">Kører v.' + TP_VERSION + '</div>'
+        '<div style="font-size:11px;color:#666">Kører v.'+TP_VERSION+'</div>'
       );
-
       document.body.appendChild(menu);
 
-      // wire Pushover
+      // pushover token
       const inp  = menu.querySelector('#tpUserKeyMenu');
       const save = menu.querySelector('#tpSaveUserKeyMenu');
       const test = menu.querySelector('#tpTestPushoverBtn');
       const chk  = menu.querySelector('#tpCheckUpdate');
-
       inp.value = getUserKey();
-      save.addEventListener('click', () => { setUserKey(inp.value); notify('USER-token gemt.'); });
-      inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); setUserKey(inp.value); notify('USER-token gemt.'); } });
+      const toast = (t)=>notify(t);
+      save.addEventListener('click', ()=>{ setUserKey(inp.value); toast('USER-token gemt.'); });
+      inp.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); setUserKey(inp.value); toast('USER-token gemt.'); } });
 
-      test.addEventListener('click', () => {
-        try {
+      // robust test: retry hvis TPNotifs ikke er klar endnu
+      test.addEventListener('click', ()=>{
+        const tryRun = ()=>{
           if (window.TPNotifs && typeof window.TPNotifs.testPushover === 'function') {
             window.TPNotifs.testPushover();
-          } else {
-            notify('TPNotifs ikke klar endnu');
+            return true;
           }
-        } catch { /*noop*/ }
+          return false;
+        };
+        if (tryRun()) return;
+        toast('Initialiserer… prøver igen om lidt');
+        let attempts = 0;
+        const tm = setInterval(()=>{
+          attempts++;
+          if (tryRun()){ clearInterval(tm); }
+          if (attempts>=10){ clearInterval(tm); toast('TPNotifs er ikke klar. Prøv igen om lidt.'); }
+        }, 500);
       });
 
-      chk.addEventListener('click', async () => {
-        try {
-          const raw = await gmGET(SCRIPT_RAW + '?t=' + Date.now());
-          const m = raw.match(/@version\s+([0-9.]+)/);
+      // update-tjek (simpelt – læser @version i raw main)
+      chk.addEventListener('click', async ()=>{
+        const url = 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js?t=' + Date.now();
+        try{
+          const t = await (await fetch(url, {cache:'no-store'})).text();
+          const m = t.match(/@version\s+([0-9.]+)/);
           const remote = m ? m[1] : null;
-          if (!remote) { notify('Kunne ikke læse remote version.'); return; }
-          const cmp = versionCompare(remote, TP_VERSION);
-          if (cmp > 0) { notify(`Ny version: ${remote} (du kører ${TP_VERSION}). Åbner…`); window.open(SCRIPT_RAW,'_blank','noopener'); }
-          else notify(`Du kører nyeste version (${TP_VERSION}).`);
-        } catch { notify('Update-tjek fejlede.'); }
+          if (!remote) return toast('Kunne ikke læse remote version.');
+          const cmp = (a,b)=>{ const pa=a.split('.').map(n=>+n||0), pb=b.split('.').map(n=>+n||0); for(let i=0;i<Math.max(pa.length,pb.length);i++){ const x=pa[i]||0,y=pb[i]||0; if(x>y) return 1; if(x<y) return -1; } return 0; };
+          const r = cmp(remote, TP_VERSION);
+          if (r>0) { toast('Ny version '+remote+' (du kører '+TP_VERSION+'). Åbner…'); window.open('https://github.com/danieldamdk/temponizer-notifikation/releases','_blank','noopener'); }
+          else toast('Du kører nyeste ('+TP_VERSION+').');
+        } catch { toast('Update-tjek fejlede.'); }
       });
 
-      // Excel/CSV wiring via modul
+      // Excel/CSV wiring
       if (window.TPExcel && typeof window.TPExcel.attachToMenu === 'function') {
         window.TPExcel.attachToMenu(menu);
       } else {
         const pbh = menu.querySelector('#tpPBHint');
         if (pbh) pbh.textContent = 'Excel/CSV-modul ikke indlæst endnu.';
       }
-
       return menu;
     }
 
     function toggleMenu(){
       const m = buildMenu();
       m.style.display = (m.style.display === 'block') ? 'none' : 'block';
-      if (m.style.display === 'block') {
-        const outside = (e)=>{ if(!m.contains(e.target) && e.target!==gearBtn){ m.style.display='none'; cleanup(); } };
-        const esc     = (e)=>{ if(e.key==='Escape'){ m.style.display='none'; cleanup(); } };
+      if (m.style.display === 'block'){
+        const outside = (e)=>{ if(!m.contains(e.target) && e.target!==gear){ m.style.display='none'; cleanup(); } };
+        const esc = (e)=>{ if(e.key==='Escape'){ m.style.display='none'; cleanup(); } };
         function cleanup(){ document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', esc, true); }
         document.addEventListener('mousedown', outside, true);
         document.addEventListener('keydown', esc, true);
       }
     }
-    gearBtn.addEventListener('click', toggleMenu);
+
+    gear.addEventListener('click', toggleMenu);
   }
 
-  /*──────── Boot ───────*/
+  // Boot
   function boot(){
-    console.info('[TP][MAIN] v'+TP_VERSION+' loaded at', new Date().toISOString());
     injectUI();
 
     // Notifikationer
@@ -239,58 +226,56 @@
       msgUrl: location.origin + '/index.php?page=get_comcenter_counters&ajax=true',
       interestUrl: location.origin + '/index.php?page=freevagter',
       enableInterestNameHints: true,
-      rawPhonebookUrl: CSV_JSDELIVR,         // <- CDN for CSV
+      rawPhonebookUrl: CSV_JSDELIVR,
       cacheKeyCSV: 'tpCSVCache'
     });
 
-    // SMS toggle
+    // SMS
     TPSms.install({ settingsUrl: location.origin + '/index.php?page=showmy_settings' });
 
     // Excel/CSV
     TPExcel.install({
       owner: 'danieldamdk',
-      repo:  'temponizer-notifikation',
-      branch:'main',
+      repo: 'temponizer-notifikation',
+      branch: 'main',
       csvPath: 'vikarer.csv',
       cacheKeyCSV: 'tpCSVCache',
       printUrl: location.origin + '/index.php?page=print_vikar_list_custom_excel',
       settingsUrl: location.origin + '/index.php?page=showmy_settings'
     });
 
-    // Caller-toast
+    // Caller
     TPCaller.install({
       queueSuffix: '*1500',
       queueCode: '1500',
-      rawPhonebookUrl: CSV_JSDELIVR,         // <- CDN for CSV
+      rawPhonebookUrl: CSV_JSDELIVR,
       cacheKeyCSV: 'tpCSVCache',
       openInNewTab: true,
       debounceMs: 10000,
       autohideMs: 8000
     });
-
-    // Actions (Registrer “Intet svar”)
-    if (typeof window.TPActions?.install === 'function') {
-      window.TPActions.install();
-    }
-
-    // Beacon-fane: auto-process + luk
     if (TPCaller && typeof TPCaller.processFromUrl === 'function') {
       TPCaller.processFromUrl().catch(()=>{});
     }
 
-    // Bridge til page-window
-    try {
-      const root = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
-      root.TPNotifs  = TPNotifs;
-      root.TPSms     = TPSms;
-      root.TPExcel   = TPExcel;
-      root.TPCaller  = TPCaller;
-      root.TPActions = (typeof window.TPActions !== 'undefined') ? window.TPActions : undefined;
-      console.info('[TP] bridged APIs to page window');
-    } catch(e) {
+    // Actions (registrér “Intet svar”)
+    if (typeof window.TPActions !== 'undefined' && typeof window.TPActions.install === 'function') {
+      window.TPActions.install();
+    }
+
+    // bridge til page-window (så du kan kalde i Console)
+    try{
+      const root = (typeof unsafeWindow!=='undefined' ? unsafeWindow : window);
+      root.TPNotifs = TPNotifs;
+      root.TPSms    = TPSms;
+      root.TPExcel  = TPExcel;
+      root.TPCaller = TPCaller;
+      root.TPActions= (typeof window.TPActions!=='undefined') ? window.TPActions : undefined;
+      console.info('[TP][MAIN] v'+TP_VERSION+' loaded at', new Date().toISOString());
+    } catch(e){
       console.warn('[TP] bridge error', e);
     }
   }
 
-  try { boot(); } catch(e){ console.warn('[TP][BOOT ERR]', e); }
+  try { boot(); } catch (e) { console.warn('[TP][BOOT ERR]', e); }
 })();
