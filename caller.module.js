@@ -1,4 +1,16 @@
 /* eslint-env browser */
+/* eslint no-console: "off" */
+(function () {
+  'use strict';
+  const MOD = 'caller.module';           // ← skift til sms.module / excel.module / caller.module
+  const VER = 'v2025-08-28-01';          // ← valgfrit versionsstempel
+  const debug = localStorage.getItem('tpDebug') === '1';
+  const log = (...a) => { if (debug) console.info('[TP]', MOD, VER, ...a); };
+
+  log('loaded at', new Date().toISOString());
+  // ... resten af modulet ...
+})();
+
 /* global GM_xmlhttpRequest, GM_getValue, GM_setValue */
 // Caller module for Temponizer (IPnordic Communicator integration)
 // Purpose: Show a clickable DOM toast on inbound queue calls, with optional link to vikar profile.
