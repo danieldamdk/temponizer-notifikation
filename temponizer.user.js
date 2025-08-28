@@ -21,6 +21,7 @@
 // @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/sms.module.js
 // @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/excel.module.js
 // @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/caller.module.js
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/actions.module.js?v=20250828-01
 // ==/UserScript==
 
 /* eslint-env browser */
@@ -237,6 +238,11 @@
       debounceMs: 10000,
       autohideMs: 8000
     });
+
+    // 5) Actions (Intet svar)
+    if (window.TPActions && typeof window.TPActions.install === 'function') {
+    window.TPActions.install();
+}
 
     if (TPCaller && typeof TPCaller.processFromUrl === 'function') {
       TPCaller.processFromUrl().catch(()=>{});
