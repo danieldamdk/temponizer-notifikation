@@ -88,7 +88,7 @@
     let root = document.getElementById('tpSMS');
     if (!root){
       // create a minimal section if main-panelet ikke findes endnu
-      root = document.createElement('div'); root.id='tpSMS'; root.style.cssText='position:fixed;right:12px;bottom:12px;background:#fff;border:1px solid #ccc;border-radius:8px;padding:8px 10px;box-shadow:0 8px 24px rgba(0,0,0,.15);font:12px system-ui,sans-serif;z-index:2147483645';
+      root = document.createElement('div'); root.id='tpSMS'; root.style.cssText='position:fixed;right:12px;bottom:12px;background:#fff;border:1px solid #ccc;border-radius:8px;padding:8px 10px;box-shadow:0 8px 24px rgba(0,0,0,15);font:12px system-ui,sans-serif;z-index:2147483645';
       root.innerHTML = '<div id="tpSMSStatus" style="font-size:12px; color:#666;">Indlæser SMS-status…</div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:6px;"><button id="tpSMSOneBtn" style="padding:5px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;flex:0 0 auto">Aktivér</button></div>';
       document.body.appendChild(root);
     }
