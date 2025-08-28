@@ -5,7 +5,7 @@
   const MOD = 'caller.module';           // ← skift til sms.module / excel.module / caller.module
   const VER = 'v2025-08-28-01';          // ← valgfrit versionsstempel
   const debug = localStorage.getItem('tpDebug') === '1';
-  const log = (...a) => { if (debug) console.info('[TP]', MOD, VER, ...a); };
+  const log = (.a) => { if (debug) console.info('[TP]', MOD, VER, .a); };
 
   log('loaded at', new Date().toISOString());
   // ... resten af modulet ...
@@ -32,7 +32,7 @@
     eventKey: 'tpCallerEvtV2' // localStorage broadcast key
   });
 
-  let CFG = { ...DEF };
+  let CFG = { .DEF };
   let _installed = false;
   let _listenerAttached = false;
 
@@ -262,7 +262,7 @@
   const TPCaller = {
     install(opts={}){
       if (_installed) return; _installed = true;
-      CFG = { ...DEF, ...(opts||{}) };
+      CFG = { .DEF, .(opts||{}) };
       attachStorageListenerOnce();
       // Optional immediate processing of beacon tab
       if (opts.beaconFromUrl !== false){
@@ -271,7 +271,7 @@
       }
     },
     processFromUrl, // expose for manual triggering if needed
-    config(){ return { ...CFG }; },
+    config(){ return { .CFG }; },
     version: '1.0.0'
   };
 
