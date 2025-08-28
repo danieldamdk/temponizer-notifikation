@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Caller-Toast + SMS-toggle + Excel→CSV (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.12.2
-// @description  Modulært setup: (1) Besked/Interesse + Pushover + toasts (TPNotifs). (2) Caller-toast via Communicator-beacon (TPCaller). (3) SMS on/off (TPSms). (4) Excel→CSV→Upload (TPExcel). Kompakt UI + ⚙️-menu + badges.
+// @version      7.12.3
+// @description  Modulært setup: (1) Besked/Interesse + Pushover + toasts (TPNotifs). (2) Caller-toast (TPCaller). (3) SMS on/off (TPSms). (4) Excel→CSV→Upload (TPExcel). Kompakt UI + ⚙️-menu + badges.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -17,11 +17,11 @@
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=20250828-04
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=20250828-04
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=20250828-04
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=20250828-04
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/tp-actions.module.js?v=20250828-04
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=20250828-05
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=20250828-05
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=20250828-05
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=20250828-05
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/tp-actions.module.js?v=20250828-05
 // ==/UserScript==
 
 /* eslint-env browser */
@@ -29,10 +29,12 @@
 
 (function () {
   'use strict';
-  if (window.__TP_MAIN_ACTIVE__) return; // guard against double-boot
+
+  // Strong double-boot guard (prevents any second parse/run from doing UI again)
+  if (window.__TP_MAIN_ACTIVE__) return;
   window.__TP_MAIN_ACTIVE__ = true;
 
-  const TP_VERSION = '7.12.2';
+  const TP_VERSION = '7.12.3';
   const CSV_JSDELIVR = 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/vikarer.csv';
 
   const getUserKey = () => { try { return (GM_getValue('tpUserKey') || '').trim(); } catch { return ''; } };
@@ -57,20 +59,14 @@
         '<div style="font-weight:700;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">TP Notifikationer</div>' +
         '<button id="tpGearBtn" title="Indstillinger" style="width:22px;height:22px;line-height:22px;text-align:center;border:1px solid #ccc;border-radius:50%;background:#fff;cursor:pointer">⚙️</button>' +
       '</div>' +
-
-      // Linje 1: Besked toggle + badge (tekst uden "→ Pushover")
       '<div style="display:flex; align-items:center; gap:6px; margin:2px 0; white-space:nowrap;">' +
         '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableMsg"> <span>Besked</span></label>' +
         '<span id="tpMsgCountBadge" style="margin-left:auto;min-width:18px;text-align:center;background:#eef;border:1px solid #cbd; padding:0 6px;border-radius:999px;font-weight:600">0</span>' +
       '</div>' +
-
-      // Linje 2: Interesse toggle + badge
       '<div style="display:flex; align-items:center; gap:6px; margin:2px 0 6px 0; white-space:nowrap;">' +
         '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableInt"> <span>Interesse</span></label>' +
         '<span id="tpIntCountBadge" style="margin-left:auto;min-width:18px;text-align:center;background:#efe;border:1px solid #cbd; padding:0 6px;border-radius:999px;font-weight:600">0</span>' +
       '</div>' +
-
-      // SMS sektion – TPSms binder til disse IDs
       '<div id="tpSMS" style="border-top:1px solid #eee;margin-top:6px;padding-top:6px">' +
         '<div id="tpSMSStatus" style="color:#666;margin-bottom:6px">Indlæser SMS-status…</div>' +
         '<button id="tpSMSOneBtn" style="padding:5px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Aktivér</button>' +
@@ -78,7 +74,7 @@
 
     document.body.appendChild(wrap);
 
-    // toggles gemmes i localStorage (bruges af TPNotifs)
+    // toggles
     const cbMsg = wrap.querySelector('#tpEnableMsg');
     const cbInt = wrap.querySelector('#tpEnableInt');
     cbMsg.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
@@ -86,7 +82,7 @@
     cbMsg.onchange = () => localStorage.setItem('tpPushEnableMsg', cbMsg.checked ? 'true' : 'false');
     cbInt.onchange = () => localStorage.setItem('tpPushEnableInt', cbInt.checked ? 'true' : 'false');
 
-    // badges opdateres via CustomEvents fra notifs.module
+    // badges via events
     const badgeMsg = wrap.querySelector('#tpMsgCountBadge');
     const badgeInt = wrap.querySelector('#tpIntCountBadge');
     document.addEventListener('tp:msg-count', (e) => {
@@ -104,9 +100,10 @@
       localStorage.setItem('tpIntPrevBadge', String(val));
     });
 
-    // ⚙️ menu
-    const gear = wrap.querySelector('#tpGearBtn');
+    // gear menu
+    const tpGearBtnEl = wrap.querySelector('#tpGearBtn'); // ← renamed from "gear"
     let menu = null;
+
     function buildMenu(){
       if (menu) return menu;
       menu = document.createElement('div');
@@ -135,7 +132,6 @@
         '<div style="font-size:11px;color:#666">Kører v.' + TP_VERSION + '</div>';
       document.body.appendChild(menu);
 
-      // Pushover key + test + update
       const inp = menu.querySelector('#tpUserKeyMenu');
       const save = menu.querySelector('#tpSaveUserKeyMenu');
       const test = menu.querySelector('#tpTestPushoverBtn');
@@ -145,7 +141,6 @@
       inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); setUserKey(inp.value); notify('USER-token gemt.'); } });
 
       test.addEventListener('click', () => {
-        // robust: vent hvis modulet stadig initialiserer
         let tries = 0;
         const tick = () => {
           const ok = (window.TPNotifs && typeof window.TPNotifs.testPushover === 'function');
@@ -169,32 +164,30 @@
         } catch { notify('Update-tjek fejlede.'); }
       });
 
-      // Excel/CSV – lader modulet selv hooke
       if (window.TPExcel && typeof window.TPExcel.attachToMenu === 'function') {
         window.TPExcel.attachToMenu(menu);
         const hint = menu.querySelector('#tpPBHint'); if (hint) hint.remove();
       }
       return menu;
     }
+
     function toggleMenu() {
       const m = buildMenu();
       m.style.display = (m.style.display === 'block') ? 'none' : 'block';
       if (m.style.display === 'block') {
-        const outside = (e) => { if (!m.contains(e.target) && e.target !== gear) { m.style.display = 'none'; cleanup(); } };
+        const outside = (e) => { if (!m.contains(e.target) && e.target !== tpGearBtnEl) { m.style.display = 'none'; cleanup(); } };
         const esc = (e) => { if (e.key === 'Escape') { m.style.display = 'none'; cleanup(); } };
         function cleanup(){ document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', esc, true); }
         document.addEventListener('mousedown', outside, true);
         document.addEventListener('keydown', esc, true);
       }
     }
-    const gear = wrap.querySelector('#tpGearBtn');
-    gear.addEventListener('click', toggleMenu);
+    tpGearBtnEl.addEventListener('click', toggleMenu);
   }
 
   function boot() {
     injectUI();
 
-    // Notifikationer (besked + interesse + Pushover)
     TPNotifs.install({
       pushoverToken: 'a27du13k8h2yf8p4wabxeukthr1fu7',
       pollMs: 15000,
