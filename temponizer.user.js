@@ -68,5 +68,17 @@
   });
   if (typeof TPCaller.processFromUrl === 'function') {
     TPCaller.processFromUrl().catch(()=>{});
+
   }
+  // Gør moduler synlige i sidens Console (valgfrit)
+try {
+  const root = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
+  root.TPNotifs = TPNotifs;
+  root.TPSms    = TPSms;
+  root.TPExcel  = TPExcel;
+  root.TPCaller = TPCaller;
+  console.info('[TP] bridged APIs to page window');
+} catch (e) {
+  console.warn('[TP] bridge error', e);
+}
 })();
