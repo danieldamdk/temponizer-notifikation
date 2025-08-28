@@ -21,7 +21,7 @@
 // @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=20250828-02
 // @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=20250828-02
 // @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=20250828-02
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/actions.module.js?v=20250828-02
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/tp-actions.module.js?v=20250828-02
 // ==/UserScript==
 
 /* eslint-env browser */
