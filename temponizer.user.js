@@ -2,7 +2,7 @@
 // @name         Temponizer → Pushover + Toast + Caller-Toast + SMS-toggle + Excel→CSV (AjourCare)
 // @namespace    ajourcare.dk
 // @version      7.11.5
-// @description  Modulært setup: Notifikationer (Besked/Interesse + Pushover), Caller-toast (klik for at åbne profil i nyt faneblad), SMS on/off, Excel→CSV→GitHub. Kompakt UI + ⚙️.
+// @description  Modulært setup: (1) Besked/Interesse + Pushover + toasts (TPNotifs). (2) Caller-toast via Communicator-beacon (TPCaller) med klik-åbn profil i nyt faneblad. (3) SMS on/off via skjult iframe (TPSms). (4) Excel→CSV→Upload + test-lookup (TPExcel). Kompakt UI + ⚙️-menu.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -12,15 +12,16 @@
 // @connect      api.github.com
 // @connect      cdn.jsdelivr.net
 // @connect      ajourcare.temponizer.dk
+// @connect      raw.githubusercontent.com
 // @run-at       document-idle
 // @noframes
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=7180
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=7180
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=7180
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=7180
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=20250828-02
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=20250828-02
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=20250828-02
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=20250828-02
 // ==/UserScript==
 
 /* eslint-env browser */
@@ -29,13 +30,39 @@
 (function () {
   'use strict';
 
+  /*──────── 0) Version + helpers ────────*/
   const TP_VERSION = '7.11.5';
+  const SCRIPT_RAW_URL = 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js';
+  const CSV_JSDELIVR  = 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/vikarer.csv';
+
   function getUserKey() { try { return (GM_getValue('tpUserKey') || '').trim(); } catch (_) { return ''; } }
   function setUserKey(v) { try { GM_setValue('tpUserKey', (v || '').trim()); } catch (_) {} }
-  
-  const SCRIPT_RAW_URL = 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js';
 
-  // Sikker GET der virker med @connect raw.githubusercontent.com
+  // Lille OS/DOM-toast til egne UI-beskeder
+  function toast(msg) {
+    try {
+      if ('Notification' in window) {
+        if (Notification.permission === 'granted') { new Notification('Temponizer', { body: msg }); return; }
+        if (Notification.permission !== 'denied') {
+          Notification.requestPermission().then(p => { if (p === 'granted') { try { new Notification('Temponizer', { body: msg }); } catch(_){} } });
+        }
+      }
+    } catch(_) {}
+    // fallback DOM
+    const el = document.createElement('div');
+    el.textContent = msg;
+    Object.assign(el.style, {
+      position:'fixed', bottom:'12px', right:'12px', zIndex:2147483647,
+      background:'#333', color:'#fff', padding:'8px 10px', borderRadius:'8px', fontSize:'12px',
+      fontFamily:'system-ui,-apple-system,Segoe UI,Roboto,sans-serif', boxShadow:'0 6px 18px rgba(0,0,0,.35)',
+      opacity:0, transform:'translateY(8px)', transition:'opacity .22s, transform .22s'
+    });
+    document.body.appendChild(el);
+    requestAnimationFrame(()=>{ el.style.opacity=1; el.style.transform='translateY(0)'; });
+    setTimeout(()=>{ el.style.opacity=0; el.style.transform='translateY(8px)'; setTimeout(()=>el.remove(), 260); }, 4200);
+  }
+
+  // GET via GM_xmlhttpRequest til update-tjek
   function gmGET(url){
     return new Promise((resolve, reject) => {
       try {
@@ -50,7 +77,7 @@
     });
   }
 
-  // Simpel semver sammenligning "a.b.c"
+  // Sammenlign "a.b.c" vs "x.y.z"
   function versionCompare(a,b){
     const pa = String(a).split('.').map(n=>parseInt(n,10)||0);
     const pb = String(b).split('.').map(n=>parseInt(n,10)||0);
@@ -59,9 +86,10 @@
     return 0;
   }
 
-
+  /*──────── 1) UI (panel + ⚙️) ────────*/
   function injectUI() {
     if (document.getElementById('tpPanel')) return;
+
     const wrap = document.createElement('div');
     wrap.id = 'tpPanel';
     wrap.style.cssText = [
@@ -80,8 +108,10 @@
         '<div id="tpSMSStatus" style="color:#666;margin-bottom:6px">Indlæser SMS-status…</div>' +
         '<button id="tpSMSOneBtn" style="padding:5px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Aktivér</button>' +
       '</div>';
+
     document.body.appendChild(wrap);
 
+    // Toggler kun Pushover (toasts vises altid)
     const cbMsg = wrap.querySelector('#tpEnableMsg');
     const cbInt = wrap.querySelector('#tpEnableInt');
     cbMsg.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
@@ -89,8 +119,9 @@
     cbMsg.onchange = () => localStorage.setItem('tpPushEnableMsg', cbMsg.checked ? 'true' : 'false');
     cbInt.onchange = () => localStorage.setItem('tpPushEnableInt', cbInt.checked ? 'true' : 'false');
 
-    const gear = wrap.querySelector('#tpGearBtn');
+    const gear = wrap.querySelector('#tpGearBtn'); // ← kun én deklaration
     let menu = null;
+
     function buildMenu() {
       if (menu) return menu;
       menu = document.createElement('div');
@@ -124,75 +155,75 @@
           '</div>' +
           '<div id="tpPBHint" style="margin-top:6px;color:#666"></div>' +
         '</div>' +
-          '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
-          '<button id="tpTestPushoverBtn" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🧪 Test Pushover (Besked + Interesse)</button>' +
-          '<div style="margin-top:8px"><button id="tpCheckUpdate" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🔄 Søg efter opdatering</button></div>' +
-          '<div style="margin-top:6px;font-size:11px;color:#666">Kører v.' + TP_VERSION + '</div>'
+        '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
+        '<button id="tpTestPushoverBtn" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🧪 Test Pushover (Besked + Interesse)</button>' +
+        '<div style="margin-top:8px"><button id="tpCheckUpdate" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;width:100%;text-align:left">🔄 Søg efter opdatering</button></div>' +
+        '<div style="margin-top:6px;font-size:11px;color:#666">Kører v.' + TP_VERSION + '</div>';
 
       document.body.appendChild(menu);
 
-      const inp = menu.querySelector('#tpUserKeyMenu');
+      // Wire Pushover token
+      const inp  = menu.querySelector('#tpUserKeyMenu');
       const save = menu.querySelector('#tpSaveUserKeyMenu');
       inp.value = getUserKey();
-      save.addEventListener('click', () => { setUserKey(inp.value); try { new Notification('Temponizer', { body: 'USER-token gemt.' }); } catch(_){} });
-      inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); setUserKey(inp.value); try { new Notification('Temponizer', { body: 'USER-token gemt.' }); } catch(_){} } });
+      save.addEventListener('click', () => { setUserKey(inp.value); toast('USER-token gemt.'); });
+      inp.addEventListener('keydown', e => { if (e.key === 'Enter'){ e.preventDefault(); setUserKey(inp.value); toast('USER-token gemt.'); } });
 
+      // Excel/CSV – lader modulet tilføje sine knapper til menuen
       if (window.TPExcel && typeof window.TPExcel.attachToMenu === 'function') {
         window.TPExcel.attachToMenu(menu);
       }
-    // Ekstra knapper i menuen
+
+      // Test Pushover
       const test = menu.querySelector('#tpTestPushoverBtn');
       if (test) test.addEventListener('click', () => {
-      try {
-        if (window.TPNotifs && typeof window.TPNotifs.testPushover === 'function') {
-      window.TPNotifs.testPushover();
-    }
-  } catch(_) {}
-  menu.style.display = 'none';
-});
+        try { if (window.TPNotifs && typeof window.TPNotifs.testPushover === 'function') window.TPNotifs.testPushover(); } catch(_) {}
+        menu.style.display = 'none';
+      });
 
-const chk = menu.querySelector('#tpCheckUpdate');
-if (chk) chk.addEventListener('click', async () => {
-  try {
-    const raw = await gmGET(SCRIPT_RAW_URL + '?t=' + Date.now());
-    const m = raw.match(/@version\s+([0-9.]+)/);
-    const remote = m ? m[1] : null;
-    if (!remote) { try { new Notification('Temponizer', { body: 'Kunne ikke læse remote version.' }); } catch(_) {} return; }
-    const cmp = versionCompare(remote, TP_VERSION);
-    if (cmp > 0) {
-      try { new Notification('Temponizer', { body: 'Ny version: ' + remote + ' (du kører ' + TP_VERSION + '). Åbner…' }); } catch(_) {}
-      window.open(SCRIPT_RAW_URL, '_blank', 'noopener');
-    } else {
-      try { new Notification('Temponizer', { body: 'Du kører nyeste version (' + TP_VERSION + ').' }); } catch(_) {}
-    }
-  } catch(e) {
-    try { new Notification('Temponizer', { body: 'Update-tjek fejlede.' }); } catch(_) {}
-  }
-});
+      // Søg opdatering
+      const chk = menu.querySelector('#tpCheckUpdate');
+      if (chk) chk.addEventListener('click', async () => {
+        try {
+          const raw = await gmGET(SCRIPT_RAW_URL + '?t=' + Date.now());
+          const m = raw.match(/@version\s+([0-9.]+)/);
+          const remote = m ? m[1] : null;
+          if (!remote) { toast('Kunne ikke læse remote version.'); return; }
+          const cmp = versionCompare(remote, TP_VERSION);
+          if (cmp > 0) {
+            toast('Ny version: ' + remote + ' (du kører ' + TP_VERSION + '). Åbner…');
+            window.open(SCRIPT_RAW_URL, '_blank', 'noopener');
+          } else {
+            toast('Du kører nyeste version (' + TP_VERSION + ').');
+          }
+        } catch (e) {
+          toast('Update-tjek fejlede.');
+        }
+      });
+
       return menu;
     }
+
     function toggleMenu() {
       const m = buildMenu();
       m.style.display = (m.style.display === 'block') ? 'none' : 'block';
       if (m.style.display === 'block') {
         const outside = (e) => { if (!m.contains(e.target) && e.target !== gear) { m.style.display = 'none'; cleanup(); } };
         const esc = (e) => { if (e.key === 'Escape') { m.style.display = 'none'; cleanup(); } };
-        function cleanup() { document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', esc, true); }
+        function cleanup(){ document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', esc, true); }
         document.addEventListener('mousedown', outside, true);
         document.addEventListener('keydown', esc, true);
       }
     }
-    const gear = wrap.querySelector('#tpGearBtn');
+
     gear.addEventListener('click', toggleMenu);
   }
 
+  /*──────── 2) Boot moduler ────────*/
   function boot() {
     injectUI();
 
-    // Brug jsDelivr til CSV (slipper for @connect raw.githubusercontent.com)
-    const CSV_JSDELIVR = 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/vikarer.csv';
-
-    // Notifikationer (besked + interesse + Pushover)
+    // Notifikationer (besked + interesse + pushover)
     TPNotifs.install({
       pushoverToken: 'a27du13k8h2yf8p4wabxeukthr1fu7',
       pollMs: 15000,
@@ -200,14 +231,14 @@ if (chk) chk.addEventListener('click', async () => {
       msgUrl: location.origin + '/index.php?page=get_comcenter_counters&ajax=true',
       interestUrl: location.origin + '/index.php?page=freevagter',
       enableInterestNameHints: true,
-      rawPhonebookUrl: CSV_JSDELIVR,
+      rawPhonebookUrl: CSV_JSDELIVR,   // CSV via jsDelivr
       cacheKeyCSV: 'tpCSVCache'
     });
 
-    // SMS toggle
+    // SMS toggle (binder på #tpSMS*)
     TPSms.install({ settingsUrl: location.origin + '/index.php?page=showmy_settings' });
 
-    // Excel/CSV/GitHub
+    // Excel/CSV/GitHub – gear-menu binder sig selv via attachToMenu
     TPExcel.install({
       owner: 'danieldamdk',
       repo: 'temponizer-notifikation',
@@ -222,7 +253,7 @@ if (chk) chk.addEventListener('click', async () => {
     TPCaller.install({
       queueSuffix: '*1500',
       queueCode: '1500',
-      rawPhonebookUrl: CSV_JSDELIVR,
+      rawPhonebookUrl: CSV_JSDELIVR,   // CSV via jsDelivr
       cacheKeyCSV: 'tpCSVCache',
       openInNewTab: true,
       debounceMs: 10000,
@@ -234,7 +265,7 @@ if (chk) chk.addEventListener('click', async () => {
       TPCaller.processFromUrl().catch(()=>{});
     }
 
-    // Bridge til page-window (så du kan kalde fra Console)
+    // Bridge til window for console-debug (frivilligt)
     try {
       const root = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
       root.TPNotifs = TPNotifs;
@@ -247,5 +278,6 @@ if (chk) chk.addEventListener('click', async () => {
     }
   }
 
+  // Start
   try { boot(); } catch (e) { console.warn('[TP][BOOT ERR]', e); }
 })();
