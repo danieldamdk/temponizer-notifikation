@@ -171,6 +171,21 @@
       test.addEventListener('click', () => {
         try { if (window.TPNotifs && typeof window.TPNotifs.testPushover === 'function') window.TPNotifs.testPushover(); } catch(_){}
       });
+
+      const test = menu.querySelector('#tpTestPushoverBtn');
+if (test) test.addEventListener('click', () => {
+  try {
+    console.info('[TP][MAIN] Pushover TEST clicked');
+    if (window.TPNotifs && typeof window.TPNotifs.testPushover === 'function') {
+      window.TPNotifs.testPushover();
+    } else {
+      try { new Notification('Temponizer', { body: 'TPNotifs ikke klar endnu' }); } catch(_) {}
+    }
+  } catch(e) {
+    console.warn('[TP][MAIN] test click error', e);
+  }
+});
+
       chk.addEventListener('click', async () => {
         try {
           const raw = await gmGET(SCRIPT_RAW_URL + '?t=' + Date.now());
