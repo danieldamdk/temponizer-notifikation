@@ -319,13 +319,30 @@
     ensureVikarNameMap().catch(()=>{});
     start();
   }
-  function testPushover(){ const user=getUserKey(); if(!user){ showToastOnce('test','Indsæt din Pushover USER-token i ⚙️ først.'); return; }
-    const ts=new Date().toLocaleTimeString();
+// --- I notifs.module.js: erstat hele testPushover-funktionen ---
+function testPushover(){
+  try {
+    // vis altid en hurtig toast, så du kan se klik registreres
+    showDOMToast('🧪 Sender Pushover test…');
+
+    const user = getUserKey();
+    if (!user) {
+      // brugeren mangler USER-token i ⚙️
+      showDOMToast('⚠️ Indsæt din Pushover USER-token i ⚙️ først.');
+      return;
+    }
+
+    const ts = new Date().toLocaleTimeString();
+    // send to “kanalerne” (samme token i CFG bruges)
     sendPushover('🧪 [TEST] Besked-kanal OK — ' + ts);
     setTimeout(()=> sendPushover('🧪 [TEST] Interesse-kanal OK — ' + ts), 600);
-    showToastOnce('testok','Sendte Pushover-test (Besked + Interesse). Tjek Pushover.');
-  }
 
-  const TPNotifs = { install, start, stop, testPushover, _cfg:()=>({ ...CFG }) };
-  try { window.TPNotifs = Object.freeze(TPNotifs); } catch(_) { window.TPNotifs = TPNotifs; }
+    // giv tydelig bekræftelse, uafhængigt af suppress/locks
+    showDOMToast('✅ Test sendt. Tjek Pushover.');
+  } catch (e) {
+    console.warn('[TPNotifs][TEST] error', e);
+    showDOMToast('❌ Test fejlede: ' + (e && e.message ? e.message : 'ukendt fejl'));
+  
+}
+
 })();
