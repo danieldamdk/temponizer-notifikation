@@ -5,7 +5,7 @@
   const MOD = 'excel.module';           // ← skift til sms.module / excel.module / caller.module
   const VER = 'v2025-08-28-01';          // ← valgfrit versionsstempel
   const debug = localStorage.getItem('tpDebug') === '1';
-  const log = (...a) => { if (debug) console.info('[TP]', MOD, VER, ...a); };
+  const log = (.a) => { if (debug) console.info('[TP]', MOD, VER, .a); };
 
   log('loaded at', new Date().toISOString());
   // ... resten af modulet ...
@@ -24,7 +24,7 @@
     settingsUrl: location.origin + '/index.php?page=showmy_settings',
     cacheKeyCSV: 'tpCSVCache'
   });
-  let CFG = { ...DEF };
+  let CFG = { .DEF };
 
   // ---------- utils ----------
   const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
@@ -77,7 +77,7 @@
   }
 
   const TPExcel = {
-    install(opts={}){ CFG = { ...DEF, ...(opts||{}) }; },
+    install(opts={}){ CFG = { .DEF, .(opts||{}) }; },
     attachToMenu,
     fetchExcelAsCSVAndUpload,
     parsePhonebookCSV,
