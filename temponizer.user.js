@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Caller-Toast + SMS-toggle + Excel→CSV (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.12.12
+// @version      7.12.13
 // @description  (1) Besked/Interesse + Pushover + toasts, (2) Caller-toast, (3) SMS on/off, (4) Excel→CSV→GitHub. Kompakt UI + ⚙️.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -18,11 +18,11 @@
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=7.12.12
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=7.12.12
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=7.12.12
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=7.12.12
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/tp-actions.module.js?v=7.12.12
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=7.12.13
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=7.12.13
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=7.12.13
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=7.12.12-hard2
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/tp-actions.module.js?v=7.12.13
 // ==/UserScript==
 /* eslint-env browser */
 /* global GM_xmlhttpRequest, GM_getValue, GM_setValue, XLSX, TPNotifs, TPSms, TPExcel, TPCaller, TPActions */
@@ -30,11 +30,11 @@
 (function () {
   'use strict';
 
-  // Duplikat-guard (hindrer dobbelt-UI ved parallelle kopier)
+  // Duplikat-guard
   if (window.__TP_MAIN_ACTIVE__) return;
   window.__TP_MAIN_ACTIVE__ = Date.now();
 
-  const TP_VERSION   = '7.12.12';
+  const TP_VERSION   = '7.12.13';
   const CSV_JSDELIVR = 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/vikarer.csv';
   const SCRIPT_RAW_URL = 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js';
 
@@ -56,7 +56,7 @@
     wrap.style.cssText = [
       'position:fixed','right:8px','bottom:12px','z-index:2147483645','background:#fff','border:1px solid #d7d7d7',
       'padding:8px','border-radius:8px','font:12px/1.25 system-ui,-apple-system,Segoe UI,Roboto,sans-serif',
-      'box-shadow:0 8px 24px rgba(0,0,0,.15)','max-width:260px','min-width:200px'
+      'box-shadow:0 8px 24px rgba(0,0,0,0.15)','max-width:260px','min-width:200px'
     ].join(';');
 
     wrap.innerHTML =
@@ -77,7 +77,13 @@
         '<button id="tpSMSOneBtn" style="padding:5px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Aktivér</button>' +
       '</div>';
 
-    document.body.appendChild(wrap);
+    try {
+      document.body.appendChild(wrap);
+    } catch (e) {
+      // Fallback: hvis en sanitizer/patch fejler på vores CSS, prøv en ultralet variant
+      wrap.style.boxShadow = '0 8px 24px rgba(0,0,0,0.15)';
+      document.body.appendChild(wrap);
+    }
 
     // toggles
     const cbMsg = wrap.querySelector('#tpEnableMsg');
@@ -90,8 +96,8 @@
     // badges
     const badgeMsg = wrap.querySelector('#tpMsgCountBadge');
     const badgeInt = wrap.querySelector('#tpIntCountBadge');
-    document.addEventListener('tp:msg-count', e => { badgeMsg.textContent = String(e.detail?.count||0); });
-    document.addEventListener('tp:int-count', e => { badgeInt.textContent = String(e.detail?.count||0); });
+    document.addEventListener('tp:msg-count', e => { try { badgeMsg.textContent = String((e.detail && e.detail.count) || 0); } catch(_){ badgeMsg.textContent='0'; } });
+    document.addEventListener('tp:int-count', e => { try { badgeInt.textContent = String((e.detail && e.detail.count) || 0); } catch(_){ badgeInt.textContent='0'; } });
 
     // gear menu
     const gearBtn = wrap.querySelector('#tpGearBtn');
@@ -102,7 +108,7 @@
       Object.assign(menu.style, {
         position:'fixed', right:'8px', bottom:(wrap.offsetHeight+18)+'px', zIndex:2147483646,
         background:'#fff', border:'1px solid #ccc', borderRadius:'10px',
-        boxShadow:'0 12px 36px rgba(0,0,0,.22)', padding:'12px', width:'380px',
+        boxShadow:'0 12px 36px rgba(0,0,0,0.22)', padding:'12px', width:'380px',
         maxWidth:'calc(100vw - 16px)', maxHeight:'70vh', overflow:'auto', display:'none',
         font:'12px system-ui,-apple-system,Segoe UI,Roboto,sans-serif'
       });
@@ -141,7 +147,7 @@
       const inp = menu.querySelector('#tpUserKeyMenu'); inp.value = getUserKey();
       menu.querySelector('#tpSaveUserKeyMenu').addEventListener('click', ()=>{ setUserKey(inp.value); notify('USER-token gemt.'); });
       inp.addEventListener('keydown', e=>{ if (e.key==='Enter'){ e.preventDefault(); setUserKey(inp.value); notify('USER-token gemt.'); } });
-      menu.querySelector('#tpTestPushoverBtn').addEventListener('click', ()=>{ try { if (typeof TPNotifs?.testPushover === 'function') TPNotifs.testPushover(); else notify('TPNotifs er ikke klar endnu.'); }
+      menu.querySelector('#tpTestPushoverBtn').addEventListener('click', ()=>{ try { if (typeof TPNotifs === 'object' && typeof TPNotifs.testPushover === 'function') TPNotifs.testPushover(); else notify('TPNotifs er ikke klar endnu.'); }
         catch { notify('Kunne ikke køre test.'); } });
       menu.querySelector('#tpCheckUpdate').addEventListener('click', async ()=>{
         try {
@@ -156,7 +162,7 @@
       });
 
       // Excel menu binder sig her
-      if (window.TPExcel?.attachToMenu) TPExcel.attachToMenu(menu);
+      if (window.TPExcel && typeof TPExcel.attachToMenu === 'function') TPExcel.attachToMenu(menu);
       else { const pbh = menu.querySelector('#tpPBHint'); if (pbh) pbh.textContent = 'Excel/CSV-modul ikke indlæst endnu.'; }
 
       return menu;
@@ -206,12 +212,6 @@
       settingsUrl: location.origin + '/index.php?page=showmy_settings'
     });
 
-    // --- Minimal, lokal anti-stale til Caller (uden at røre resten) ---
-    try {
-      const v = (window.TPCaller && window.TPCaller.version) || '';
-      if (!/^v7\.12\./.test(String(v))) { window.TPCaller = undefined; }
-    } catch (_){}
-
     // Caller
     TPCaller.install({
       queueSuffix: '*1500',
@@ -222,17 +222,16 @@
       debounceMs: 10000,
       autohideMs: 8000
     });
-    if (TPCaller?.processFromUrl) try { TPCaller.processFromUrl(); } catch(_){}
+    if (TPCaller && typeof TPCaller.processFromUrl === 'function') { try { TPCaller.processFromUrl(); } catch(_) {} }
 
-    // Actions (Registrér “Intet svar”)
-    try { window.TPActions?.install && window.TPActions.install(); } catch(_){}
+    // Actions
+    if (window.TPActions && typeof TPActions.install === 'function') { try { TPActions.install(); } catch(_) {} }
 
     // Bridge for DevTools
     try {
       const root = (typeof unsafeWindow!=='undefined'? unsafeWindow : window);
       root.TPNotifs = TPNotifs; root.TPSms = TPSms; root.TPExcel = TPExcel; root.TPCaller = TPCaller; root.TPActions = window.TPActions;
       console.info('[TP] bridged APIs to page window');
-      console.info('[TP] TPCaller.version =', TPCaller && TPCaller.version);
     } catch(e){ /* noop */ }
   }
 
