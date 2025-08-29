@@ -36,8 +36,8 @@
     Object.assign(el.style, {
       position:'fixed', bottom:'12px', right:'12px', zIndex:2147483647,
       background:'#333', color:'#fff', padding:'8px 10px', borderRadius:'8px', fontSize:'12px',
-      fontFamily:'system-ui,-apple-system,Segoe UI,Roboto,sans-serif', boxShadow:'0 6px 18px #00000059',
-      opacity:0, transform:'translateY(8px)', transition:'opacity  220ms, transform  220ms'
+      fontFamily:'system-ui,-apple-system,Segoe UI,Roboto,sans-serif', boxShadow:'0 6px 18px rgba(0,0,0,.35)',
+      opacity:0, transform:'translateY(8px)', transition:'opacity .22s, transform .22s'
     });
     document.body.appendChild(el);
     requestAnimationFrame(()=>{ el.style.opacity=1; el.style.transform='translateY(0)'; });
