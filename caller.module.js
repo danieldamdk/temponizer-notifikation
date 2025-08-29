@@ -116,13 +116,13 @@
       const host = document.createElement('div');
       Object.assign(host.style, {
         position:'fixed', bottom:'12px', right:'12px', zIndex:2147483647,
-        maxWidth:'360px', font:'12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif'
+        maxWidth:'360px', font:'12px/ 1 system-ui, -apple-system, Segoe UI, Roboto, sans-serif'
       });
       const card = document.createElement('div');
       Object.assign(card.style, {
         background:'#1f1f1f', color:'#fff', borderRadius:'10px', padding:'10px 12px',
-        boxShadow:'0 10px 28px rgba(0,0,0, 0.38)', display:'flex', gap:'10px', alignItems:'flex-start',
-        opacity:'0', transform:'translateY(8px)', transition:'opacity 0.22s, transform .22s'
+        boxShadow:'0 10px 28px #00000061', display:'flex', gap:'10px', alignItems:'flex-start',
+        opacity:'0', transform:'translateY(8px)', transition:'opacity  220ms, transform  220ms'
       });
       const icon = document.createElement('div'); icon.textContent='☎️'; icon.style.fontSize='18px';
 
