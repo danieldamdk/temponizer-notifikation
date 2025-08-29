@@ -1,66 +1,68 @@
 /* eslint-env browser */
 /* global GM_xmlhttpRequest, GM_getValue, GM_setValue */
 // Caller module for Temponizer (IPNordic Communicator integration)
-// v7.12.9 — no about:blank, reliable self/mirror toast, optional OS notifications
-// - Beacon udsender event; andre faner viser toast og kvitterer (ACK)
-// - Hvis ingen ACK: beacon viser SELV toast og redirect'er bagefter (ingen window.close)
-// - Hvis ACK og denne fane er synlig (manuelt indsat URL): vis kort mirror-toast her, derefter redirect
-// - Nummer normaliseres (+45, mellemrum, *suffix). Opslår navn i CSV. Debounce pr. nummer.
-// - OS-notifikationer (system) som supplement til DOM-toast, så du ser den når Chrome er minimeret.
+// v7.12.12-hard — hard override + no about:blank + self/mirror toast + optional OS notifications
+// - ALWAYS overrides any older window.TPCaller (e.g. '1.0.0') and exports an immutable TPCaller
+// - Beacon broadcasts event; other tabs ACK and show toast
+// - If no ACK: beacon shows its OWN toast, then soft-redirects to front (no window.close)
+// - If ACK and this tab is visible (manual URL paste): short mirror toast here, then redirect
+// - Normalizes numbers (+45, spaces, *suffix). Looks up name/ID from CSV. Debounce by number
+// - Optional OS notifications so you see something even if Chrome is minimized
 
-(function(){
+(function (w) {
   'use strict';
-  if (window.TPCaller?.installed) return;
 
-  const VER = 'v7.12.9';
+  // >>> HARD OVERRIDE: remove any old TPCaller so this version always takes over
+  try {
+    Object.defineProperty(w, 'TPCaller', { value: undefined, writable: true, configurable: true });
+    delete w.TPCaller; // ignore result
+  } catch (_) { try { w.TPCaller = undefined; } catch (_) {} }
+
+  const VER = 'v7.12.12-hard';
   const NS  = `[TP][Caller ${VER}]`;
   const debug = localStorage.getItem('tpDebug') === '1';
   const dlog  = (...a) => { if (debug) console.info(NS, ...a); };
 
   const DEF = Object.freeze({
     rawPhonebookUrl: 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/vikarer.csv',
-    cacheKeyCSV: 'tpCSVCache',
-    queueSuffix: '*1500',
-    queueCode:   '1500',
-    debounceMs: 10000,
-    autohideMs: 8000,
-    eventKey: 'tpCallerEvtV2',
-    ackPrefix: 'tpCallerAckV2:',
-    lastKey: 'tpCallerLastV2',
-    waitAckMs: 300,              // vent kort på svar fra andre faner
-    selfToastMs: 1800,           // varighed af toast når beacon selv viser
+    cacheKeyCSV:     'tpCSVCache',
+    queueSuffix:     '*1500',
+    queueCode:       '1500',
+    debounceMs:      10000,
+    autohideMs:      8000,
+    eventKey:        'tpCallerEvtV2',
+    ackPrefix:       'tpCallerAckV2:',
+    lastKey:         'tpCallerLastV2',
+    waitAckMs:       300,     // wait briefly for other tabs to ACK
+    selfToastMs:     1800,    // duration when beacon shows its own toast
     mirrorOnAckWhenVisible: true,
-    ackMirrorMs: 1100,           // varighed af kort mirror ved ACK
-    frontUrl: '/index.php?page=front',
-    z: 2147483646,
-    osNotifs: true               // vis også OS-notifikationer hvis tilladt
+    ackMirrorMs:     1100,    // short mirror toast if this tab is visible and others ACKed
+    frontUrl:        '/index.php?page=front',
+    z:               2147483646,
+    osNotifs:        true     // show OS notifications if permitted
   });
 
   let CFG = { ...DEF };
-  let _installed = false;
   let _listenerAttached = false;
 
-  const clamp = (n,min,max) => Math.max(min, Math.min(max, n));
+  // ----------------- utils -----------------
   const now   = () => Date.now();
-
-  function absFront(){
-    try { return location.origin + CFG.frontUrl; } catch(_) { return CFG.frontUrl; }
-  }
+  const clamp = (n,min,max) => Math.max(min, Math.min(max, n));
+  function absFront(){ try{ return location.origin + CFG.frontUrl; }catch(_){ return CFG.frontUrl; } }
 
   function normPhone(raw){
     if (!raw) return '';
     let s = String(raw).trim();
     try { s = decodeURIComponent(s); } catch(_){ /* ignore */ }
     s = s.replace(/\s+/g,'');
-    s = s.replace(/\*[0-9]+$/,''); // drop *1500 suffix
+    s = s.replace(/\*[0-9]+$/,''); // drop *queue suffix
     s = s.replace(/[^0-9]/g,'');
-    if (s.length > 8) s = s.slice(-8);
+    if (s.length > 8) s = s.slice(-8); // DK 8 digits
     return s;
   }
-
   function fmtPhone8(p8){
     const s = String(p8||'');
-    return s.replace(/(\d{2})(?=\d)/g, function(_m, a){ return a + ' '; }).trim();
+    return s.replace(/(\d{2})(?=\d)/g, (m,a)=> a + ' ').trim();
   }
 
   function gmGET(url){
@@ -179,12 +181,12 @@
       let ev=null; try{ ev = JSON.parse(e.newValue||'{}'); }catch(_){ return; }
       if (!ev || !ev.payload) return;
       const id = ev.id;
-      // Debounce per nummer
+      // Debounce per number
       const p8 = ev.payload.phone8 || (ev.payload.secret ? 'secret' : 'x');
       const seenKey = 'tpCallerSeen_'+p8;
       if (now() - Number(localStorage.getItem(seenKey)||'0') < CFG.debounceMs) return;
       localStorage.setItem(seenKey, String(now()));
-      // ACK til beacon
+      // ACK back to beacon
       try { if (id) localStorage.setItem(CFG.ackPrefix+id, String(now())); } catch(_){/* ignore */}
       await resolveAndShow(ev.payload);
     });
@@ -238,7 +240,7 @@
     try{
       const ev = JSON.parse(localStorage.getItem(CFG.lastKey)||'null');
       if (!ev || !ev.ts) return;
-      if (now() - ev.ts > 3000) return; // kun helt friske events
+      if (now() - ev.ts > 3000) return; // only very recent events
       const p8 = ev.payload.phone8 || (ev.payload.secret ? 'secret' : 'x');
       const seenKey = 'tpCallerSeen_'+p8;
       if (now() - Number(localStorage.getItem(seenKey)||'0') < CFG.debounceMs) return;
@@ -249,7 +251,6 @@
 
   const TPCaller = {
     install(opts){
-      if (_installed) return; _installed = true;
       CFG = Object.freeze({ ...DEF, ...(opts||{}) });
       dlog('installed with CFG', CFG);
       attachStorageListenerOnce();
@@ -258,9 +259,14 @@
     },
     processFromUrl,
     config(){ return { ...CFG }; },
-    version: VER,
-    installed: true
+    version: VER
   };
 
-  try{ window.TPCaller = TPCaller; }catch(_){/* ignore */}
-})();
+  // Export as immutable value so older scripts cannot overwrite it with assignment.
+  try {
+    Object.defineProperty(w, 'TPCaller', { value: TPCaller, writable: false, configurable: true });
+  } catch (_) {
+    w.TPCaller = TPCaller;
+  }
+
+})(window);
