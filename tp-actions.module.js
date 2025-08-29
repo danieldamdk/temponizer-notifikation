@@ -44,7 +44,11 @@ Notes:
     menu.id = 'tpIntetSvarMenu';
     Object.assign(menu.style, {
       position:'fixed', zIndex:'2147483647', background:'#fff', border:'1px solid #ccc',
-      boxShadow:'0 12px 28px rgba(0,0,0,.22)', borderRadius:'8px', font:'12px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif',
+      boxShadow: '0 12px 28px rgba(0,0,0,0.22)',
+      // og erstat font-shorthand med sikre properties:
+      fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
+      fontSize: '12px',
+      lineHeight: '20px',
       padding:'6px', display:'none'
     });
     const btn = document.createElement('div');
