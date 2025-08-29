@@ -3,10 +3,9 @@
 // TPNotifs — besked/interest poll + DOM toasts + Pushover + badge events
 (function(){
   'use strict';
-  const VER = '2025-08-28-05';
+  const VER = '2025-08-29-06';
   console.info('[TP] notifs.module v'+VER+' loaded at', new Date().toISOString());
 
-  // defaults
   const DEF = Object.freeze({
     pushoverToken: '',
     pollMs: 15000,
@@ -19,7 +18,6 @@
   });
   let CFG = { ...DEF };
 
-  // state
   const ST_MSG = 'tpNotifs_msgStateV1';
   const ST_INT = 'tpNotifs_intStateV1';
   const LOCK_PREFIX = 'tpNotifs_lock_';
@@ -30,10 +28,17 @@
   function showDOMToast(msg){
     const el=document.createElement('div');
     el.textContent=msg;
-    Object.assign(el.style,{position:'fixed',right:'12px',bottom:'12px',zIndex:2147483646,background:'#333',color:'#fff',padding:'8px 10px',borderRadius:'8px',font:'12px system-ui,-apple-system,Segoe UI,Roboto,sans-serif',boxShadow:'0 6px 18px rgba(0,0,0,.35)',opacity:0,transform:'translateY(8px)',transition:'opacity .22s, transform .22s'});
+    Object.assign(el.style,{
+      position:'fixed', right:'12px', bottom:'12px', zIndex:2147483646,
+      background:'#333', color:'#fff', padding:'8px 10px', borderRadius:'8px',
+      font:'12px system-ui,-apple-system,Segoe UI,Roboto,sans-serif',
+      boxShadow:'0 6px 18px rgba(0,0,0,0.35)',
+      opacity:'0', transform:'translateY(8px)',
+      transition:'opacity 0.22s, transform 0.22s'
+    });
     document.body.appendChild(el);
-    requestAnimationFrame(()=>{el.style.opacity=1;el.style.transform='translateY(0)';});
-    setTimeout(()=>{el.style.opacity=0;el.style.transform='translateY(8px)';setTimeout(()=>el.remove(),260);},4200);
+    requestAnimationFrame(()=>{el.style.opacity='1';el.style.transform='translateY(0)';});
+    setTimeout(()=>{el.style.opacity='0';el.style.transform='translateY(8px)';setTimeout(()=>el.remove(),260);},4200);
   }
   function toast(msg){
     if ('Notification' in window){
@@ -63,12 +68,7 @@
     const user  = (GM_getValue('tpUserKey')||'').trim();
     if (!token || !user) return;
     const data = 'token='+encodeURIComponent(token)+'&user='+encodeURIComponent(user)+'&message='+encodeURIComponent(message);
-    GM_xmlhttpRequest({
-      method:'POST',
-      url:'https://api.pushover.net/1/messages.json',
-      headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
-      data
-    });
+    GM_xmlhttpRequest({ method:'POST', url:'https://api.pushover.net/1/messages.json', headers:{ 'Content-Type':'application/x-www-form-urlencoded' }, data });
   }
 
   function pollMessages(){
@@ -77,9 +77,7 @@
       .then(d=>{
         const st = loadJson(ST_MSG, {count:0,lastPush:0});
         const n  = Number(d.vagt_unread||0) + Number(d.generel_unread||0);
-        // badge
         try { document.dispatchEvent(new CustomEvent('tp:msg-count', { detail:{ count:n } })); } catch(_){}
-
         if (n>st.count){
           const can = (Date.now()-st.lastPush > CFG.suppressMs) && takeLock('msg', CFG.suppressMs);
           if (can){
@@ -94,7 +92,6 @@
       .catch(()=>{ /* stille */ });
   }
 
-  // very light interest counter (no HEAD/ETag; robust against page markup)
   function parseInterestCount(html){
     const doc = new DOMParser().parseFromString(html, 'text/html');
     let nodes = Array.from(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
@@ -112,9 +109,7 @@
       .then(html=>{
         const st = loadJson(ST_INT, {count:0,lastPush:0});
         const n  = parseInterestCount(html);
-        // badge
         try { document.dispatchEvent(new CustomEvent('tp:int-count', { detail:{ count:n } })); } catch(_){}
-
         if (n>st.count){
           const can = (Date.now()-st.lastPush > CFG.suppressMs) && takeLock('int', CFG.suppressMs);
           if (can){
@@ -139,13 +134,7 @@
   }
   function stop(){ if (_timer){ clearInterval(_timer); _timer=null; } }
 
-  function install(opts={}){
-    CFG = { ...DEF, ...(opts||{}) };
-    // heal state
-    const heal = (k)=>{ const st=loadJson(k,{count:0,lastPush:0}); if (typeof st.count!=='number') st.count=0; if (typeof st.lastPush!=='number') st.lastPush=0; saveJson(k,st); };
-    heal(ST_MSG); heal(ST_INT);
-    start();
-  }
+  function install(opts={}){ CFG = { ...DEF, ...(opts||{}) }; ['tpNotifs_msgStateV1','tpNotifs_intStateV1'].forEach(k=>{ const st=loadJson(k,{count:0,lastPush:0}); if (typeof st.count!=='number') st.count=0; if (typeof st.lastPush!=='number') st.lastPush=0; saveJson(k,st); }); start(); }
 
   function testPushover(){
     const user = (GM_getValue('tpUserKey')||'').trim();
