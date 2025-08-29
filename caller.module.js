@@ -1,71 +1,50 @@
 /* eslint-env browser */
-/* eslint no-console: "off" */
-(function () {
-  'use strict';
-  const MOD = 'caller.module';           // ← skift til sms.module / excel.module / caller.module
-  const VER = 'v2025-08-28-01';          // ← valgfrit versionsstempel
-  const debug = localStorage.getItem('tpDebug') === '1';
-  const log = (.a) => { if (debug) console.info('[TP]', MOD, VER, .a); };
-
-  log('loaded at', new Date().toISOString());
-  // ... resten af modulet ...
-})();
-
 /* global GM_xmlhttpRequest, GM_getValue, GM_setValue */
-// Caller module for Temponizer (IPnordic Communicator integration)
-// Purpose: Show a clickable DOM toast on inbound queue calls, with optional link to vikar profile.
-// Works as a beacon: the tab opened by Communicator broadcasts the event to all open tabs and auto-closes.
-// This file is designed to be @require'd from the main userscript.
-
 (function(){
   'use strict';
 
-  // ---- Config (runtime overridable via TPCaller.install(opts)) ----
+  const MOD = 'caller.module';
+  const VER = 'v2025-08-29-01';
+  const debug = localStorage.getItem('tpDebug') === '1';
+  const log = (...a) => { if (debug) console.info('[TP]', MOD, VER, ...a); };
+
   const DEF = Object.freeze({
     rawPhonebookUrl: 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/vikarer.csv',
     cacheKeyCSV: 'tpCSVCache',
-    queueSuffix: '*1500',     // inbound numbers end with this (e.g., 11223344*1500)
-    queueCode: '1500',        // secret number shows only this
-    openInNewTab: true,       // open profile in new tab on click
-    debounceMs: 10000,        // per-number toast debounce in listeners
-    autohideMs: 8000,         // toast lifetime
-    eventKey: 'tpCallerEvtV2' // localStorage broadcast key
+    queueSuffix: '*1500',
+    queueCode: '1500',
+    openInNewTab: true,
+    debounceMs: 10000,
+    autohideMs: 8000,
+    eventKey: 'tpCallerEvtV2'
   });
 
-  let CFG = { .DEF };
+  let CFG = { ...DEF };
   let _installed = false;
   let _listenerAttached = false;
 
-  // ---- Small utils ----
   const now = () => Date.now();
-  const clamp = (n,min,max) => Math.max(min, Math.min(max, n));
+  const clamp = (n,min,max)=> Math.max(min, Math.min(max, n));
 
   function normPhone(raw){
-    const digits = String(raw||'').replace(/\D/g,'').replace(/^0+/, '').replace(/^45/, '');
-    return digits.length >= 8 ? digits.slice(-8) : '';
+    const digits=String(raw||'').replace(/\D/g,'').replace(/^0+/, '').replace(/^45/, '');
+    return digits.length>=8?digits.slice(-8):'';
   }
-  function fmtPhoneDK(p8){
-    if (!p8) return '';
-    return String(p8).replace(/(\d{2})(?=\d)/g,'$1 ').trim();
-  }
+  function fmtPhoneDK(p8){ return String(p8||'').replace(/(\d{2})(?=\d)/g,'$1 ').trim(); }
 
-  // GM_XHR GET wrapper
   function gmGET(url){
-    return new Promise((resolve, reject) => {
-      try {
-        GM_xmlhttpRequest({
-          method: 'GET', url,
-          headers: { 'Accept': '*/*', 'Cache-Control':'no-cache','Pragma':'no-cache' },
-          onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
-          onerror: e => reject(e)
-        });
-      } catch (e) { reject(e); }
+    return new Promise((resolve, reject)=>{
+      GM_xmlhttpRequest({
+        method:'GET', url,
+        headers:{ 'Accept':'*/*','Cache-Control':'no-cache','Pragma':'no-cache' },
+        onload:r=> (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
+        onerror: reject
+      });
     });
   }
-  function GM_GetValueSafe(k){ try { return GM_getValue(k); } catch(_) { return null; } }
-  function GM_SetValueSafe(k,v){ try { GM_setValue(k,v); } catch(_) { /* ignore */ } }
+  function GM_GetValueSafe(k, fb=null){ try { const v=GM_getValue(k); return v==null?fb:v; } catch(_) { return fb; } }
+  function GM_SetValueSafe(k,v){ try { GM_setValue(k,v); } catch(_){} }
 
-  // CSV parsing (minimal, robust)
   function parseCSV(text){
     if (!text) return [];
     text = text.replace(/^\uFEFF/, '');
@@ -94,14 +73,14 @@
     const idxName = header.findIndex(h => /(navn|name)/.test(h));
     const phoneCols = header.map((h, idx) => ({ h, idx })).filter(x => /(telefon|mobil|cellphone|mobile|phone|tlf)/.test(x.h));
     if (idxId < 0 || phoneCols.length === 0) return { map, header, vikarsById };
-    for (let r = 1; r < rows.length; r++){
+    for (let r=1; r<rows.length; r++){
       const row = rows[r];
-      const id   = (row[idxId]   || '').trim();
-      const name = idxName >= 0 ? (row[idxName] || '').trim() : '';
+      const id = (row[idxId]||'').trim();
+      const name = idxName>=0 ? (row[idxName]||'').trim() : '';
       if (id) vikarsById.set(String(id), { id, name });
       if (!id) continue;
       for (const pc of phoneCols){
-        const val = (row[pc.idx] || '').trim();
+        const val = (row[pc.idx]||'').trim();
         const p8 = normPhone(val);
         if (p8) map.set(p8, { id, name });
       }
@@ -109,14 +88,12 @@
     return { map, header, vikarsById };
   }
 
-  // --- Toast UI ---
   function showCallerToast(opts){
-    // opts: { title, primary, secondary, profileUrl|null, autohideMs }
-    try {
+    try{
       const host = document.createElement('div');
       Object.assign(host.style, {
         position:'fixed', bottom:'12px', right:'12px', zIndex:2147483647,
-        maxWidth:'360px', font:'12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif'
+        maxWidth:'360px', font:'12px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif'
       });
       const card = document.createElement('div');
       Object.assign(card.style, {
@@ -125,7 +102,6 @@
         opacity:'0', transform:'translateY(8px)', transition:'opacity .22s, transform .22s'
       });
       const icon = document.createElement('div'); icon.textContent='☎️'; icon.style.fontSize='18px';
-
       const body = document.createElement('div'); body.style.flex='1 1 auto';
       const h = document.createElement('div'); h.textContent = opts.title || 'Indgående opkald'; h.style.fontWeight='700'; h.style.marginBottom='2px';
       const p = document.createElement('div'); p.textContent = opts.primary || ''; p.style.fontSize='13px'; p.style.marginBottom='2px';
@@ -138,13 +114,13 @@
       if (opts.profileUrl){
         const btn = document.createElement('button'); btn.type='button';
         btn.textContent='Åbn vikarprofil';
-        Object.assign(btn.style, { cursor:'pointer', background:'#fff', color:'#111', border:'1px solid #ccc', borderRadius:'8px', padding:'6px 8px', fontWeight:600 });
-        btn.addEventListener('click', () => { try { window.open(opts.profileUrl, '_blank', 'noopener'); } catch(_){} });
+        Object.assign(btn.style,{ cursor:'pointer', background:'#fff', color:'#111', border:'1px solid #ccc', borderRadius:'8px', padding:'6px 8px', fontWeight:600 });
+        btn.addEventListener('click', ()=>{ try{ window.open(opts.profileUrl, '_blank', 'noopener'); }catch(_){} });
         actions.appendChild(btn);
       }
       const close = document.createElement('button'); close.type='button'; close.textContent='Luk';
-      Object.assign(close.style, { cursor:'pointer', background:'transparent', color:'#fff', border:'1px solid #666', borderRadius:'8px', padding:'4px 8px' });
-      close.addEventListener('click', () => { try { host.remove(); } catch(_){} });
+      Object.assign(close.style,{ cursor:'pointer', background:'transparent', color:'#fff', border:'1px solid #666', borderRadius:'8px', padding:'4px 8px' });
+      close.addEventListener('click', ()=>{ try{ host.remove(); }catch(_){} });
       actions.appendChild(close);
 
       card.appendChild(icon); card.appendChild(body); card.appendChild(actions);
@@ -152,31 +128,29 @@
       requestAnimationFrame(()=>{ card.style.opacity='1'; card.style.transform='translateY(0)'; });
 
       const ah = clamp(Number(opts.autohideMs||CFG.autohideMs)||0, 1500, 60000);
-      let t = setTimeout(()=>{ try { host.remove(); } catch(_){} }, ah);
+      let t = setTimeout(()=>{ try{ host.remove(); }catch(_){} }, ah);
       card.addEventListener('mouseenter', ()=>{ clearTimeout(t); t=null; });
-      card.addEventListener('mouseleave', ()=>{ if (!t) t = setTimeout(()=>{ try { host.remove(); } catch(_){} }, 1800); });
-    } catch(_) {}
+      card.addEventListener('mouseleave', ()=>{ if(!t) t=setTimeout(()=>{ try{ host.remove(); }catch(_){} }, 1800); });
+    }catch(_){}
   }
 
-  // --- Broadcast ---
   function broadcastCallerEvent(payload){
     try {
       const ev = { id:`${Date.now()}-${Math.random().toString(36).slice(2)}`, ts:Date.now(), payload };
       localStorage.setItem(CFG.eventKey, JSON.stringify(ev));
-    } catch(_) {}
+    } catch(_){}
   }
   function attachStorageListenerOnce(){
     if (_listenerAttached) return;
     _listenerAttached = true;
-    window.addEventListener('storage', (e) => {
+    window.addEventListener('storage', (e)=>{
       if (e.key !== CFG.eventKey || !e.newValue) return;
-      try {
+      try{
         const { payload } = JSON.parse(e.newValue||'{}');
         if (!payload) return;
-        // Debounce per number
         const p8 = payload.phone8 || (payload.secret ? 'secret' : 'x');
         const seenKey = 'tpCallerSeen_' + p8;
-        const last = Number(localStorage.getItem(seenKey) || '0');
+        const last = Number(localStorage.getItem(seenKey)||'0');
         if (Date.now() - last < CFG.debounceMs) return;
         localStorage.setItem(seenKey, String(Date.now()));
 
@@ -195,36 +169,32 @@
         const nm = payload.match.name || '(uden navn)';
         const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(payload.match.id)}#stamoplysninger`;
         showCallerToast({ title:'Indgående opkald', primary:`${nm} · ${numTxt}`, secondary, profileUrl:url });
-      } catch(_) {}
+      }catch(_){}
     });
   }
 
-  // --- Beacon tab handling ---
   async function maybeLookupCSV(p8){
-    try {
+    try{
       const txt = await gmGET(CFG.rawPhonebookUrl + '?t=' + Date.now());
       if (txt && txt.length > 50) GM_SetValueSafe(CFG.cacheKeyCSV, txt);
       const { map } = parsePhonebookCSV(txt);
       return map.get(p8) || null;
-    } catch(_){
-      const cached = GM_GetValueSafe(CFG.cacheKeyCSV) || '';
-      try { const { map } = parsePhonebookCSV(cached); return map.get(p8) || null; } catch(_) { return null; }
+    }catch(_){
+      const cached = GM_GetValueSafe(CFG.cacheKeyCSV, '');
+      try{ const { map } = parsePhonebookCSV(cached); return map.get(p8) || null; }catch(_){ return null; }
     }
   }
   function hidePageQuickly(){
-    try {
-      const de = document.documentElement; if (!de) return;
-      de.style.opacity='0'; de.style.pointerEvents='none';
-    } catch(_) {}
+    try{ const de=document.documentElement; if (!de) return; de.style.opacity='0'; de.style.pointerEvents='none'; }catch(_){}
   }
   function tryAutoClose(){
-    setTimeout(()=>{ try { window.close(); } catch(_){} }, 50);
-    setTimeout(()=>{ try { open('', '_self'); window.close(); } catch(_){} }, 120);
-    setTimeout(()=>{ try { location.replace('about:blank'); } catch(_){} }, 200);
+    setTimeout(()=>{ try{ window.close(); }catch(_){} }, 50);
+    setTimeout(()=>{ try{ open('', '_self'); window.close(); }catch(_){} }, 120);
+    setTimeout(()=>{ try{ location.replace('about:blank'); }catch(_){} }, 200);
   }
 
   async function processFromUrl(){
-    try {
+    try{
       const q = new URLSearchParams(location.search);
       const rawParam = (q.get('tp_caller') || '').trim();
       if (!rawParam) return false;
@@ -233,11 +203,12 @@
 
       const isSecret = (rawParam === CFG.queueCode);
       const isQueueInbound = rawParam.endsWith(CFG.queueSuffix);
-      const digitsRaw = rawParam.replace(new RegExp(String(CFG.queueSuffix).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*$'), '').replace(/[^\d+]/g, '');
+      const digitsRaw = rawParam
+        .replace(new RegExp(String(CFG.queueSuffix).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*$'), '')
+        .replace(/[^\d+]/g, '');
       const phone8 = normPhone(digitsRaw);
 
       if (!isSecret && !isQueueInbound){
-        // Outbound (click-to-call) → no toast, just close
         tryAutoClose();
         return true;
       }
@@ -252,29 +223,21 @@
       broadcastCallerEvent(payload);
       tryAutoClose();
       return true;
-    } catch (e) {
-      // swallow
-      return false;
-    }
+    }catch(_){ return false; }
   }
 
-  // ---- Public API ----
   const TPCaller = {
     install(opts={}){
       if (_installed) return; _installed = true;
-      CFG = { .DEF, .(opts||{}) };
+      CFG = { ...DEF, ...(opts||{}) };
       attachStorageListenerOnce();
-      // Optional immediate processing of beacon tab
-      if (opts.beaconFromUrl !== false){
-        // If this tab was opened by Communicator with tp_caller, process it
-        processFromUrl();
-      }
+      if (opts.beaconFromUrl !== false) processFromUrl();
+      log('installed with', CFG);
     },
-    processFromUrl, // expose for manual triggering if needed
-    config(){ return { .CFG }; },
+    processFromUrl,
+    config(){ return { ...CFG }; },
     version: '1.0.0'
   };
 
-  // Expose globally
-  try { window.TPCaller = Object.freeze(TPCaller); } catch(_) { /* ignore */ }
+  try { window.TPCaller = Object.freeze(TPCaller); } catch(_) { window.TPCaller = TPCaller; }
 })();
