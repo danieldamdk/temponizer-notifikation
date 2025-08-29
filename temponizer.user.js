@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Caller-Toast + SMS-toggle + Excel→CSV (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.12.21
+// @version      7.12.22
 // @description  (1) Besked/Interesse + Pushover + toasts, (2) Caller-toast, (3) SMS on/off, (4) Excel→CSV→GitHub. Kompakt UI + ⚙️.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -18,11 +18,11 @@
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=7.12.6
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=7.12.6
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=7.12.6
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=7.12.6
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/tp-actions.module.js?v=7.12.6
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=7.12.22
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=7.12.22
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=7.12.22
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=7.12.22
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/tp-actions.module.js?v=7.12.22
 // ==/UserScript==
 /* eslint-env browser */
 /* global GM_xmlhttpRequest, GM_getValue, GM_setValue, XLSX, TPNotifs, TPSms, TPExcel, TPCaller, TPActions */
@@ -30,11 +30,11 @@
 (function () {
   'use strict';
 
-  // Duplikat-guard
+  // Duplikat-guard (hindrer dobbelt-UI ved parallelle kopier)
   if (window.__TP_MAIN_ACTIVE__) return;
   window.__TP_MAIN_ACTIVE__ = Date.now();
 
-  const TP_VERSION   = '7.12.21';
+  const TP_VERSION   = '7.12.22';
   const CSV_JSDELIVR = 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/vikarer.csv';
   const SCRIPT_RAW_URL = 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js';
 
@@ -47,20 +47,6 @@
   function versionCompare(a,b){const pa=String(a).split('.').map(n=>+n||0),pb=String(b).split('.').map(n=>+n||0),L=Math.max(pa.length,pb.length);for(let i=0;i<L;i++){if((pa[i]||0)>(pb[i]||0))return 1;if((pa[i]||0)<(pb[i]||0))return -1}return 0}
   function getUserKey(){ try { return (GM_getValue('tpUserKey')||'').trim(); } catch(_) { return ''; } }
   function setUserKey(v){ try { GM_setValue('tpUserKey', (v||'').trim()); } catch(_){} }
-
-  // --- defensiv append der fanger Temponizers appendChild-hook fejl ---
-  function safeAppend(parent, el, fallbackCssText){
-    try {
-      parent.appendChild(el); // som i 7.12.6
-    } catch(e){
-      // fallback: fjern/erstat style og prøv igen (ingen decimals/opacities/rgba)
-      try { el.removeAttribute('style'); } catch {}
-      if (fallbackCssText){
-        try { el.style.cssText = fallbackCssText; } catch {}
-      }
-      parent.appendChild(el);
-    }
-  }
 
   function injectUI(){
     if (document.getElementById('tpPanel')) return;
@@ -91,11 +77,7 @@
         '<button id="tpSMSOneBtn" style="padding:5px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Aktivér</button>' +
       '</div>';
 
-    // Brug defensiv append (skulle normalt ikke trigges i 7.12.6, men fanger evt. hook-fejl)
-    safeAppend(document.body, wrap,
-      // fallback CSS uden decimaler hvis der smides fejl:
-      'position:fixed;right:8px;bottom:12px;z-index:2147483645;background:#fff;border:1px solid #d7d7d7;padding:8px;border-radius:8px;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:12px;line-height:20px;max-width:260px;min-width:200px'
-    );
+    document.body.appendChild(wrap);
 
     // toggles
     const cbMsg = wrap.querySelector('#tpEnableMsg');
@@ -124,12 +106,6 @@
         maxWidth:'calc(100vw - 16px)', maxHeight:'70vh', overflow:'auto', display:'none',
         font:'12px system-ui,-apple-system,Segoe UI,Roboto,sans-serif'
       });
-
-      // igen defensiv append hvis deres hook hikker
-      safeAppend(document.body, menu,
-        'position:fixed;right:8px;z-index:2147483646;background:#fff;border:1px solid #ccc;border-radius:10px;padding:12px;width:380px;max-width:calc(100vw - 16px);max-height:70vh;overflow:auto;display:none;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:12px;line-height:20px;bottom:'+(wrap.offsetHeight+18)+'px'
-      );
-
       menu.innerHTML =
         '<div style="font-weight:700;margin-bottom:8px">Indstillinger</div>'+
         '<div style="margin-bottom:10px">'+
@@ -159,6 +135,7 @@
         '</div>'+
         '<div style="border-top:1px solid #eee;margin:10px 0"></div>'+
         '<div style="font-size:11px;color:#666">Kører v.'+TP_VERSION+'</div>';
+      document.body.appendChild(menu);
 
       // pushover + update
       const inp = menu.querySelector('#tpUserKeyMenu'); inp.value = getUserKey();
