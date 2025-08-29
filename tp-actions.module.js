@@ -1,62 +1,53 @@
-/*
-FILE: tp-actions.module.js
-Purpose: Genskaber "Intet svar" 1:1 som i v7.11.4 – stabil og isoleret. (Ingen nye features)
-Notes:
-- Hover over Temponizers ikon med title/aria-label "Registrer opkald til vikar" viser én lille menu-knap.
-- Klik på knappen åbner Temponizers popup, udfylder textarea[name="phonetext"] med "Intet Svar" og klikker "Gem registrering" automatisk.
-- Popup er skjult (opacity 0 / pointer-events none) i millisekunder under auto-registreringen for at undgå flimmer.
-- MutationObserver aktiveres KUN pr. handling og disconnect'er igen (failsafe efter 3s).
-*/
-
-/* eslint-env browser */
-/* global unsafeWindow */
-(function (w) {
-  'use strict';
+(function(w){
   if (w.TPActions?.installed) return;
+  const VER = '2025-08-29-02';
+  const NS = '[TP][TPActions v' + VER + ']';
 
-  const VER = 'v7.12.6-01';
-  const NS  = `[TP][TPActions ${VER}]`;
+  let menu = null, iconEl = null, hideTimer = null, auto = false, obs = null;
 
-  let menu = null;
-  let iconEl = null;
-  let hideTimer = null;
-  let auto = false;
-  let obs = null;
-
-  // Find klikbart ikon via title/aria-label (som i 7.11.4)
-  function findIcon(el){
+  function findIcon(el){ /* uændret som før */ 
     try {
       while (el && el !== document && el.nodeType === 1){
-        const t = ((el.getAttribute('title')||'') + ' ' + (el.getAttribute('aria-label')||'')).toLowerCase();
+        const title = (el.getAttribute('title') || '');
+        const aria  = (el.getAttribute('aria-label') || '');
+        const t = (title + ' ' + aria).toLowerCase();
         if (t && /registrer\s*opkald\s*til\s*vikar/.test(t)){
-          return el.closest('a') || el; // klik-element
+          const a = el.closest('a') || el;
+          return a;
         }
         el = el.parentElement;
       }
-    } catch(_){/* ignore */}
+    } catch(_){}
     return null;
   }
 
-  // Lille hover-menu
   function mkMenu(){
     if (menu) return menu;
     menu = document.createElement('div');
     menu.id = 'tpIntetSvarMenu';
-    Object.assign(menu.style, {
-      position:'fixed', zIndex:'2147483647', background:'#fff', border:'1px solid #ccc',
-      boxShadow: '0 12px 28px rgba(0,0,0,0.22)',
-      // og erstat font-shorthand med sikre properties:
-      fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
-      fontSize: '12px',
-      lineHeight: '20px',
-      padding:'6px', display:'none'
-    });
+    // SIKRE styles (ingen shorthand/decimal uden 0)
+    menu.style.position = 'fixed';
+    menu.style.zIndex = '2147483647';
+    menu.style.background = '#ffffff';
+    menu.style.border = '1px solid #cccccc';
+    menu.style.boxShadow = '0 12px 28px rgba(0,0,0,0.22)';
+    menu.style.borderRadius = '8px';
+    menu.style.fontFamily = 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+    menu.style.fontSize = '12px';
+    menu.style.lineHeight = '20px';
+    menu.style.padding = '6px';
+    menu.style.display = 'none';
+
     const btn = document.createElement('div');
     btn.textContent = "Registrér 'Intet Svar'";
-    Object.assign(btn.style, { padding:'6px 8px', borderRadius:'6px', cursor:'pointer', userSelect:'none' });
+    btn.style.padding = '6px 8px';
+    btn.style.borderRadius = '6px';
+    btn.style.cursor = 'pointer';
+    btn.style.userSelect = 'none';
     btn.onmouseenter = () => { btn.style.background = '#f2f2f2'; };
     btn.onmouseleave = () => { btn.style.background = 'transparent'; };
-    btn.onclick = () => { try { autoRegister(); } catch(e){ console.warn(NS,'autoRegister error',e); } hideMenu(); };
+    btn.onclick = () => { try { autoRegister(); } catch(e){ console.warn(NS,'autoRegister error', e); } hideMenu(); };
+
     menu.appendChild(btn);
     document.body.appendChild(menu);
     return menu;
@@ -74,97 +65,93 @@ Notes:
     m.style.left = left + 'px';
     m.style.top  = top  + 'px';
   }
-  function hideMenu(){
-    if (!menu) return;
-    clearTimeout(hideTimer);
-    hideTimer = setTimeout(()=>{ if (menu) menu.style.display = 'none'; }, 120);
-  }
+  function hideMenu(){ if (!menu) return; clearTimeout(hideTimer); hideTimer=setTimeout(()=>{ if(menu) menu.style.display='none'; }, 120); }
 
-  function autoRegister(){
+  function autoRegister(){ /* uændret som før */ 
     if (!iconEl) return;
     auto = true;
     attachObserverOnce();
     try { iconEl.click(); } catch(_) {}
   }
 
-  function attachObserverOnce(){
-    if (obs) { try { obs.disconnect(); } catch {} obs=null; }
-
-    const cloak = (root)=>{
+  function attachObserverOnce(){ /* uændret logik – kun styles sikre hvis sat */ 
+    if (obs) { try { obs.disconnect(); } catch {} obs = null; }
+    const cloak = (root) => {
       try{
         const hsBody = root.querySelector ? root.querySelector('.highslide-body') : null;
         const hsCont = root.querySelector ? root.querySelector('.highslide-container') : null;
-        [hsBody, hsCont].filter(Boolean).forEach(el=>{
+        const els = [hsBody, hsCont].filter(Boolean);
+        for (const el of els){
           el._tp_prev = { opacity: el.style.opacity, pointerEvents: el.style.pointerEvents, transform: el.style.transform };
-          el.style.opacity='0'; el.style.pointerEvents='none'; el.style.transform='scale(0.98)';
-        });
+          el.style.opacity = '0';
+          el.style.pointerEvents = 'none';
+          el.style.transform = 'scale(0.98)';
+        }
       }catch{}
     };
-    const uncloackAll = ()=>{
-      try { document.querySelectorAll('.highslide-body,.highslide-container').forEach(el=>{
-        if (!el._tp_prev) return;
-        el.style.opacity = el._tp_prev.opacity || '';
-        el.style.pointerEvents = el._tp_prev.pointerEvents || '';
-        el.style.transform = el._tp_prev.transform || '';
-        delete el._tp_prev;
-      }); } catch{}
+    const uncloackAll = () => {
+      try {
+        document.querySelectorAll('.highslide-body,.highslide-container').forEach(el=>{
+          if (el && el._tp_prev){
+            el.style.opacity = el._tp_prev.opacity || '';
+            el.style.pointerEvents = el._tp_prev.pointerEvents || '';
+            el.style.transform = el._tp_prev.transform || '';
+            delete el._tp_prev;
+          }
+        });
+      } catch {}
     };
-
-    const tryProcess = (node)=>{
-      try{
-        const root = (node && node.nodeType===1) ? node : document;
+    const tryProcess = (node) => {
+      try {
+        const root = (node && node.nodeType === 1) ? node : document;
         cloak(root);
-
         let ta = null;
-        if (root.matches && root.matches('textarea[name="phonetext"]')) ta = root;
-        if (!ta && root.querySelector) ta = root.querySelector('textarea[name="phonetext"]');
+        if (root.matches && root.matches('textarea[name=\"phonetext\"]')) ta = root;
+        if (!ta && root.querySelector) ta = root.querySelector('textarea[name=\"phonetext\"]');
         if (!ta) return false;
-
         if (!ta.value || !ta.value.trim()) ta.value = 'Intet Svar';
         const form = ta.closest('form') || ta.form || (root.querySelector && root.querySelector('form'));
         if (!form) return false;
-
-        const btn = Array.from(form.querySelectorAll('input[type="button"],input[type="submit"],button')).find(b=>{
+        const btn = Array.from(form.querySelectorAll('input[type=\"button\"],input[type=\"submit\"],button')).find(b=>{
           const v = (b.value || b.textContent || '').trim().toLowerCase();
-          return /gem\s+registrering/.test(v);
+          return /gem\\s+registrering/.test(v);
         });
         if (!btn) return false;
-
         setTimeout(()=>{
-          try { btn.click(); } catch{}
-          try {
-            const uw = (typeof unsafeWindow!=='undefined') ? unsafeWindow : w;
-            if (uw && uw.hs && typeof uw.hs.close==='function') uw.hs.close();
-          } catch{}
+          try { btn.click(); } catch {}
+          try { if (w && w.hs && typeof w.hs.close === 'function') w.hs.close(); } catch {}
           setTimeout(uncloackAll, 120);
         }, 30);
         return true;
-      }catch(e){ console.warn(NS,'process error', e); return false; }
+      } catch (e) { console.warn(NS,'process error', e); return false; }
     };
-
     obs = new MutationObserver((mlist)=>{
       if (!auto) return;
       for (const m of mlist){
         for (const n of m.addedNodes){
-          if (tryProcess(n)){
-            auto = false;
-            try { obs.disconnect(); } catch{}
-            obs = null;
-            return;
-          }
+          if (tryProcess(n)){ auto=false; try { obs.disconnect(); } catch {} obs=null; return; }
         }
       }
     });
     obs.observe(document.body, { childList:true, subtree:true });
-
-    // failsafe
-    setTimeout(()=>{ if (auto){ auto=false; try{ obs && obs.disconnect(); }catch{} obs=null; } }, 3000);
+    setTimeout(()=>{ if (auto){ auto=false; try { obs && obs.disconnect(); } catch{} obs=null; } }, 3000);
   }
 
   function onMouseOver(e){ const el = findIcon(e.target); if (!el) return; showMenuForIcon(el); }
-  function onMouseMove(e){ if (!menu || menu.style.display!=='block') return; const t=e.target; if (menu.contains(t)) return; if (iconEl && iconEl.contains && iconEl.contains(t)) return; hideMenu(); }
+  function onMouseMove(e){
+    if (!menu || menu.style.display !== 'block') return;
+    const t = e.target;
+    if (menu.contains(t)) return;
+    if (iconEl && iconEl.contains && iconEl.contains(t)) return;
+    hideMenu();
+  }
 
-  function install(){ if (install._did) return; install._did = true; document.addEventListener('mouseover', onMouseOver, true); document.addEventListener('mousemove', onMouseMove, true); console.info(NS,'installed'); }
+  function install(){
+    if (install._did) return; install._did = true;
+    document.addEventListener('mouseover', onMouseOver, true);
+    document.addEventListener('mousemove', onMouseMove, true);
+    console.info(NS,'installed');
+  }
 
   w.TPActions = { install, VER };
   w.TPActions.installed = true;
