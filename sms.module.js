@@ -78,7 +78,7 @@
   function bindUI(container){
     const lbl = container.querySelector('#tpSMSStatus');
     const btn = container.querySelector('#tpSMSOneBtn');
-    function setBusy(on, text){ if (btn){ btn.disabled=on; btn.style.opacity = on ? 0.6 : 1; } if (on && text && lbl) lbl.textContent = text; }
+    function setBusy(on, text){ if (btn){ btn.disabled=on; btn.style.opacity = on ? .6 : 1; } if (on && text && lbl) lbl.textContent = text; }
     function paint(st){ if(!lbl||!btn) return; switch(st.state){ case 'active': btn.textContent='Deaktiver'; lbl.textContent='SMS: Aktiv' + (st.phone?(' — '+st.phone):''); lbl.style.color='#0a7a35'; break; case 'inactive': btn.textContent='Aktivér'; lbl.textContent='SMS: Ikke aktiv' + (st.phone?(' — '+st.phone):''); lbl.style.color='#a33'; break; default: btn.textContent='Aktivér'; lbl.textContent='SMS: Ukendt'; lbl.style.color='#666'; } }
     btn.addEventListener('click', async ()=>{ if (_busy) return; _busy=true; const wantOn = (btn.textContent==='Aktivér'); setBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…'); try { const st = await toggleSmsInIframe(wantOn, 15000, 500); paint(st); } finally { _busy=false; setBusy(false); } });
     (async()=>{ setBusy(true,'indlæser…'); try { paint(await getSmsStatus()); } finally { setBusy(false); } })();
