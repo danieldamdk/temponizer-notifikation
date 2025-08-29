@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Caller-Toast + SMS-toggle + Excel→CSV (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.12.23
+// @version      7.12.24
 // @description  7.12.6-funktionalitet, men UI injiceres uden inline-decimaler (safe CSS via <style> + klasser).
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -33,7 +33,7 @@
   if (window.__TP_MAIN_ACTIVE__) return;
   window.__TP_MAIN_ACTIVE__ = Date.now();
 
-  const TP_VERSION   = '7.12.23';
+  const TP_VERSION   = '7.12.24';
   const CSV_JSDELIVR = 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/vikarer.csv';
   const SCRIPT_RAW_URL = 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js';
 
