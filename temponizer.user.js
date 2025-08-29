@@ -8,9 +8,9 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
+// @connect      cdn.jsdelivr.net
 // @connect      api.pushover.net
 // @connect      api.github.com
-// @connect      cdn.jsdelivr.net
 // @connect      ajourcare.temponizer.dk
 // @connect      raw.githubusercontent.com
 // @run-at       document-idle
@@ -18,11 +18,11 @@
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=7.12.25
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=7.12.25
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=7.12.25
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=7.12.25
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/tp-actions.module.js?v=7.12.25
+// @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/notifs.module
+// @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/tp-actions.module.js?ts=71225
+// @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/sms.module.js?ts=71225
+// @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/excel.module.js?ts=71225
+// @require      https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/caller.module.js?ts=71225
 // ==/UserScript==
 /* eslint-env browser */
 /* global GM_xmlhttpRequest, GM_getValue, GM_setValue, XLSX, TPNotifs, TPSms, TPExcel, TPCaller, TPActions */
