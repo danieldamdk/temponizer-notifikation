@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Caller-Toast + SMS-toggle + Excel→CSV (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.12.10
+// @version      7.12.11
 // @description  (1) Besked/Interesse + Pushover + toasts, (2) Caller-toast, (3) SMS on/off, (4) Excel→CSV→GitHub. Kompakt UI + ⚙️.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -18,11 +18,11 @@
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=7.12.10
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=7.12.10
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=7.12.10
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=7.12.10
-// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/tp-actions.module.js?v=7.12.10
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/notifs.module.js?v=7.12.11
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/sms.module.js?v=7.12.11
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/excel.module.js?v=7.12.11
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/caller.module.js?v=7.12.11
+// @require      https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/tp-actions.module.js?v=7.12.11
 // ==/UserScript==
 /* eslint-env browser */
 /* global GM_xmlhttpRequest, GM_getValue, GM_setValue, XLSX, TPNotifs, TPSms, TPExcel, TPCaller, TPActions */
@@ -30,23 +30,19 @@
 (function () {
   'use strict';
 
-  // Duplikat-guard for main (hindrer dobbelt-UI ved parallelle kopier)
+  // Global dup-guard
   if (window.__TP_MAIN_ACTIVE__) return;
   window.__TP_MAIN_ACTIVE__ = Date.now();
 
-  const TP_VERSION   = '7.12.10';
+  const TP_VERSION   = '7.12.11';
   const CSV_JSDELIVR = 'https://cdn.jsdelivr.net/gh/danieldamdk/temponizer-notifikation@main/vikarer.csv';
   const SCRIPT_RAW_URL = 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js';
 
-  // --- Anti-stale TPCaller: fjern meget gamle/globalt kolliderende versioner ---
-  // Hvis en anden userscript-instans har sat en gammel TPCaller (fx '1.0.0'),
-  // ryd den, så den nye @require/caller.module.js kan overtage.
+  // --- Anti-stale: ryd gammel/global TPCaller (fx '1.0.0') inden install ---
   try {
     const v = (window.TPCaller && window.TPCaller.version) || '';
     if (!/^v7\.12\./.test(String(v))) {
-      // Kun hvis det ikke ligner vores nyere semver med 'v7.12.x'
       console.warn('[TP][MAIN] Removing stale TPCaller', v);
-      try { delete window.TPCaller.installed; } catch (_) {}
       try { window.TPCaller = undefined; } catch (_) {}
     }
   } catch (_) {}
@@ -62,6 +58,7 @@
   function setUserKey(v){ try { GM_setValue('tpUserKey', (v||'').trim()); } catch(_){} }
 
   function injectUI(){
+    // DOM-guard mod dobbelt UI
     if (document.getElementById('tpPanel')) return;
 
     const wrap = document.createElement('div');
@@ -107,7 +104,7 @@
     document.addEventListener('tp:int-count', e => { badgeInt.textContent = String(e.detail?.count||0); });
 
     // gear menu
-    const gearBtn = wrap.querySelector('#tpGearBtn');
+    const tpGearBtnEl = wrap.querySelector('#tpGearBtn'); // <— unikt navn
     let menu = null;
     function buildMenu(){
       if (menu) return menu;
@@ -154,7 +151,10 @@
       const inp = menu.querySelector('#tpUserKeyMenu'); inp.value = getUserKey();
       menu.querySelector('#tpSaveUserKeyMenu').addEventListener('click', ()=>{ setUserKey(inp.value); notify('USER-token gemt.'); });
       inp.addEventListener('keydown', e=>{ if (e.key==='Enter'){ e.preventDefault(); setUserKey(inp.value); notify('USER-token gemt.'); } });
-      menu.querySelector('#tpTestPushoverBtn').addEventListener('click', ()=>{ try { if (typeof TPNotifs?.testPushover === 'function') TPNotifs.testPushover(); else notify('TPNotifs er ikke klar endnu.'); } catch { notify('Kunne ikke køre test.'); } });
+      menu.querySelector('#tpTestPushoverBtn').addEventListener('click', ()=>{
+        try { if (typeof TPNotifs?.testPushover === 'function') TPNotifs.testPushover(); else notify('TPNotifs er ikke klar endnu.'); }
+        catch { notify('Kunne ikke køre test.'); }
+      });
       menu.querySelector('#tpCheckUpdate').addEventListener('click', async ()=>{
         try {
           const raw = await gmGET(SCRIPT_RAW_URL + '?t=' + Date.now());
@@ -177,15 +177,14 @@
       const menu = buildMenu();
       menu.style.display = (menu.style.display==='block')?'none':'block';
       if (menu.style.display==='block'){
-        const outside = (e)=>{ if (!menu.contains(e.target) && e.target !== gearBtn){ menu.style.display='none'; cleanup(); } };
+        const outside = (e)=>{ if (!menu.contains(e.target) && e.target !== tpGearBtnEl){ menu.style.display='none'; cleanup(); } };
         const esc = (e)=>{ if (e.key==='Escape'){ menu.style.display='none'; cleanup(); } };
         function cleanup(){ document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', esc, true); }
         document.addEventListener('mousedown', outside, true);
         document.addEventListener('keydown', esc, true);
       }
     }
-    const gearBtn = wrap.querySelector('#tpGearBtn');
-    gearBtn.addEventListener('click', toggleMenu);
+    tpGearBtnEl.addEventListener('click', toggleMenu);
   }
 
   function boot(){
@@ -218,7 +217,7 @@
       settingsUrl: location.origin + '/index.php?page=showmy_settings'
     });
 
-    // Caller (nyeste module skal nu have fået lov at sætte window.TPCaller)
+    // Caller (nyeste modul skal nu have overtaget window.TPCaller)
     TPCaller.install({
       queueSuffix: '*1500',
       queueCode: '1500',
@@ -228,10 +227,9 @@
       debounceMs: 10000,
       autohideMs: 8000
     });
-    // Tillad manuelt testkald i adresselinjen
     try { TPCaller.processFromUrl && TPCaller.processFromUrl(); } catch(_) {}
 
-    // Actions (Registrér “Intet svar”)
+    // Actions (“Intet svar”)
     try { TPActions?.install && TPActions.install(); } catch(_){}
 
     // Bridge for DevTools
