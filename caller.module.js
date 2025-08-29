@@ -1,227 +1,280 @@
 /* eslint-env browser */
-/* global GM_xmlhttpRequest, GM_getValue, GM_setValue, unsafeWindow */
-// Caller module for Temponizer (IPNordic Communicator integration)
-// - Beacon tab opened by Communicator with ?tp_caller=<number> broadcasts to other tabs and auto-closes
-// - Other tabs show a toast with name lookup from CSV phonebook and optional link to vikar profile
-// - Robust to whitespace, +45, and optional queue suffix (e.g. *1500). Last 8 digits used for DK numbers.
+/* eslint no-console: "off" */
+(function () {
+  'use strict';
+  const MOD = 'caller.module';           // ← skift til sms.module / excel.module / caller.module
+  const VER = 'v2025-08-28-01';          // ← valgfrit versionsstempel
+  const debug = localStorage.getItem('tpDebug') === '1';
+  const log = (.a) => { if (debug) console.info('[TP]', MOD, VER, .a); };
+
+  log('loaded at', new Date().toISOString());
+  // ... resten af modulet ...
+})();
+
+/* global GM_xmlhttpRequest, GM_getValue, GM_setValue */
+// Caller module for Temponizer (IPnordic Communicator integration)
+// Purpose: Show a clickable DOM toast on inbound queue calls, with optional link to vikar profile.
+// Works as a beacon: the tab opened by Communicator broadcasts the event to all open tabs and auto-closes.
+// This file is designed to be @require'd from the main userscript.
 
 (function(){
   'use strict';
 
-  if (window.TPCaller?.installed) return;
-
-  const VER = 'v7.12.6-02';
-  const NS  = `[TP][Caller ${VER}]`;
-  const debug = localStorage.getItem('tpDebug') === '1';
-  const dlog  = (...a) => { if (debug) console.info(NS, ...a); };
-
-  // ---- Config (override by TPCaller.install(opts)) ----
+  // ---- Config (runtime overridable via TPCaller.install(opts)) ----
   const DEF = Object.freeze({
     rawPhonebookUrl: 'https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/vikarer.csv',
     cacheKeyCSV: 'tpCSVCache',
-    queueSuffix: '*1500',      // accepted but NOT required
-    queueCode:   '1500',       // shown if secret/queue-only
-    openInNewTab: true,
-    debounceMs: 10000,
-    autohideMs: 8000,
-    eventKey: 'tpCallerEvtV2',
-    z: 2147483646
+    queueSuffix: '*1500',     // inbound numbers end with this (e.g., 11223344*1500)
+    queueCode: '1500',        // secret number shows only this
+    openInNewTab: true,       // open profile in new tab on click
+    debounceMs: 10000,        // per-number toast debounce in listeners
+    autohideMs: 8000,         // toast lifetime
+    eventKey: 'tpCallerEvtV2' // localStorage broadcast key
   });
 
-  let CFG = { ...DEF };
+  let CFG = { .DEF };
   let _installed = false;
   let _listenerAttached = false;
 
   // ---- Small utils ----
+  const now = () => Date.now();
   const clamp = (n,min,max) => Math.max(min, Math.min(max, n));
-  const now   = () => Date.now();
 
   function normPhone(raw){
-    if (!raw) return '';
-    // Trim, decode and strip non-digits except optional trailing *digits (queue suffix)
-    let s = String(raw).trim();
-    try { s = decodeURIComponent(s); } catch(_){}
-    // Remove spaces
-    s = s.replace(/\s+/g,'');
-    // If suffix like *1500, drop it
-    s = s.replace(/\*[0-9]+$/,'');
-    // Strip non-digits
-    s = s.replace(/[^0-9]/g,'');
-    // Drop country code 45 if present by keeping last 8
-    if (s.length > 8) s = s.slice(-8);
-    return s;
+    const digits = String(raw||'').replace(/\D/g,'').replace(/^0+/, '').replace(/^45/, '');
+    return digits.length >= 8 ? digits.slice(-8) : '';
+  }
+  function fmtPhoneDK(p8){
+    if (!p8) return '';
+    return String(p8).replace(/(\d{2})(?=\d)/g,'$1 ').trim();
   }
 
-  function fmtPhone8(p8){
-    return String(p8||'').replace(/(\d{2})(?=\d)/g,'$1 ').trim();
-  }
-
-  // ---- GM wrappers ----
+  // GM_XHR GET wrapper
   function gmGET(url){
-    return new Promise((resolve,reject)=>{
+    return new Promise((resolve, reject) => {
       try {
-        GM_xmlhttpRequest({ method:'GET', url, headers:{'Accept':'*/*','Cache-Control':'no-cache','Pragma':'no-cache'},
-          onload:r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
-          onerror:e => reject(e)
+        GM_xmlhttpRequest({
+          method: 'GET', url,
+          headers: { 'Accept': '*/*', 'Cache-Control':'no-cache','Pragma':'no-cache' },
+          onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
+          onerror: e => reject(e)
         });
-      } catch (e){ reject(e); }
+      } catch (e) { reject(e); }
     });
   }
-  const GM_GetValueSafe = (k,def) => { try{ return GM_getValue(k,def); }catch(_){ return def; } };
-  const GM_SetValueSafe = (k,v) => { try{ return GM_setValue(k,v); }catch(_){ return; } };
+  function GM_GetValueSafe(k){ try { return GM_getValue(k); } catch(_) { return null; } }
+  function GM_SetValueSafe(k,v){ try { GM_setValue(k,v); } catch(_) { /* ignore */ } }
 
-  // ---- CSV phonebook ----
-  function parsePhonebookCSV(txt){
-    const map = new Map(); // p8 -> { id, name }
+  // CSV parsing (minimal, robust)
+  function parseCSV(text){
+    if (!text) return [];
+    text = text.replace(/^\uFEFF/, '');
+    const first = (text.split(/\r?\n/)[0] || '');
+    const delim = (first.indexOf(';') > first.indexOf(',')) ? ';' : (first.includes(';') ? ';' : ',');
+    const rows = []; let i=0, field='', row=[], inQ=false;
+    while (i < text.length){
+      const c = text[i];
+      if (inQ){ if (c==='"'){ if (text[i+1]==='"'){ field+='"'; i+=2; continue; } inQ=false; i++; continue; } field+=c; i++; continue; }
+      if (c==='"'){ inQ=true; i++; continue; }
+      if (c==='\r'){ i++; continue; }
+      if (c==='\n'){ row.push(field.trim()); rows.push(row); row=[]; field=''; i++; continue; }
+      if (c===delim){ row.push(field.trim()); field=''; i++; continue; }
+      field+=c; i++;
+    }
+    if (field.length || row.length){ row.push(field.trim()); rows.push(row); }
+    return rows.filter(r => r.length && r.some(x => x !== ''));
+  }
+  function parsePhonebookCSV(text){
     const vikarsById = new Map();
-    let header = [];
-    try {
-      const lines = txt.split(/\r?\n/);
-      header = (lines.shift()||'').split(';');
-      const idxName = header.findIndex(h=>/navn/i.test(h));
-      const idxPhone= header.findIndex(h=>/tlf|telefon|mobil/i.test(h));
-      const idxId   = header.findIndex(h=>/id/i.test(h));
-      for (const line of lines){
-        if (!line.trim()) continue;
-        const row = line.split(';');
-        const name = (row[idxName]||'').trim();
-        const phoneRaw = (row[idxPhone]||'').trim();
-        const id = (row[idxId]||'').trim();
-        const p8 = normPhone(phoneRaw);
-        if (p8){ map.set(p8,{id,name}); if (id) vikarsById.set(id,{name,p8}); }
+    const map = new Map();
+    const rows = parseCSV(text);
+    if (!rows.length) return { map, header: [], vikarsById };
+    const header = rows[0].map(h => h.toLowerCase());
+    const idxId   = header.findIndex(h => /(vikar.*nr|vikar[_ ]?id|^id$)/.test(h));
+    const idxName = header.findIndex(h => /(navn|name)/.test(h));
+    const phoneCols = header.map((h, idx) => ({ h, idx })).filter(x => /(telefon|mobil|cellphone|mobile|phone|tlf)/.test(x.h));
+    if (idxId < 0 || phoneCols.length === 0) return { map, header, vikarsById };
+    for (let r = 1; r < rows.length; r++){
+      const row = rows[r];
+      const id   = (row[idxId]   || '').trim();
+      const name = idxName >= 0 ? (row[idxName] || '').trim() : '';
+      if (id) vikarsById.set(String(id), { id, name });
+      if (!id) continue;
+      for (const pc of phoneCols){
+        const val = (row[pc.idx] || '').trim();
+        const p8 = normPhone(val);
+        if (p8) map.set(p8, { id, name });
       }
-    } catch(e){ dlog('CSV parse error', e); }
+    }
     return { map, header, vikarsById };
   }
 
-  async function getCSVMap(){
-    // Try live
-    try{
-      const txt = await gmGET(CFG.rawPhonebookUrl + '?t=' + now());
-      if (txt && txt.length > 50) GM_SetValueSafe(CFG.cacheKeyCSV, txt);
-      const { map } = parsePhonebookCSV(txt);
-      if (map.size) return map;
-    }catch(e){ dlog('live CSV error', e); }
-    // Fallback to cache
-    try{
-      const cached = GM_GetValueSafe(CFG.cacheKeyCSV, '') || '';
-      if (cached){ const { map } = parsePhonebookCSV(cached); if (map.size) return map; }
-    }catch(e){ dlog('cache CSV error', e); }
-    return new Map();
-  }
-
-  // ---- Toast UI ----
+  // --- Toast UI ---
   function showCallerToast(opts){
-    const { title, primary, secondary, profileUrl, autohideMs } = opts || {};
-    try{
+    // opts: { title, primary, secondary, profileUrl|null, autohideMs }
+    try {
       const host = document.createElement('div');
       Object.assign(host.style, {
-        position:'fixed', right:'12px', bottom:'12px', zIndex:String(CFG.z),
-        background:'#1f2937', color:'#fff', borderRadius:'10px', boxShadow:'0 12px 28px rgba(0,0,0,.25)',
-        padding:'10px 12px', maxWidth:'360px', font:'13px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif',
-        cursor: profileUrl ? 'pointer' : 'default', opacity:'0', transform:'translateY(8px)', transition:'opacity .16s ease, transform .16s ease'
+        position:'fixed', bottom:'12px', right:'12px', zIndex:2147483647,
+        maxWidth:'360px', font:'12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif'
       });
-      host.setAttribute('role','alert');
-      host.innerHTML = `<div style="font-weight:600;margin-bottom:2px;">${title||'Indgående opkald'} ☎️</div>
-        <div style="font-size:14px;">${primary||''}</div>
-        ${secondary?`<div style="opacity:.8;margin-top:2px;">${secondary}</div>`:''}`;
-      if (profileUrl){ host.addEventListener('click',()=>{ try{ window.open(profileUrl, CFG.openInNewTab?'_blank':'_self'); }catch(_){} }); }
-      document.body.appendChild(host);
-      requestAnimationFrame(()=>{ host.style.opacity='1'; host.style.transform='translateY(0)'; });
-      const ms = clamp(Number(autohideMs||CFG.autohideMs)|0,1500,60000);
-      setTimeout(()=>{ host.style.opacity='0'; host.style.transform='translateY(8px)';
-        setTimeout(()=>{ try{ host.remove(); }catch(_){} }, 220);
-      }, ms);
-    }catch(e){ dlog('toast error', e); }
+      const card = document.createElement('div');
+      Object.assign(card.style, {
+        background:'#1f1f1f', color:'#fff', borderRadius:'10px', padding:'10px 12px',
+        boxShadow:'0 10px 28px rgba(0,0,0,.38)', display:'flex', gap:'10px', alignItems:'flex-start',
+        opacity:'0', transform:'translateY(8px)', transition:'opacity .22s, transform .22s'
+      });
+      const icon = document.createElement('div'); icon.textContent='☎️'; icon.style.fontSize='18px';
+
+      const body = document.createElement('div'); body.style.flex='1 1 auto';
+      const h = document.createElement('div'); h.textContent = opts.title || 'Indgående opkald'; h.style.fontWeight='700'; h.style.marginBottom='2px';
+      const p = document.createElement('div'); p.textContent = opts.primary || ''; p.style.fontSize='13px'; p.style.marginBottom='2px';
+      const s = document.createElement('div'); s.textContent = opts.secondary || ''; s.style.color='#bbb'; s.style.fontSize='11px';
+      body.appendChild(h); body.appendChild(p); if (opts.secondary) body.appendChild(s);
+
+      const actions = document.createElement('div');
+      actions.style.display='flex'; actions.style.flexDirection='column'; actions.style.gap='6px'; actions.style.marginLeft='6px';
+
+      if (opts.profileUrl){
+        const btn = document.createElement('button'); btn.type='button';
+        btn.textContent='Åbn vikarprofil';
+        Object.assign(btn.style, { cursor:'pointer', background:'#fff', color:'#111', border:'1px solid #ccc', borderRadius:'8px', padding:'6px 8px', fontWeight:600 });
+        btn.addEventListener('click', () => { try { window.open(opts.profileUrl, '_blank', 'noopener'); } catch(_){} });
+        actions.appendChild(btn);
+      }
+      const close = document.createElement('button'); close.type='button'; close.textContent='Luk';
+      Object.assign(close.style, { cursor:'pointer', background:'transparent', color:'#fff', border:'1px solid #666', borderRadius:'8px', padding:'4px 8px' });
+      close.addEventListener('click', () => { try { host.remove(); } catch(_){} });
+      actions.appendChild(close);
+
+      card.appendChild(icon); card.appendChild(body); card.appendChild(actions);
+      host.appendChild(card); document.body.appendChild(host);
+      requestAnimationFrame(()=>{ card.style.opacity='1'; card.style.transform='translateY(0)'; });
+
+      const ah = clamp(Number(opts.autohideMs||CFG.autohideMs)||0, 1500, 60000);
+      let t = setTimeout(()=>{ try { host.remove(); } catch(_){} }, ah);
+      card.addEventListener('mouseenter', ()=>{ clearTimeout(t); t=null; });
+      card.addEventListener('mouseleave', ()=>{ if (!t) t = setTimeout(()=>{ try { host.remove(); } catch(_){} }, 1800); });
+    } catch(_) {}
   }
 
-  // ---- Broadcast between tabs ----
-  function broadcast(payload){
-    try{
-      const ev = { ts: now(), payload };
+  // --- Broadcast ---
+  function broadcastCallerEvent(payload){
+    try {
+      const ev = { id:`${Date.now()}-${Math.random().toString(36).slice(2)}`, ts:Date.now(), payload };
       localStorage.setItem(CFG.eventKey, JSON.stringify(ev));
-    }catch(_){/* ignore */}
+    } catch(_) {}
   }
-
   function attachStorageListenerOnce(){
-    if (_listenerAttached) return; _listenerAttached = true;
-    window.addEventListener('storage', async (e)=>{
+    if (_listenerAttached) return;
+    _listenerAttached = true;
+    window.addEventListener('storage', (e) => {
       if (e.key !== CFG.eventKey || !e.newValue) return;
-      try{
+      try {
         const { payload } = JSON.parse(e.newValue||'{}');
         if (!payload) return;
-        // Debounce by number
+        // Debounce per number
         const p8 = payload.phone8 || (payload.secret ? 'secret' : 'x');
-        const seenKey = 'tpCallerSeen_'+p8;
-        const last = Number(localStorage.getItem(seenKey)||'0');
-        if (now() - last < CFG.debounceMs) return;
-        localStorage.setItem(seenKey, String(now()));
+        const seenKey = 'tpCallerSeen_' + p8;
+        const last = Number(localStorage.getItem(seenKey) || '0');
+        if (Date.now() - last < CFG.debounceMs) return;
+        localStorage.setItem(seenKey, String(Date.now()));
 
-        let title   = 'Indgående opkald';
-        let primary = '';
-        let secondary = '';
-        let profileUrl = null;
+        const viaKoe = payload.viaQueue === true;
+        const secondary = viaKoe ? `Via kø (${CFG.queueCode})` : '';
 
         if (payload.secret){
-          secondary = `Via kø (${CFG.queueCode})`;
-          primary   = 'Hemmelig/ukendt nummer';
-        } else {
-          const map = await getCSVMap();
-          const hit = map.get(payload.phone8||'');
-          const nice = fmtPhone8(payload.phone8);
-          if (hit){ primary = `${hit.name} (${nice})`; profileUrl = `/index.php?page=vikar&show=${encodeURIComponent(hit.id)}`; }
-          else { primary = nice; }
+          showCallerToast({ title:'Indgående opkald', primary:'Hemmelig via kø', secondary });
+          return;
         }
-        showCallerToast({ title, primary, secondary, profileUrl, autohideMs: CFG.autohideMs });
-      }catch(err){ dlog('storage listener error', err); }
+        const numTxt = fmtPhoneDK(payload.phone8||'');
+        if (!payload.match){
+          showCallerToast({ title:'Indgående opkald', primary:`Ukendt nummer · ${numTxt}`, secondary });
+          return;
+        }
+        const nm = payload.match.name || '(uden navn)';
+        const url = `/index.php?page=showvikaroplysninger&vikar_id=${encodeURIComponent(payload.match.id)}#stamoplysninger`;
+        showCallerToast({ title:'Indgående opkald', primary:`${nm} · ${numTxt}`, secondary, profileUrl:url });
+      } catch(_) {}
     });
   }
 
-  // ---- Beacon tab handler ----
-  function getParam(name){
-    const rx = new RegExp(`[?&]${name}=([^&]*)`,'i');
-    const m  = rx.exec(location.search);
-    return m ? m[1] : '';
+  // --- Beacon tab handling ---
+  async function maybeLookupCSV(p8){
+    try {
+      const txt = await gmGET(CFG.rawPhonebookUrl + '?t=' + Date.now());
+      if (txt && txt.length > 50) GM_SetValueSafe(CFG.cacheKeyCSV, txt);
+      const { map } = parsePhonebookCSV(txt);
+      return map.get(p8) || null;
+    } catch(_){
+      const cached = GM_GetValueSafe(CFG.cacheKeyCSV) || '';
+      try { const { map } = parsePhonebookCSV(cached); return map.get(p8) || null; } catch(_) { return null; }
+    }
+  }
+  function hidePageQuickly(){
+    try {
+      const de = document.documentElement; if (!de) return;
+      de.style.opacity='0'; de.style.pointerEvents='none';
+    } catch(_) {}
+  }
+  function tryAutoClose(){
+    setTimeout(()=>{ try { window.close(); } catch(_){} }, 50);
+    setTimeout(()=>{ try { open('', '_self'); window.close(); } catch(_){} }, 120);
+    setTimeout(()=>{ try { location.replace('about:blank'); } catch(_){} }, 200);
   }
 
-  function tryClose(){
-    try{ window.close(); }catch(_){}
-    // Some browsers block close() if not opened by script; attempt to blank out
-    try{ setTimeout(()=>{ try{ window.open('','_self'); window.close(); }catch(_){} }, 100); }catch(_){}
-  }
+  async function processFromUrl(){
+    try {
+      const q = new URLSearchParams(location.search);
+      const rawParam = (q.get('tp_caller') || '').trim();
+      if (!rawParam) return false;
 
-  function processFromUrl(){
-    try{
-      const raw = String(getParam('tp_caller')||'').trim();
-      if (!raw) return false;
-      // Support secret or withheld numbers from Communicator (could be empty) → treat as secret when non-digits
-      const hasDigits = /\d/.test(raw);
-      const p8 = hasDigits ? normPhone(raw) : '';
-      const secret = !hasDigits;
-      const payload = secret ? { secret:true } : { phone8: p8 };
-      broadcast(payload);
-      dlog('beacon broadcast', payload);
-      tryClose();
+      hidePageQuickly();
+
+      const isSecret = (rawParam === CFG.queueCode);
+      const isQueueInbound = rawParam.endsWith(CFG.queueSuffix);
+      const digitsRaw = rawParam.replace(new RegExp(String(CFG.queueSuffix).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*$'), '').replace(/[^\d+]/g, '');
+      const phone8 = normPhone(digitsRaw);
+
+      if (!isSecret && !isQueueInbound){
+        // Outbound (click-to-call) → no toast, just close
+        tryAutoClose();
+        return true;
+      }
+
+      const payload = { dir:'in', viaQueue:true, secret:isSecret, raw:rawParam };
+      if (!isSecret && phone8){
+        payload.phone8 = phone8;
+        const rec = await maybeLookupCSV(phone8);
+        if (rec) payload.match = { id: rec.id, name: rec.name || '' };
+      }
+
+      broadcastCallerEvent(payload);
+      tryAutoClose();
       return true;
-    }catch(e){ dlog('processFromUrl error', e); return false; }
+    } catch (e) {
+      // swallow
+      return false;
+    }
   }
 
   // ---- Public API ----
   const TPCaller = {
-    install(opts){
+    install(opts={}){
       if (_installed) return; _installed = true;
-      CFG = Object.freeze({ ...DEF, ...(opts||{}) });
-      dlog('installed with CFG', CFG);
+      CFG = { .DEF, .(opts||{}) };
       attachStorageListenerOnce();
-      // Auto-process beacon if param exists
-      try { processFromUrl(); } catch(_){/* ignore */}
+      // Optional immediate processing of beacon tab
+      if (opts.beaconFromUrl !== false){
+        // If this tab was opened by Communicator with tp_caller, process it
+        processFromUrl();
+      }
     },
-    processFromUrl,
-    config(){ return { ...CFG }; },
-    version: VER,
-    installed: true
+    processFromUrl, // expose for manual triggering if needed
+    config(){ return { .CFG }; },
+    version: '1.0.0'
   };
 
-  try{ window.TPCaller = TPCaller; }catch(_){/* ignore */}
-
+  // Expose globally
+  try { window.TPCaller = Object.freeze(TPCaller); } catch(_) { /* ignore */ }
 })();
