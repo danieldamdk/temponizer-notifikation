@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.11.6
+// @version      7.11.7
 // @description  Pushover + OS/DOM toast (no dupes, på tværs af faner & når Chrome er minimeret). Pending-flush for bursts. “Intet Svar”-auto. Én SMS-aktiver/deaktiver-knap (iframe). Kompakt UI nederst-højre med ⚙️ inde i boksen.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -18,7 +18,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.11.6';
+const TP_VERSION = '7.11.7';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -59,9 +59,6 @@ function setLeader(obj) { localStorage.setItem(LEADER_KEY, JSON.stringify(obj));
 function isLeader() { const L = getLeader(); return !!(L && L.id === TAB_ID && L.until > now()); }
 function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.until || 0) <= t) { setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); } }
 function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
-window.addEventListener('storage', () => { /* noop */ });
-
-/*──────── 8) HTTP helpers ────────*/
 function gmGET(url) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
@@ -87,54 +84,58 @@ window.addEventListener('storage', e => {
   try {
     const ev = JSON.parse(e.newValue);
     const seenKey = 'tpToastSeen_' + ev.id;
-    if (localStorage.getItem(seenKey)) return;
-    localStorage.setItem(seenKey, '1');
-    // vis DOM toast i andre faner
-    showDOMToast(ev.msg);
+    if (sessionStorage.getItem(seenKey)) return;
+    sessionStorage.setItem(seenKey, '1');
+    showToast(ev.msg);
   } catch (_) {}
 });
 
-function showToastOnce(key, msg) {
-  const lk = 'tpToastLock_' + key;
-  const o  = JSON.parse(localStorage.getItem(lk) || '{"t":0}');
-  if (Date.now() - o.t < LOCK_MS) return;
-  localStorage.setItem(lk, JSON.stringify({ t: Date.now() }));
-  broadcastToast(key, msg);
-  showToast(msg);
-}
-
-// OS-notifikation tillades i ALLE faner
-function showToast(msg) {
-  if ('Notification' in window) {
-    if (Notification.permission === 'granted') {
-      try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
-      return;
-    } else if (Notification.permission !== 'denied') {
-      Notification.requestPermission().then(p => {
-        if (p === 'granted') {
-          try { new Notification('Temponizer', { body: msg }); } catch (_) { showDOMToast(msg); }
-        } else showDOMToast(msg);
-      }).catch(()=> showDOMToast(msg));
-      return;
+function showToast(msg, ms = 4500) {
+  try {
+    if ('Notification' in window) {
+      if (Notification.permission === 'granted') {
+        const n = new Notification('Temponizer', { body: msg });
+        setTimeout(() => n.close(), Math.min(ms, 6000));
+      }
     }
-  }
-  showDOMToast(msg);
-}
-function showDOMToast(msg) {
-  const el = document.createElement('div');
-  el.textContent = msg;
-  Object.assign(el.style, {
-    position: 'fixed', bottom: '12px', right: '12px',
-    background: '#333', color: '#fff', padding: '8px 10px',
-    borderRadius: '8px', fontSize: '12px', fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
-    boxShadow: '0 6px 18px rgba(0,0,0,.35)', zIndex: 2147483646,
-    opacity: 0, transition: 'opacity .22s, transform .22s', transform: 'translateY(8px)'
-  });
-  document.body.appendChild(el);
-  requestAnimationFrame(() => { el.style.opacity = 1; el.style.transform = 'translateY(0)'; });
-  setTimeout(() => { el.style.opacity = 0; el.style.transform = 'translateY(8px)'; setTimeout(() => el.remove(), 280); }, 4200);
+  } catch(_) {}
+
+  try {
+    let el = document.getElementById('tpToast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'tpToast';
+      el.style.cssText = [
+        'position:fixed','right:16px','bottom:16px','z-index:2147483646',
+        'background:#111','color:#fff','padding:10px 12px','border-radius:10px',
+        'box-shadow:0 10px 30px rgba(0,0,0,.35)','font-size:13px',
+        'font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
+        'max-width:360px','opacity:0','transition:opacity .25s'
+      ].join(';');
+      document.body.appendChild(el);
+      requestAnimationFrame(() => el.style.opacity = '1');
+    }
+    el.textContent = msg;
+    clearTimeout(el._t);
+    el._t = setTimeout(() => { if (el) { el.style.opacity = '0'; setTimeout(() => el.remove(), 250); } }, ms);
+  } catch(_) {}
 }
 
+const TOAST_LOCK_KEY_PREFIX = 'tpToastLock_';
+function takeToastLock(kind) {
+  try {
+    const key = TOAST_LOCK_KEY_PREFIX + kind;
+    const l = JSON.parse(localStorage.getItem(key) || '{"t":0}');
+    if (Date.now() - l.t < LOCK_MS) return false;
+    localStorage.setItem(key, JSON.stringify({ t: Date.now() }));
+    return true;
+  } catch(_) { return true; }
+}
+function showToastOnce(kind, msg) {
+  if (!takeToastLock(kind)) return;
+  showToast(msg);
+  broadcastToast(kind, msg);
+}
 
 /*──────── 3) PUSHOVER ────────*/
 function getUserKey() { try { return (GM_getValue('tpUserKey') || '').trim(); } catch (_) { return ''; } }
@@ -153,7 +154,6 @@ function sendPushover(msg) {
     }
   });
 }
-
 
 /*──────── 4) STATE + LOCK ────────*/
 const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
@@ -206,8 +206,17 @@ function maybeFlushPending(kind, pushEnableKey, stateKey, buildMsg) {
   return false;
 }
 
-
 /*──────── 5) POLLERS: BESKED ────────*/
+function setBadge(el, n) {
+  if (!el) return;
+  el.textContent = String(n);
+  el.style.opacity = n > 0 ? '1' : '.45';
+}
+function badgePulse(el){
+  if (!el) return;
+  el.animate([{ transform:'scale(1)'},{ transform:'scale(1.18)'},{ transform:'scale(1)'}], { duration: 420, easing: 'ease-out' });
+}
+
 function pollMessages() {
   // flush evt. pending
   maybeFlushPending('msg', 'tpPushEnableMsg', ST_MSG_KEY, (n)=>`🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`);
@@ -228,11 +237,9 @@ function pollMessages() {
           st.lastPush = Date.now();
           st.lastSent = n;
         } else {
-          // kø til flush
           st.pending = Math.max(st.pending||0, n);
         }
       } else if (n < st.count) {
-        // fald i count → tillad ny notifikation ved næste stigning
         st.lastPush = 0;
         st.lastSent = n;
         if (st.pending && n <= st.pending) st.pending = 0;
@@ -247,7 +254,6 @@ function pollMessages() {
     })
     .catch(e => console.warn('[TP][ERR][MSG]', e));
 }
-
 
 /*──────── 6) INTERESSE (HEAD→GET) ────────*/
 const HTML_URL = location.origin + '/index.php?page=freevagter';
@@ -264,7 +270,6 @@ function parseInterestHTML(html) {
   const c = boxes.reduce((s, el) => { const v = parseInt((el.textContent||'').replace(/\D+/g,''), 10); return s + (isNaN(v) ? 0 : v); }, 0);
   return c;
 }
-
 
 function buildInterestMsg(count) {
   return '👀 ' + count + ' vikar(er) har vist interesse for ledige vagter.';
@@ -330,8 +335,6 @@ function pollInterest() {
   .catch(e => console.warn('[TP][ERR][INT][HEAD]', e));
 }
 
-
-
 /*──────── 12) UI (panel + gear i boksen + SMS) ────────*/
 const POS_KEY = 'tpPanelPosV3';
 
@@ -358,13 +361,11 @@ function injectUI() {
     '<div style="display:flex; align-items:center; gap:6px; margin:2px 0 2px 0; white-space:nowrap;">' +
       '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableMsg"> <span>Besked</span>' +
       '<span id="tpMsgCountBadge" style="display:inline-block;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span></label>' +
-      '<a href="/index.php?page=messages" style="margin-left:auto;color:#06c;text-decoration:none;font-size:11px">Åbn</a>' +
     '</div>' +
 
     '<div style="display:flex; align-items:center; gap:6px; margin:2px 0 6px 0; white-space:nowrap;">' +
       '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableInt"> <span>Interesse</span>' +
       '<span id="tpIntCountBadge" style="display:inline-block;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span></label>' +
-      '<a href="/index.php?page=freevagter" style="margin-left:auto;color:#06c;text-decoration:none;font-size:11px">Åbn</a>' +
     '</div>' +
 
     '<div style="display:flex; align-items:center; gap:6px; margin:0 0 2px 0;">' +
@@ -436,7 +437,7 @@ function injectUI() {
         if (!m) { showToast('Kunne ikke læse remote version.'); return; }
         const remote = m[1];
         if (remote === TP_VERSION) showToast('Du kører allerede nyeste version ('+remote+').');
-        else { showToast('Ny version tilgængelig: '+remote+' (du kører '+TP_VERSION+'). Åbner…'); window.open(SCRIPT_RAW_URL, '_blank'); }
+        else { showToast('Ny version tilgængelig: '+remote+' (du kører '+TP_VERSION+'). Starter…'); window.open(SCRIPT_RAW_URL, '_blank'); }
       } catch(_) { showToast('Update-tjek fejlede.'); }
     });
 
@@ -564,40 +565,41 @@ function ensureFullyVisible(el, margin = 8) {
 }
 
 /* Badges */
-function setBadge(el, n) { if (el) el.textContent = String(Number(n||0)); }
 function badgePulse(el){
   if (!el) return;
   el.animate([{ transform:'scale(1)', offset:0 }, { transform:'scale(1.12)', offset:.35 }, { transform:'scale(1)', offset:1 }], { duration:320, easing:'ease-out' });
 }
 
+/*──────── 13) SMS ────────*/
+const SMS_SETTINGS_URL = location.origin + '/index.php?page=kontor_indstillinger&sub=kontor_sms';
+const SMS_IFRAME_ID = 'tpSMSFrameV2';
+const SMS_BTN_ID = 'tpSMSOneBtn';
+const SMS_STATUS_ID = 'tpSMSStatus';
 
-/*──────── 13) SMS (status + én knap toggle via iframe) ────────*/
-const SMS_SETTINGS_URL = `${location.origin}/index.php?page=showmy_settings`;
-function hasDisplayBlock(el) {
-  if (!el) return false;
-  const s = (el.getAttribute('style') || '').replace(/\s+/g,'').toLowerCase();
-  if (s.includes('display:none'))  return false;
-  if (s.includes('display:block')) return true;
-  return false;
-}
 function parseSmsStatusFromDoc(doc) {
-  const elAktiv   = doc.getElementById('sms_notifikation_aktiv');
-  const elInaktiv = doc.getElementById('sms_notifikation_ikke_aktiv');
-  const aktivShown   = hasDisplayBlock(elAktiv);
-  const inaktivShown = hasDisplayBlock(elInaktiv);
-  const hasDeactivateLink = !!(doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_aktiv a[href*="deactivate_cell_sms_notifikationer"]'));
-  const hasActivateLink   = !!(doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_ikke_aktiv a[href*="activate_cell_sms_notifikationer"]'));
-  let state = 'unknown', phone = '';
+  const aktivShown   = !!doc.querySelector('.sms_aktiv_container, .kontor_sms_aktiv_container');
+  const inaktivShown = !!doc.querySelector('.sms_inaktiv_container, .kontor_sms_inaktiv_container');
+  const hasActivateLink   = !!doc.querySelector('a[href*="aktiver_kontor_sms"]');
+  const hasDeactivateLink = !!doc.querySelector('a[href*="deaktiver_kontor_sms"]');
+
+  const elAktiv = doc.querySelector('.sms_aktiv_container, .kontor_sms_aktiv_container');
+  const elInaktiv = doc.querySelector('.sms_inaktiv_container, .kontor_sms_inaktiv_container');
+
+  let state = 'unknown';
   if (aktivShown || (!inaktivShown && hasDeactivateLink && !hasActivateLink)) state = 'active';
   else if (inaktivShown || (!aktivShown && hasActivateLink && !hasDeactivateLink)) state = 'inactive';
+
+  let phone = '';
   const refTxt = state === 'active' ? (elAktiv?.textContent || '') : (elInaktiv?.textContent || '');
   const m = refTxt.replace(/\u00A0/g,' ').match(/\+?\d[\d\s]{5,}/);
   if (m) phone = m[0].replace(/\s+/g,'');
+
   return { state, phone };
 }
 function parseSmsStatusFromHTML(html) { return parseSmsStatusFromDoc(new DOMParser().parseFromString(html, 'text/html')); }
 async function fetchSmsStatusHTML() { return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now()); }
 async function getSmsStatus() { try { return parseSmsStatusFromHTML(await fetchSmsStatusHTML()); } catch { return { state: 'unknown' }; } }
+
 function hardenSmsIframe(ifr){
   try {
     const w=ifr.contentWindow, d=ifr.contentDocument;
@@ -606,124 +608,116 @@ function hardenSmsIframe(ifr){
     d.addEventListener('click',ev=>{
       const a=ev.target.closest&&ev.target.closest('a');
       if(!a) return;
-      ev.preventDefault(); ev.stopPropagation(); return false;
-    },true);
+      if (/print|excel|download/i.test(a.href||'')) { ev.preventDefault(); ev.stopPropagation(); }
+    }, true);
   } catch(_){}
 }
-async function ensureSmsFrameLoaded() {
-  let ifr = document.getElementById('tpSmsFrame');
-  if (!ifr) {
-    ifr = document.createElement('iframe');
-    ifr.id = 'tpSmsFrame';
-    Object.assign(ifr.style, { position:'fixed', left:'-10000px', top:'-10000px', width:'1px', height:'1px', opacity:'0', pointerEvents:'none', border:'0' });
-    document.body.appendChild(ifr);
-  }
-  const loadOnce = () => new Promise(res => { ifr.onload = () => { hardenSmsIframe(ifr); res(); }; });
-  const wantUrl = SMS_SETTINGS_URL;
-  if (ifr.src !== wantUrl) { ifr.src = wantUrl; await loadOnce(); }
-  else if (!ifr.contentWindow || !ifr.contentDocument || !ifr.contentDocument.body) { ifr.src = wantUrl; await loadOnce(); }
-  else hardenSmsIframe(ifr);
+
+async function ensureSmsIframe(){
+  let ifr = document.getElementById(SMS_IFRAME_ID);
+  if (ifr) return ifr;
+
+  ifr = document.createElement('iframe');
+  ifr.id = SMS_IFRAME_ID;
+  ifr.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+  ifr.src = SMS_SETTINGS_URL + '&t=' + Date.now();
+  document.body.appendChild(ifr);
+
+  await new Promise(res => ifr.addEventListener('load', res, { once:true }));
+  hardenSmsIframe(ifr);
   return ifr;
 }
-function getIframeStatus(ifr) { try { return parseSmsStatusFromDoc(ifr.contentDocument); } catch { return { state:'unknown' }; } }
-function invokeIframeAction(ifr, wantOn) {
-  const win = ifr.contentWindow, doc = ifr.contentDocument;
-  try {
-    if (wantOn && typeof win.activate_cell_sms_notifikationer === 'function') { win.activate_cell_sms_notifikationer(); return true; }
-    if (!wantOn && typeof win.deactivate_cell_sms_notifikationer === 'function') { win.deactivate_cell_sms_notifikationer(); return true; }
-  } catch(_) {}
-  try {
-    const link = wantOn
-      ? (doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_ikke_aktiv a'))
-      : (doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_aktiv a'));
-    if (link) { link.click(); return true; }
-  } catch(_) {}
-  return false;
+
+async function smsClickLink(which){
+  const ifr = await ensureSmsIframe();
+  const doc = ifr.contentDocument;
+  if (!doc) throw new Error('No iframe doc');
+  const sel = which === 'activate' ? 'a[href*="aktiver_kontor_sms"]' : 'a[href*="deaktiver_kontor_sms"]';
+  const a = doc.querySelector(sel);
+  if (!a) throw new Error('Link not found: ' + which);
+  a.click();
+
+  // vent lidt + reload iframe for frisk status
+  await sleep(700);
+  ifr.src = SMS_SETTINGS_URL + '&t=' + Date.now();
+  await new Promise(res => ifr.addEventListener('load', res, { once:true }));
+  hardenSmsIframe(ifr);
 }
-async function toggleSmsInIframe(wantOn, timeoutMs=15000, pollMs=500) {
-  const ifr = await ensureSmsFrameLoaded();
-  let st0 = getIframeStatus(ifr);
-  if ((wantOn && st0.state === 'active') || (!wantOn && st0.state === 'inactive')) return st0;
-  const invoked = invokeIframeAction(ifr, wantOn);
-  if (!invoked) throw new Error('Kan ikke udløse aktivering/deaktivering i iframe.');
-  const maybeReloaded = new Promise(res => { let done=false; ifr.addEventListener('load', () => { if (!done){ done=true; res(); } }, { once:true }); setTimeout(() => { if (!done) res(); }, 1200); });
-  await maybeReloaded;
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
-    const st = getIframeStatus(ifr);
-    if (wantOn && st.state === 'active') return st;
-    if (!wantOn && st.state === 'inactive') return st;
-    await new Promise(r => setTimeout(r, pollMs));
+
+function renderSmsUI(status){
+  const el = document.getElementById(SMS_STATUS_ID);
+  const btn = document.getElementById(SMS_BTN_ID);
+  if (!el || !btn) return;
+
+  if (status.state === 'active') {
+    el.textContent = status.phone ? `SMS: Aktiv — ${status.phone}` : 'SMS: Aktiv';
+    btn.textContent = 'Deaktivér';
+  } else if (status.state === 'inactive') {
+    el.textContent = 'SMS: Inaktiv';
+    btn.textContent = 'Aktivér';
+  } else {
+    el.textContent = 'SMS: Ukendt';
+    btn.textContent = 'Aktivér';
   }
-  const reload = () => new Promise(res => { ifr.onload = () => res(); ifr.src = SMS_SETTINGS_URL + '&ts=' + Date.now(); });
-  await reload();
-  return getIframeStatus(ifr);
 }
-const sms = {
-  _busy: false,
-  _last: null,
-  async refresh(cb) { const st = await getSmsStatus(); this._last = st; cb && cb(st); },
-  async setEnabled(wantOn, uiBusy, cb) {
-    if (this._busy) return;
-    this._busy = true;
-    uiBusy && uiBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
-    try {
-      const st = await toggleSmsInIframe(wantOn, 15000, 500);
-      this._last = st; cb && cb(st);
-    } catch (e) {
-      console.warn('[TP][SMS] setEnabled error', e);
-      const st = await getSmsStatus(); this._last = st; cb && cb(st);
-    } finally {
-      this._busy = false; uiBusy && uiBusy(false);
-    }
-  }
-};
-function initSMSControls(root){
-  const lbl   = root.querySelector('#tpSMSStatus');
-  const btn   = root.querySelector('#tpSMSOneBtn');
-  function setBusy(on, text){ btn.disabled = on; btn.style.opacity = on ? .6 : 1; if (on && text) lbl.textContent = text; }
-  function paint(st){
-    switch (st.state) {
-      case 'active':   btn.textContent = 'Deaktiver'; lbl.textContent = 'SMS: Aktiv'   + (st.phone ? ' — ' + st.phone : ''); lbl.style.color='#0a7a35'; break;
-      case 'inactive': btn.textContent = 'Aktivér';   lbl.textContent = 'SMS: Ikke aktiv' + (st.phone ? ' — ' + st.phone : ''); lbl.style.color='#a33'; break;
-      default:         btn.textContent = 'Aktivér';   lbl.textContent = 'SMS: Ukendt'; lbl.style.color='#666';
-    }
-  }
+
+async function refreshSmsStatus(){
+  const status = await getSmsStatus();
+  renderSmsUI(status);
+  return status;
+}
+
+function initSMSControls(panel){
+  // bind click
+  const btn = panel.querySelector('#'+SMS_BTN_ID);
+  if (!btn || btn._bound) return;
+  btn._bound = true;
+
   btn.addEventListener('click', async () => {
-    const wantOn = (sms._last?.state !== 'active');
-    setBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
-    await sms.setEnabled(wantOn, setBusy, paint);
+    btn.disabled = true;
+    try {
+      const st = await getSmsStatus();
+      if (st.state === 'active') {
+        showToast('Deaktiverer SMS…');
+        await smsClickLink('deactivate');
+        await refreshSmsStatus();
+        showToast('SMS deaktiveret.');
+      } else {
+        showToast('Aktiverer SMS…');
+        await smsClickLink('activate');
+        await refreshSmsStatus();
+        showToast('SMS aktiveret.');
+      }
+    } catch(e) {
+      console.warn('[TP][SMS]', e);
+      showToast('SMS-handling fejlede. Prøv igen.');
+    } finally {
+      btn.disabled = false;
+    }
   });
-  (async()=>{ setBusy(true,'indlæser…'); await sms.refresh(paint); setBusy(false); })();
+
+  // initial load
+  refreshSmsStatus().catch(()=>{});
 }
 
-
+/* Test-knap */
 function tpTestPushoverBoth(){
   const userKey = getUserKey();
   if (!userKey) { showToast('Indsæt din USER-token i ⚙️-menuen før test.'); return; }
   const ts = new Date().toLocaleTimeString();
   sendPushover('🧪 [TEST] Besked-kanal OK — ' + ts);
   setTimeout(() => sendPushover('🧪 [TEST] Interesse-kanal OK — ' + ts), 800);
-  showToast('Sendte Pushover-test (Besked + Interesse). Tjek Pushover.');
+  showToast('Sendte Pushover-test. Tjek Pushover.');
 }
 
-
 /*──────── 14) STARTUP ────────*/
-document.addEventListener('click', e => {
-  const a = e.target.closest && e.target.closest('a');
-  if (a && /Beskeder/.test(a.textContent || '')) {
-    const stMsg = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
-    stMsg.lastPush = stMsg.lastSent = 0; stMsg.pending = 0; saveJson(ST_MSG_KEY, stMsg);
-  }
-});
+// UI
+injectUI();
 
 // Leader liv, men ikke afgørende længere
 tryBecomeLeader();
 setInterval(heartbeatIfLeader, HEARTBEAT_MS);
 setInterval(tryBecomeLeader, HEARTBEAT_MS + 1200);
-
-// UI
-injectUI();
 
 // Pollers kører i ALLE faner (dup-beskyttet via lock/pending/once)
 function doPoll() { pollMessages(); pollInterest(); }
@@ -731,60 +725,41 @@ doPoll();
 setInterval(doPoll, POLL_MS);
 
 // Ekstra: poll lige når man vender tilbage til tab (hurtig catch-up)
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') doPoll(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) doPoll(); });
 
-console.info('[TP] kører version', TP_VERSION);
+/*──────── 15) HOVER / “Intet Svar” auto (beholdt) ────────*/
+(function(){
+  let auto = false;
+  const OBS = new MutationObserver(() => {
+    if (auto) return;
+    const hsWrap = document.querySelector('#highslide-wrapper-0');
+    if (!hsWrap) return;
 
+    const btn = hsWrap.querySelector('input[type="button"][value*="Intet"]');
+    if (!btn) return;
 
-/*──────── 15) HOVER “Intet Svar” (auto-gem uden popup) ────────*/
-(function () {
-  var auto = false, icon = null, menu = null, hideT = null;
-  function mkMenu() {
-    if (menu) return menu;
-    menu = document.createElement('div');
-    Object.assign(menu.style, { position: 'fixed', zIndex: 2147483647, background: '#fff', border: '1px solid #ccc', borderRadius: '6px', boxShadow: '0 10px 28px rgba(0,0,0,.2)', fontSize: '12px', fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif' });
-    var btn = document.createElement('div');
-    btn.textContent = 'Registrér “Intet Svar”';
-    btn.style.cssText = 'padding:8px 12px;white-space:nowrap;cursor:default';
-    btn.onmouseenter = function () { btn.style.background = '#f0f0f0'; };
-    btn.onmouseleave = function () { btn.style.background = ''; };
-    btn.onclick = function () { auto = true; if (icon) icon.click(); hide(); };
-    menu.appendChild(btn); document.body.appendChild(menu); return menu;
-  }
-  function show(el) { icon = el; var r = el.getBoundingClientRect(); var m = mkMenu(); m.style.left = r.left + 'px'; m.style.top = r.bottom + 4 + 'px'; m.style.display = 'block'; }
-  function hide() { clearTimeout(hideT); hideT = setTimeout(function () { if (menu) menu.style.display = 'none'; icon = null; }, 120); }
-  function findIcon(n) { while (n && n !== document) { if (n.getAttribute && /Registrer opkald til vikar/i.test((n.getAttribute('title') || n.getAttribute('aria-label') || ''))) return n; n = n.parentNode; } return null; }
+    auto = true;
+    try {
+      hsWrap.style.transition = 'opacity .15s, transform .15s';
+      hsWrap.style.opacity = '0.35';
+      hsWrap.style.pointerEvents = 'none';
+      hsWrap.style.transform = 'scale(.99)';
+    } catch(_) {}
 
-  document.addEventListener('mouseover', function (e) { var ic = findIcon(e.target); if (ic) show(ic); }, true);
-  document.addEventListener('mousemove', function (e) {
-    if (!menu || menu.style.display !== 'block') return;
-    var overM = menu.contains(e.target);
-    var overI = icon && (icon === e.target || icon.contains(e.target) || e.target.contains(icon));
-    if (!overM && !overI) hide();
-  }, true);
-
-  new MutationObserver(function (ml) {
-    if (!auto) return;
-    ml.forEach(function (m) {
-      m.addedNodes.forEach(function (n) {
-        if (!(n instanceof HTMLElement)) return;
-        const hsWrap = n.closest && n.closest('.highslide-body, .highslide-container');
-        if (hsWrap) { hsWrap.style.opacity = '0'; hsWrap.style.pointerEvents = 'none'; hsWrap.style.transform = 'scale(.98)'; }
-        var ta = (n.matches && n.matches('textarea[name="phonetext"]')) ? n : (n.querySelector && n.querySelector('textarea[name="phonetext"]'));
-        if (ta) {
-          if (!ta.value.trim()) ta.value = 'Intet Svar';
-          var frm = ta.closest('form');
-          var saveBtn = frm && Array.prototype.find.call(frm.querySelectorAll('input[type="button"],button'), function (b) { return /Gem registrering/i.test((b.value || b.textContent || '').trim()); });
-          if (saveBtn) {
-            setTimeout(function () {
-              try { saveBtn.click(); } catch (_) {}
-              try { if ((unsafeWindow && unsafeWindow.hs && unsafeWindow.hs.close)) unsafeWindow.hs.close(); } catch (_) {}
-              if (hsWrap) { setTimeout(()=>{ hsWrap.style.opacity = ''; hsWrap.style.pointerEvents = ''; hsWrap.style.transform=''; }, 120); }
-            }, 30);
-          }
-          auto = false;
+    setTimeout(() => {
+      try { btn.click(); } catch (_) {}
+      setTimeout(() => {
+        const saveBtn = hsWrap.querySelector('input[type="submit"], button[type="submit"], input[value*="Gem"]');
+        if (saveBtn) {
+          setTimeout(function () {
+            try { saveBtn.click(); } catch (_) {}
+            try { if ((unsafeWindow && unsafeWindow.hs && unsafeWindow.hs.close)) unsafeWindow.hs.close(); } catch (_) {}
+            if (hsWrap) { setTimeout(()=>{ hsWrap.style.opacity = ''; hsWrap.style.pointerEvents = ''; hsWrap.style.transform=''; }, 120); }
+          }, 30);
         }
-      });
-    });
-  }).observe(document.body, { childList: true, subtree: true });
+        auto = false;
+      }, 120);
+    }, 30);
+  });
+  OBS.observe(document.body, { childList: true, subtree: true });
 })();
