@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.11.7
+// @version      7.11.8
 // @description  Pushover + OS/DOM toast (no dupes, på tværs af faner & når Chrome er minimeret). Pending-flush for bursts. “Intet Svar”-auto. Én SMS-aktiver/deaktiver-knap (iframe). Kompakt UI nederst-højre med ⚙️ inde i boksen.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -18,7 +18,7 @@
 // ==/UserScript==
 
 /*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.11.7';
+const TP_VERSION = '7.11.8';
 
 /*──────── 1) KONFIG ────────*/
 const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -51,7 +51,6 @@ const SCRIPT_RAW_URL = `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}
 
 /*──────── helpers ────────*/
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-
 
 function now() { return Date.now(); }
 function getLeader() { try { return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null'); } catch (_) { return null; } }
@@ -359,13 +358,13 @@ function injectUI() {
     '</div>' +
 
     '<div style="display:flex; align-items:center; gap:6px; margin:2px 0 2px 0; white-space:nowrap;">' +
-      '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableMsg"> <span>Besked</span>' +
-      '<span id="tpMsgCountBadge" style="display:inline-block;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span></label>' +
+      '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableMsg"> <span>Besked</span></label>' +
+      '<span id="tpMsgCountBadge" style="display:flex;align-items:center;justify-content:center;margin-left:auto;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span>' +
     '</div>' +
 
     '<div style="display:flex; align-items:center; gap:6px; margin:2px 0 6px 0; white-space:nowrap;">' +
-      '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableInt"> <span>Interesse</span>' +
-      '<span id="tpIntCountBadge" style="display:inline-block;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span></label>' +
+      '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableInt"> <span>Interesse</span></label>' +
+      '<span id="tpIntCountBadge" style="display:flex;align-items:center;justify-content:center;margin-left:auto;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span>' +
     '</div>' +
 
     '<div style="display:flex; align-items:center; gap:6px; margin:0 0 2px 0;">' +
@@ -570,36 +569,33 @@ function badgePulse(el){
   el.animate([{ transform:'scale(1)', offset:0 }, { transform:'scale(1.12)', offset:.35 }, { transform:'scale(1)', offset:1 }], { duration:320, easing:'ease-out' });
 }
 
-/*──────── 13) SMS ────────*/
-const SMS_SETTINGS_URL = location.origin + '/index.php?page=kontor_indstillinger&sub=kontor_sms';
-const SMS_IFRAME_ID = 'tpSMSFrameV2';
-const SMS_BTN_ID = 'tpSMSOneBtn';
-const SMS_STATUS_ID = 'tpSMSStatus';
-
+/*──────── 13) SMS (status + én knap toggle via iframe) ────────*/
+const SMS_SETTINGS_URL = `${location.origin}/index.php?page=showmy_settings`;
+function hasDisplayBlock(el) {
+  if (!el) return false;
+  const s = (el.getAttribute('style') || '').replace(/\s+/g,'').toLowerCase();
+  if (s.includes('display:none'))  return false;
+  if (s.includes('display:block')) return true;
+  return false;
+}
 function parseSmsStatusFromDoc(doc) {
-  const aktivShown   = !!doc.querySelector('.sms_aktiv_container, .kontor_sms_aktiv_container');
-  const inaktivShown = !!doc.querySelector('.sms_inaktiv_container, .kontor_sms_inaktiv_container');
-  const hasActivateLink   = !!doc.querySelector('a[href*="aktiver_kontor_sms"]');
-  const hasDeactivateLink = !!doc.querySelector('a[href*="deaktiver_kontor_sms"]');
-
-  const elAktiv = doc.querySelector('.sms_aktiv_container, .kontor_sms_aktiv_container');
-  const elInaktiv = doc.querySelector('.sms_inaktiv_container, .kontor_sms_inaktiv_container');
-
-  let state = 'unknown';
+  const elAktiv   = doc.getElementById('sms_notifikation_aktiv');
+  const elInaktiv = doc.getElementById('sms_notifikation_ikke_aktiv');
+  const aktivShown   = hasDisplayBlock(elAktiv);
+  const inaktivShown = hasDisplayBlock(elInaktiv);
+  const hasDeactivateLink = !!(doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_aktiv a[href*="deactivate_cell_sms_notifikationer"]'));
+  const hasActivateLink   = !!(doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_ikke_aktiv a[href*="activate_cell_sms_notifikationer"]'));
+  let state = 'unknown', phone = '';
   if (aktivShown || (!inaktivShown && hasDeactivateLink && !hasActivateLink)) state = 'active';
   else if (inaktivShown || (!aktivShown && hasActivateLink && !hasDeactivateLink)) state = 'inactive';
-
-  let phone = '';
   const refTxt = state === 'active' ? (elAktiv?.textContent || '') : (elInaktiv?.textContent || '');
   const m = refTxt.replace(/\u00A0/g,' ').match(/\+?\d[\d\s]{5,}/);
   if (m) phone = m[0].replace(/\s+/g,'');
-
   return { state, phone };
 }
 function parseSmsStatusFromHTML(html) { return parseSmsStatusFromDoc(new DOMParser().parseFromString(html, 'text/html')); }
 async function fetchSmsStatusHTML() { return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now()); }
 async function getSmsStatus() { try { return parseSmsStatusFromHTML(await fetchSmsStatusHTML()); } catch { return { state: 'unknown' }; } }
-
 function hardenSmsIframe(ifr){
   try {
     const w=ifr.contentWindow, d=ifr.contentDocument;
@@ -608,97 +604,97 @@ function hardenSmsIframe(ifr){
     d.addEventListener('click',ev=>{
       const a=ev.target.closest&&ev.target.closest('a');
       if(!a) return;
-      if (/print|excel|download/i.test(a.href||'')) { ev.preventDefault(); ev.stopPropagation(); }
-    }, true);
+      ev.preventDefault(); ev.stopPropagation(); return false;
+    },true);
   } catch(_){}
 }
-
-async function ensureSmsIframe(){
-  let ifr = document.getElementById(SMS_IFRAME_ID);
-  if (ifr) return ifr;
-
-  ifr = document.createElement('iframe');
-  ifr.id = SMS_IFRAME_ID;
-  ifr.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
-  ifr.src = SMS_SETTINGS_URL + '&t=' + Date.now();
-  document.body.appendChild(ifr);
-
-  await new Promise(res => ifr.addEventListener('load', res, { once:true }));
-  hardenSmsIframe(ifr);
+async function ensureSmsFrameLoaded() {
+  let ifr = document.getElementById('tpSmsFrame');
+  if (!ifr) {
+    ifr = document.createElement('iframe');
+    ifr.id = 'tpSmsFrame';
+    Object.assign(ifr.style, { position:'fixed', left:'-10000px', top:'-10000px', width:'1px', height:'1px', opacity:'0', pointerEvents:'none', border:'0' });
+    document.body.appendChild(ifr);
+  }
+  const loadOnce = () => new Promise(res => { ifr.onload = () => { hardenSmsIframe(ifr); res(); }; });
+  const wantUrl = SMS_SETTINGS_URL;
+  if (ifr.src !== wantUrl) { ifr.src = wantUrl; await loadOnce(); }
+  else if (!ifr.contentWindow || !ifr.contentDocument || !ifr.contentDocument.body) { ifr.src = wantUrl; await loadOnce(); }
+  else hardenSmsIframe(ifr);
   return ifr;
 }
-
-async function smsClickLink(which){
-  const ifr = await ensureSmsIframe();
-  const doc = ifr.contentDocument;
-  if (!doc) throw new Error('No iframe doc');
-  const sel = which === 'activate' ? 'a[href*="aktiver_kontor_sms"]' : 'a[href*="deaktiver_kontor_sms"]';
-  const a = doc.querySelector(sel);
-  if (!a) throw new Error('Link not found: ' + which);
-  a.click();
-
-  // vent lidt + reload iframe for frisk status
-  await sleep(700);
-  ifr.src = SMS_SETTINGS_URL + '&t=' + Date.now();
-  await new Promise(res => ifr.addEventListener('load', res, { once:true }));
-  hardenSmsIframe(ifr);
+function getIframeStatus(ifr) { try { return parseSmsStatusFromDoc(ifr.contentDocument); } catch { return { state:'unknown' }; } }
+function invokeIframeAction(ifr, wantOn) {
+  const win = ifr.contentWindow, doc = ifr.contentDocument;
+  try {
+    if (wantOn && typeof win.activate_cell_sms_notifikationer === 'function') { win.activate_cell_sms_notifikationer(); return true; }
+    if (!wantOn && typeof win.deactivate_cell_sms_notifikationer === 'function') { win.deactivate_cell_sms_notifikationer(); return true; }
+  } catch(_) {}
+  try {
+    const link = wantOn
+      ? (doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_ikke_aktiv a'))
+      : (doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_aktiv a'));
+    if (link) { link.click(); return true; }
+  } catch(_) {}
+  return false;
 }
-
-function renderSmsUI(status){
-  const el = document.getElementById(SMS_STATUS_ID);
-  const btn = document.getElementById(SMS_BTN_ID);
-  if (!el || !btn) return;
-
-  if (status.state === 'active') {
-    el.textContent = status.phone ? `SMS: Aktiv — ${status.phone}` : 'SMS: Aktiv';
-    btn.textContent = 'Deaktivér';
-  } else if (status.state === 'inactive') {
-    el.textContent = 'SMS: Inaktiv';
-    btn.textContent = 'Aktivér';
-  } else {
-    el.textContent = 'SMS: Ukendt';
-    btn.textContent = 'Aktivér';
+async function toggleSmsInIframe(wantOn, timeoutMs=15000, pollMs=500) {
+  const ifr = await ensureSmsFrameLoaded();
+  let st0 = getIframeStatus(ifr);
+  if ((wantOn && st0.state === 'active') || (!wantOn && st0.state === 'inactive')) return st0;
+  const invoked = invokeIframeAction(ifr, wantOn);
+  if (!invoked) throw new Error('Kan ikke udløse aktivering/deaktivering i iframe.');
+  const maybeReloaded = new Promise(res => { let done=false; ifr.addEventListener('load', () => { if (!done){ done=true; res(); } }, { once:true }); setTimeout(() => { if (!done) res(); }, 1200); });
+  await maybeReloaded;
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const st = getIframeStatus(ifr);
+    if (wantOn && st.state === 'active') return st;
+    if (!wantOn && st.state === 'inactive') return st;
+    await new Promise(r => setTimeout(r, pollMs));
   }
+  const reload = () => new Promise(res => { ifr.onload = () => res(); ifr.src = SMS_SETTINGS_URL + '&ts=' + Date.now(); });
+  await reload();
+  return getIframeStatus(ifr);
 }
-
-async function refreshSmsStatus(){
-  const status = await getSmsStatus();
-  renderSmsUI(status);
-  return status;
-}
-
-function initSMSControls(panel){
-  // bind click
-  const btn = panel.querySelector('#'+SMS_BTN_ID);
-  if (!btn || btn._bound) return;
-  btn._bound = true;
-
-  btn.addEventListener('click', async () => {
-    btn.disabled = true;
+const sms = {
+  _busy: false,
+  _last: null,
+  async refresh(cb) { const st = await getSmsStatus(); this._last = st; cb && cb(st); },
+  async setEnabled(wantOn, uiBusy, cb) {
+    if (this._busy) return;
+    this._busy = true;
+    uiBusy && uiBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
     try {
-      const st = await getSmsStatus();
-      if (st.state === 'active') {
-        showToast('Deaktiverer SMS…');
-        await smsClickLink('deactivate');
-        await refreshSmsStatus();
-        showToast('SMS deaktiveret.');
-      } else {
-        showToast('Aktiverer SMS…');
-        await smsClickLink('activate');
-        await refreshSmsStatus();
-        showToast('SMS aktiveret.');
-      }
-    } catch(e) {
-      console.warn('[TP][SMS]', e);
-      showToast('SMS-handling fejlede. Prøv igen.');
+      const st = await toggleSmsInIframe(wantOn, 15000, 500);
+      this._last = st; cb && cb(st);
+    } catch (e) {
+      console.warn('[TP][SMS] setEnabled error', e);
+      const st = await getSmsStatus(); this._last = st; cb && cb(st);
     } finally {
-      btn.disabled = false;
+      this._busy = false; uiBusy && uiBusy(false);
     }
+  }
+};
+function initSMSControls(root){
+  const lbl   = root.querySelector('#tpSMSStatus');
+  const btn   = root.querySelector('#tpSMSOneBtn');
+  function setBusy(on, text){ btn.disabled = on; btn.style.opacity = on ? .6 : 1; if (on && text) lbl.textContent = text; }
+  function paint(st){
+    switch (st.state) {
+      case 'active':   btn.textContent = 'Deaktiver'; lbl.textContent = 'SMS: Aktiv'   + (st.phone ? ' — ' + st.phone : ''); lbl.style.color='#0a7a35'; break;
+      case 'inactive': btn.textContent = 'Aktivér';   lbl.textContent = 'SMS: Ikke aktiv' + (st.phone ? ' — ' + st.phone : ''); lbl.style.color='#a33'; break;
+      default:         btn.textContent = 'Aktivér';   lbl.textContent = 'SMS: Ukendt'; lbl.style.color='#666';
+    }
+  }
+  btn.addEventListener('click', async () => {
+    const wantOn = (sms._last?.state !== 'active');
+    setBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
+    await sms.setEnabled(wantOn, setBusy, paint);
   });
-
-  // initial load
-  refreshSmsStatus().catch(()=>{});
+  (async()=>{ setBusy(true,'indlæser…'); await sms.refresh(paint); setBusy(false); })();
 }
+
 
 /* Test-knap */
 function tpTestPushoverBoth(){
