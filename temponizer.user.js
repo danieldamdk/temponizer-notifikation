@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Temponizer → Pushover + Toast + Quick "Intet Svar" (AjourCare)
+// @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.11.8
-// @description  Pushover + OS/DOM toast (no dupes, på tværs af faner & når Chrome er minimeret). Pending-flush for bursts. “Intet Svar”-auto. Én SMS-aktiver/deaktiver-knap (iframe). Kompakt UI nederst-højre med ⚙️ inde i boksen.
+// @version      7.13.2
+// @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status, SMS-toggle og Quick "Intet Svar".
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -11,751 +11,2219 @@
 // @connect      api.pushover.net
 // @connect      raw.githubusercontent.com
 // @connect      ajourcare.temponizer.dk
+// @connect      vipvikaraps.sharepoint.com
 // @run-at       document-idle
 // @noframes
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // @downloadURL  https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
 // ==/UserScript==
 
-/*──────── 0) VERSION ────────*/
-const TP_VERSION = '7.11.8';
+(() => {
+  'use strict';
 
-/*──────── 1) KONFIG ────────*/
-const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
-const POLL_MS     = 15000;
-const SUPPRESS_MS = 45000; // “cooldown” for at undgå spam
-const LOCK_MS     = SUPPRESS_MS + 5000; // toast-lås
+  const TP_VERSION = '7.13.2';
+  const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
-// (Leader bevares til evt. fremtid, men pollers kører nu i ALLE faner)
-const LEADER_KEY = 'tpLeaderV1';
-const HEARTBEAT_MS = 5000;
-const LEASE_MS     = 15000;
-const TAB_ID = (crypto && crypto.randomUUID ? crypto.randomUUID() : ('tab-' + Math.random().toString(36).slice(2) + Date.now()));
+  const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
+  const MESSAGE_POLL_MS = 15000;
+  const INTEREST_POLL_MS = 30000;
+  const SUPPRESS_MS = 45000;
+  const LOCK_MS = SUPPRESS_MS + 5000;
+  const FETCH_TIMEOUT_MS = 12000;
+  const INTEREST_DETAIL_CONCURRENCY = 4;
+  const MESSAGE_SEEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  const MESSAGE_SEEN_LIMIT = 512;
 
-// Script RAW for update-kontrol
-const GH_OWNER  = 'danieldamdk';
-const GH_REPO   = 'temponizer-notifikation';
-const GH_BRANCH = 'main';
-const SCRIPT_RAW_URL = `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_BRANCH}/temponizer.user.js`;
+  const LEADER_KEY = 'tpLeaderV3';
+  const HEARTBEAT_MS = 5000;
+  const LEASE_MS = 75000;
+  const MUTEX_LEASE_MS = 15000;
+  const MUTEX_WAIT_MS = 5000;
+  const TAB_ID = globalThis.crypto?.randomUUID?.() || ('tab-' + Math.random().toString(36).slice(2) + Date.now());
 
-/*──────── 1a) MIGRATION ────────*/
-(function migrateUserKeyToGM(){
-  try {
-    const gm = (GM_getValue('tpUserKey') || '').trim();
-    if (!gm) {
-      const ls = (localStorage.getItem('tpUserKey') || '').trim();
-      if (ls) { GM_setValue('tpUserKey', ls); localStorage.removeItem('tpUserKey'); }
-    }
-  } catch(_) {}
-})();
+  const GH_OWNER = 'danieldamdk';
+  const GH_REPO = 'temponizer-notifikation';
+  const GH_BRANCH = 'main';
+  const SCRIPT_RAW_URL = `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_BRANCH}/temponizer.user.js`;
 
-/*──────── helpers ────────*/
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+  const TP_MAIL_PUSH = {
+    key: 'tpPushEnableMail',
+    spSite: 'https://vipvikaraps.sharepoint.com/sites/Vikarkonsulenter',
+    listTitle: 'TemponizerSettings',
+    itemTitle: 'PushoverMail',
+    pollMs: 30000
+  };
 
-function now() { return Date.now(); }
-function getLeader() { try { return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null'); } catch (_) { return null; } }
-function setLeader(obj) { localStorage.setItem(LEADER_KEY, JSON.stringify(obj)); }
-function isLeader() { const L = getLeader(); return !!(L && L.id === TAB_ID && L.until > now()); }
-function tryBecomeLeader() { const L = getLeader(), t = now(); if (!L || (L.until || 0) <= t) { setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); } }
-function heartbeatIfLeader() { if (!isLeader()) return; const t = now(); setLeader({ id:TAB_ID, until:t+LEASE_MS, ts:t }); }
-function gmGET(url) {
-  return new Promise((resolve, reject) => {
-    GM_xmlhttpRequest({
-      method: 'GET',
-      url,
-      headers: { 'Accept': '*/*', 'Referer': location.href, 'Cache-Control':'no-cache','Pragma':'no-cache' },
-      onload: r => (r.status>=200 && r.status<300) ? resolve(r.responseText) : reject(new Error('HTTP '+r.status)),
-      onerror: e => reject(e)
-    });
+  const ORIGIN = globalThis.location?.origin || 'https://ajourcare.temponizer.dk';
+  const MSG_COUNTER_URL = ORIGIN + '/index.php?page=get_comcenter_counters&ajax=true';
+  const MSG_LIST_BASE = ORIGIN + '/index.php?page=get_comcenter_contents&ajax=true&vagt_avail_id=0&vikar_id=0&kontor_id=0&hidemsg=false&comcentertype=';
+  const MSG_LIST_URLS = Object.freeze({
+    vagt: MSG_LIST_BASE + 'vagt',
+    generel: MSG_LIST_BASE + 'gen'
   });
-}
+  const INTEREST_URL = ORIGIN + '/index.php?page=freevagter';
+  const INTEREST_DETAIL_URL = ORIGIN + '/index.php?page=update_vikar_synlighed_from_list&ajax=true';
+  const SMS_SETTINGS_URL = ORIGIN + '/index.php?page=showmy_settings';
 
-/*──────── 2) TOASTS (OS + DOM) + cross-tab broadcast ────────*/
-const TOAST_EVT_KEY = 'tpToastEventV1';
-function broadcastToast(type, msg) {
-  try {
-    const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, type, msg, ts: Date.now() };
-    localStorage.setItem(TOAST_EVT_KEY, JSON.stringify(ev));
-  } catch (_) {}
-}
-window.addEventListener('storage', e => {
-  if (e.key !== TOAST_EVT_KEY || !e.newValue) return;
-  try {
-    const ev = JSON.parse(e.newValue);
-    const seenKey = 'tpToastSeen_' + ev.id;
-    if (sessionStorage.getItem(seenKey)) return;
-    sessionStorage.setItem(seenKey, '1');
-    showToast(ev.msg);
-  } catch (_) {}
-});
+  const ST_MSG_KEY = 'tpMessageStateV5';
+  const ST_INT_KEY = 'tpInterestStateV3';
+  const POS_KEY = 'tpPanelPosV4';
+  const TOAST_EVT_KEY = 'tpToastEventV2';
 
-function showToast(msg, ms = 4500) {
-  try {
-    if ('Notification' in window) {
-      if (Notification.permission === 'granted') {
-        const n = new Notification('Temponizer', { body: msg });
-        setTimeout(() => n.close(), Math.min(ms, 6000));
+  let messagePollInFlight = false;
+  let interestPollInFlight = false;
+  let tpMailPushBusy = false;
+  let tpMailRefreshInFlight = false;
+  let tpMailRefreshGeneration = 0;
+  let tpMailPushTimer = null;
+  let tpSpDigestCache = { value: '', expires: 0 };
+  let tpSpEntityTypeCache = '';
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function now() {
+    return Date.now();
+  }
+
+  function normalizeText(value) {
+    return String(value ?? '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[\t\r\n ]+/g, ' ')
+      .trim();
+  }
+
+  function truncateText(value, maxLength) {
+    const text = normalizeText(value);
+    if (text.length <= maxLength) return text;
+    if (maxLength <= 1) return text.slice(0, maxLength);
+    return text.slice(0, maxLength - 1).trimEnd() + '…';
+  }
+
+  function clampInteger(value, fallback = 0) {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+  }
+
+  function parseNullableCount(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'string' && value.trim() === '') return null;
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+  }
+
+  function parseMessageCounters(payload) {
+    const data = payload && typeof payload === 'object' ? payload : {};
+    return {
+      vagt: parseNullableCount(data.vagt_unread),
+      generel: parseNullableCount(data.generel_unread),
+      brugere: parseNullableCount(data.brugere_unread)
+    };
+  }
+
+  function compareVersions(left, right) {
+    const a = String(left || '').split('.').map(part => parseInt(part, 10) || 0);
+    const b = String(right || '').split('.').map(part => parseInt(part, 10) || 0);
+    const length = Math.max(a.length, b.length);
+    for (let i = 0; i < length; i += 1) {
+      const diff = (a[i] || 0) - (b[i] || 0);
+      if (diff !== 0) return diff > 0 ? 1 : -1;
+    }
+    return 0;
+  }
+
+  function parseHtml(html) {
+    return new DOMParser().parseFromString(String(html || ''), 'text/html');
+  }
+
+  function getFirstText(root, selectors) {
+    for (const selector of selectors) {
+      const element = root.querySelector(selector);
+      if (!element) continue;
+      const titled = normalizeText(element.getAttribute('title'));
+      if (titled) return titled;
+      const clone = element.cloneNode(true);
+      clone.querySelectorAll('br').forEach(br => br.replaceWith(' '));
+      const text = normalizeText(clone.textContent);
+      if (text) return text;
+    }
+    return '';
+  }
+
+  function readUnreadValue(row) {
+    const input = row.querySelector('input[id*="unread_count"], input[name*="unread_count"]');
+    if (input) return clampInteger(input.value, 0);
+    const count = getFirstText(row, ['[id^="new_count_"]', '[class*="unread"]']);
+    const match = count.match(/\d+/);
+    return match ? clampInteger(match[0], 0) : 0;
+  }
+
+  function parseMessageRowIdentity(row, typeHint) {
+    const source = [
+      row.id || '',
+      row.getAttribute('onclick') || '',
+      row.querySelector('[onclick]')?.getAttribute('onclick') || ''
+    ].join(' ');
+
+    const vagtMatch = source.match(/(?:vikarsms_|MultiList\([^,]*,\s*)(\d+)[_,)](\d+)/i)
+      || source.match(/(?:vikarsms_|vagt_unread_count_)(\d+)_(\d+)/i);
+    if (vagtMatch) {
+      return { type: 'vagt', vikarId: vagtMatch[1], vagtId: vagtMatch[2] };
+    }
+
+    const generalMatch = source.match(/(?:generelsms_|GenerelSMSConversationFromMultiList\([^,]*,?\s*)(\d+)/i)
+      || row.querySelector('input[id*="unread_count"]')?.id.match(/unread_count_(\d+)/i);
+    if (generalMatch) {
+      return { type: 'generel', vikarId: generalMatch[1], vagtId: '' };
+    }
+
+    return typeHint === 'generel' ? null : null;
+  }
+
+  function parseMessageIndexHTML(html, typeHint = 'vagt') {
+    const doc = parseHtml(html);
+    const candidates = Array.from(doc.querySelectorAll(
+      '.vikarsms, .generelsms, [id^="vikarsms_"], [id^="generelsms_"], [onclick*="SMSConversationFromMultiList"]'
+    ));
+    const seenNodes = new Set();
+    const records = [];
+
+    for (const candidate of candidates) {
+      const row = candidate.closest('.vikarsms, .generelsms, [id^="vikarsms_"], [id^="generelsms_"]') || candidate;
+      if (seenNodes.has(row)) continue;
+      seenNodes.add(row);
+
+      const identity = parseMessageRowIdentity(row, typeHint);
+      if (!identity) continue;
+
+      const unread = readUnreadValue(row);
+      const name = getFirstText(row, [
+        '.vikar_navn', '.generel_navn', '[class*="_navn"]', '[class*="name"]'
+      ]).replace(/\s*\(\d+\)\s*$/, '').trim();
+      const context = getFirstText(row, [
+        '.vikar_vagtdata', '.generel_vagtdata', '[class*="vagtdata"]', '[class*="subject"]'
+      ]);
+      const activity = getFirstText(row, [
+        '.vikar_dato', '.generel_dato', '[class*="_dato"]', 'time'
+      ]);
+      const key = identity.type === 'vagt'
+        ? `vagt:${identity.vikarId}:${identity.vagtId}`
+        : `generel:${identity.vikarId}`;
+
+      records.push({
+        key,
+        type: identity.type,
+        vikarId: identity.vikarId,
+        vagtId: identity.vagtId,
+        name: name || 'Ukendt vikar',
+        unread,
+        context,
+        activity,
+        snippet: ''
+      });
+    }
+
+    return {
+      records,
+      unread: records.reduce((sum, record) => sum + record.unread, 0),
+      recognized: candidates.length > 0 || /Endnu ikke aktiveret|ingen beskeder/i.test(doc.body?.textContent || '')
+    };
+  }
+
+  function parseSidebarPreviews(doc = document) {
+    const previews = [];
+    for (const row of Array.from(doc.querySelectorAll('.komm_log_sms, .komm_log_sms_vagt'))) {
+      const source = [row.className || '', row.id || '', row.getAttribute('onclick') || ''].join(' ');
+      const specificMatch = source.match(/komm_log_sms_vagt_(\d+)_(\d+)/i)
+        || source.match(/showsmslog\(\s*(\d+)\s*,\s*(\d+)/i);
+      const generalMatch = source.match(/(?:gen_vagt_|gen_bruger_|OpenSMSDialog\(\s*)(\d+)/i);
+      if (!specificMatch && !generalMatch) continue;
+
+      const type = specificMatch ? 'vagt' : 'generel';
+      const vikarId = specificMatch?.[1] || generalMatch?.[1] || '';
+      const vagtId = specificMatch?.[2] || '';
+      const incoming = !!specificMatch || /(?:^|\s)gen_vagt(?:_|\s)/i.test(source);
+      const name = getFirstText(row, [
+        '[class*="navn"]', '[class*="name"]', '.komm_log_sms_header', 'span[style*="font-weight:bold"]', 'strong', 'b'
+      ]);
+      let snippet = getFirstText(row, [
+        '[class*="besked"]', '[class*="message"]', '[class*="tekst"]', '[class*="text"]'
+      ]);
+      const fullText = normalizeText(row.textContent);
+      if (!snippet) {
+        snippet = name && fullText.startsWith(name)
+          ? normalizeText(fullText.slice(name.length))
+          : fullText;
+      }
+
+      const overlay = row.querySelector('img[src*="overlay"]')?.parentElement;
+      const unread = !!overlay && hasDisplayBlock(overlay);
+
+      previews.push({
+        type,
+        vikarId,
+        vagtId,
+        name,
+        snippet: truncateText(snippet, 300),
+        incoming,
+        unread
+      });
+    }
+    return previews;
+  }
+
+  function parseOpenThreadPreview(doc = document) {
+    const wrapper = doc.querySelector('#smsmessages_wrapper');
+    if (!wrapper) return null;
+
+    const identitySource = [wrapper.id, wrapper.className, wrapper.getAttribute('data-vikar-id') || ''];
+    for (const input of Array.from(wrapper.querySelectorAll('input[type="hidden"]'))) {
+      identitySource.push(input.id || '', input.name || '', input.value || '');
+    }
+    const source = identitySource.join(' ');
+    const vikarMatch = source.match(/vikar(?:_id)?[^\d]{0,8}(\d+)/i);
+    const vagtMatch = source.match(/vagt(?:_avail)?(?:_id)?[^\d]{0,8}(\d+)/i);
+    if (!vikarMatch) return null;
+
+    const messages = Array.from(wrapper.querySelectorAll('.smsmessage'));
+    const latest = messages[messages.length - 1];
+    if (!latest) return null;
+    const incoming = latest.classList.contains('smsfrom')
+      ? true
+      : (latest.classList.contains('smsto') ? false : null);
+    const clone = latest.cloneNode(true);
+    clone.querySelectorAll('.smsdatetime, time, script, style').forEach(node => node.remove());
+    const snippet = truncateText(clone.textContent, 300);
+    if (!snippet) return null;
+
+    return {
+      type: vagtMatch ? 'vagt' : 'generel',
+      vikarId: vikarMatch[1],
+      vagtId: vagtMatch?.[1] || '',
+      incoming,
+      snippet
+    };
+  }
+
+  function enrichMessageRecords(records, sidebarPreviews, openPreview) {
+    const previews = Array.isArray(sidebarPreviews) ? sidebarPreviews : [];
+    return records.map(record => {
+      const openMatches = openPreview
+        && openPreview.vikarId === record.vikarId
+        && (!openPreview.vagtId || openPreview.vagtId === record.vagtId);
+      const matchingPreviews = previews.filter(preview => preview.vikarId === record.vikarId
+        && preview.type === record.type
+        && (!preview.vagtId || preview.vagtId === record.vagtId));
+      const unreadIncoming = matchingPreviews.find(preview => preview.incoming === true && preview.unread === true);
+      const unreadOutgoing = matchingPreviews.find(preview => preview.incoming === false && preview.unread === true);
+      const sidebar = unreadIncoming || unreadOutgoing || matchingPreviews[0]
+        || previews.find(preview => preview.vikarId === record.vikarId);
+      const snippet = openMatches ? openPreview.snippet : (sidebar?.snippet || '');
+      const name = record.name === 'Ukendt vikar' && sidebar?.name ? sidebar.name : record.name;
+      const incoming = record.type === 'vagt'
+        ? true
+        : (openMatches && typeof openPreview.incoming === 'boolean'
+          ? openPreview.incoming
+          : (unreadIncoming ? true : (unreadOutgoing ? false : null)));
+      return { ...record, name, incoming, snippet: truncateText(snippet, 300) };
+    });
+  }
+
+  function buildMessageRecordMap(sourceRecords, sidebarPreviews, openPreview) {
+    const previews = Array.isArray(sidebarPreviews) ? sidebarPreviews : [];
+    const enriched = enrichMessageRecords(sourceRecords, previews, openPreview);
+    return recordsToMap(enriched);
+  }
+
+  function messageRecordSignature(record) {
+    return [
+      clampInteger(record.unread, 0),
+      normalizeText(record.activity),
+      normalizeText(record.snippet)
+    ].join('|');
+  }
+
+  function recordsToMap(records) {
+    const map = {};
+    for (const source of records || []) {
+      if (!source?.key) continue;
+      const record = { ...source, unread: clampInteger(source.unread, 0) };
+      record.signature = messageRecordSignature(record);
+      map[record.key] = record;
+    }
+    return map;
+  }
+
+  function countUnreadMessageThreads(recordMap) {
+    return Object.values(recordMap || {}).filter(record => clampInteger(record?.unread, 0) > 0).length;
+  }
+
+  function isIncomingMessageRecord(record) {
+    if (!record || clampInteger(record.unread, 0) <= 0) return false;
+    return record.type === 'vagt' || record.incoming === true;
+  }
+
+  function countIncomingUnreadThreads(recordMap) {
+    return Object.values(recordMap || {}).filter(isIncomingMessageRecord).length;
+  }
+
+  function hasUnresolvedGeneralDirection(recordMap) {
+    return Object.values(recordMap || {}).some(record => record?.type === 'generel'
+      && clampInteger(record.unread, 0) > 0
+      && record.incoming !== true
+      && record.incoming !== false);
+  }
+
+  function resolveMessageCounterTotal(counters, vagtRecords, generalRecords) {
+    const values = counters || {};
+    const vagtThreadTotal = (vagtRecords || []).filter(record => clampInteger(record?.unread, 0) > 0).length;
+    const generalThreadTotal = (generalRecords || []).filter(record => clampInteger(record?.unread, 0) > 0).length;
+    return (values.vagt ?? vagtThreadTotal)
+      + (values.generel ?? generalThreadTotal)
+      + (values.brugere ?? 0);
+  }
+
+  function messageEventId(record) {
+    if (!record?.key) return '';
+    return `${record.key}|${record.signature || messageRecordSignature(record)}`;
+  }
+
+  function pruneSeenMessageEvents(value, time = Date.now()) {
+    const source = value && typeof value === 'object' ? value : {};
+    const oldest = time - MESSAGE_SEEN_TTL_MS;
+    return Object.fromEntries(Object.entries(source)
+      .map(([eventId, timestamp]) => [eventId, clampInteger(timestamp, 0)])
+      .filter(([eventId, timestamp]) => !!eventId && timestamp >= oldest)
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, MESSAGE_SEEN_LIMIT));
+  }
+
+  function rememberMessageRecords(seen, recordMap, time = Date.now()) {
+    const next = { ...(seen || {}) };
+    for (const record of Object.values(recordMap || {})) {
+      if (!isIncomingMessageRecord(record)) continue;
+      const eventId = messageEventId(record);
+      if (eventId) next[eventId] = time;
+    }
+    return pruneSeenMessageEvents(next, time);
+  }
+
+  function carryForwardMessageDetails(currentMap, previousMap) {
+    const current = currentMap || {};
+    const previous = previousMap || {};
+    const result = {};
+    for (const [key, source] of Object.entries(current)) {
+      const old = previous[key];
+      const sameUnread = old && clampInteger(source.unread, 0) === clampInteger(old.unread, 0);
+      const sameActivity = old && normalizeText(source.activity) === normalizeText(old.activity);
+      const record = { ...source };
+      if (sameUnread && sameActivity) {
+        if (!record.snippet && old.snippet) record.snippet = old.snippet;
+        if ((!record.name || record.name === 'Ukendt vikar') && old.name) record.name = old.name;
+        if (!record.context && old.context) record.context = old.context;
+        if (typeof record.incoming !== 'boolean' && typeof old.incoming === 'boolean') {
+          record.incoming = old.incoming;
+        }
+      }
+      record.signature = messageRecordSignature(record);
+      result[key] = record;
+    }
+    return result;
+  }
+
+  function diffMessageThreads(previousMap, currentMap) {
+    const previous = previousMap || {};
+    const current = currentMap || {};
+    const events = [];
+
+    for (const record of Object.values(current)) {
+      if (!record || record.unread <= 0) continue;
+      const old = previous[record.key];
+      const signature = record.signature || messageRecordSignature(record);
+      let delta = 0;
+
+      if (!old) {
+        delta = record.unread;
+      } else if (record.unread > clampInteger(old.unread, 0)) {
+        delta = record.unread - clampInteger(old.unread, 0);
+      } else if (record.type === 'generel' && record.incoming === true && old.incoming !== true) {
+        delta = 1;
+      } else if (
+        clampInteger(old.unread, 0) > 0
+        && signature !== (old.signature || messageRecordSignature(old))
+        && (normalizeText(record.activity) !== normalizeText(old.activity)
+          || (normalizeText(record.snippet)
+            && normalizeText(old.snippet)
+            && normalizeText(record.snippet) !== normalizeText(old.snippet)))
+      ) {
+        delta = 1;
+      }
+
+      if (delta > 0) {
+        events.push({
+          kind: 'thread',
+          key: record.key,
+          eventId: messageEventId({ ...record, signature }),
+          signature,
+          delta,
+          record
+        });
       }
     }
-  } catch(_) {}
+    return events;
+  }
 
-  try {
-    let el = document.getElementById('tpToast');
-    if (!el) {
-      el = document.createElement('div');
-      el.id = 'tpToast';
-      el.style.cssText = [
-        'position:fixed','right:16px','bottom:16px','z-index:2147483646',
-        'background:#111','color:#fff','padding:10px 12px','border-radius:10px',
-        'box-shadow:0 10px 30px rgba(0,0,0,.35)','font-size:13px',
-        'font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
-        'max-width:360px','opacity:0','transition:opacity .25s'
-      ].join(';');
-      document.body.appendChild(el);
-      requestAnimationFrame(() => el.style.opacity = '1');
+  function mergePendingEvents(existing, additions, uniqueBy = 'eventId') {
+    const merged = new Map();
+    for (const event of existing || []) {
+      if (event?.[uniqueBy]) merged.set(event[uniqueBy], event);
     }
-    el.textContent = msg;
-    clearTimeout(el._t);
-    el._t = setTimeout(() => { if (el) { el.style.opacity = '0'; setTimeout(() => el.remove(), 250); } }, ms);
-  } catch(_) {}
-}
-
-const TOAST_LOCK_KEY_PREFIX = 'tpToastLock_';
-function takeToastLock(kind) {
-  try {
-    const key = TOAST_LOCK_KEY_PREFIX + kind;
-    const l = JSON.parse(localStorage.getItem(key) || '{"t":0}');
-    if (Date.now() - l.t < LOCK_MS) return false;
-    localStorage.setItem(key, JSON.stringify({ t: Date.now() }));
-    return true;
-  } catch(_) { return true; }
-}
-function showToastOnce(kind, msg) {
-  if (!takeToastLock(kind)) return;
-  showToast(msg);
-  broadcastToast(kind, msg);
-}
-
-/*──────── 3) PUSHOVER ────────*/
-function getUserKey() { try { return (GM_getValue('tpUserKey') || '').trim(); } catch (_) { return ''; } }
-function sendPushover(msg) {
-  const userKey = getUserKey();
-  if (!PUSHOVER_TOKEN || !userKey) return;
-  const body = 'token=' + encodeURIComponent(PUSHOVER_TOKEN) + '&user=' + encodeURIComponent(userKey) + '&message=' + encodeURIComponent(msg);
-  GM_xmlhttpRequest({
-    method: 'POST',
-    url: 'https://api.pushover.net/1/messages.json',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    data: body,
-    onerror: () => {
-      fetch('https://api.pushover.net/1/messages.json', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body })
-        .catch(()=>{});
+    for (const event of additions || []) {
+      if (!event?.[uniqueBy]) continue;
+      if (event.key) {
+        for (const [id, pending] of merged) {
+          if (pending.key === event.key && id !== event[uniqueBy]) merged.delete(id);
+        }
+      }
+      merged.set(event[uniqueBy], event);
     }
-  });
-}
+    return Array.from(merged.values());
+  }
 
-/*──────── 4) STATE + LOCK ────────*/
-const MSG_URL  = location.origin + '/index.php?page=get_comcenter_counters&ajax=true';
-const MSG_KEYS = ['vagt_unread', 'generel_unread'];
-const ST_MSG_KEY = 'tpPushState';
-const ST_INT_KEY = 'tpInterestState';
-function loadJson(key, fallback) { try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); } catch (_) { return JSON.parse(JSON.stringify(fallback)); } }
-function saveJson(key, obj) { localStorage.setItem(key, JSON.stringify(obj)); }
+  function prunePendingMessageEvents(pending, currentMap, currentTotal) {
+    const map = currentMap || {};
+    return (pending || []).filter(event => {
+      if (event.kind === 'generic') return currentTotal >= clampInteger(event.targetTotal, 1);
+      const record = map[event.key];
+      if (!isIncomingMessageRecord(record)) return false;
+      return !event.signature || event.signature === (record.signature || messageRecordSignature(record));
+    });
+  }
 
-// Per-kanal lock
-function takeLock(kind = 'global') {
-  const key = 'tpPushLock_' + kind;
-  const l = JSON.parse(localStorage.getItem(key) || '{"t":0}');
-  if (Date.now() - l.t < LOCK_MS) return false;
-  localStorage.setItem(key, JSON.stringify({ t: Date.now() }));
-  return true;
-}
+  function parseTopMenuMessageCount(doc = document) {
+    const directIds = ['vagt_unread_div', 'generel_unread_div', 'brugere_unread_div'];
+    let directTotal = 0;
+    let directFound = false;
+    for (const id of directIds) {
+      const el = doc.getElementById(id);
+      if (!el) continue;
+      const match = normalizeText(el.textContent).match(/\d+/);
+      if (match) {
+        directFound = true;
+        directTotal += clampInteger(match[0], 0);
+      }
+    }
+    if (directFound) return directTotal;
 
-/* Heal/normalisér state ved opstart */
-(function healStates(){
-  const fix = (key) => {
-    const st = loadJson(key, {count:0,lastPush:0,lastSent:0,pending:0});
-    if (typeof st.pending !== 'number') st.pending = 0;
-    if (st.lastSent > st.count) st.lastSent = st.count;
-    saveJson(key, st);
-  };
-  fix(ST_MSG_KEY);
-  fix(ST_INT_KEY);
-  // ryd gamle globale locks, hvis de findes
-  try { localStorage.removeItem('tpPushLock'); } catch(_) {}
-})();
+    for (const element of Array.from(doc.querySelectorAll('a, button, li, span'))) {
+      const text = normalizeText(element.textContent);
+      if (!/Beskeder/i.test(text)) continue;
+      const match = text.match(/Beskeder\s*\((\d+)\)/i) || text.match(/\((\d+)\)/);
+      if (match) return clampInteger(match[1], 0);
+    }
+    return null;
+  }
 
-/* Pending flush (løser “missed” ved suppression/lock) */
-function maybeFlushPending(kind, pushEnableKey, stateKey, buildMsg) {
-  const st = loadJson(stateKey, {count:0,lastPush:0,lastSent:0,pending:0});
-  const shouldFlush = st.pending && (st.pending > (st.lastSent || 0) || st.pending > (st.count || 0));
-  if (shouldFlush) {
-    if (Date.now() - st.lastPush > SUPPRESS_MS && takeLock(kind)) {
-      const text = (typeof buildMsg === 'function') ? buildMsg(st.pending) : String(buildMsg);
-      const enabled = localStorage.getItem(pushEnableKey) === 'true';
-      if (enabled) sendPushover(text);
-      showToastOnce(kind, text);
-      st.lastPush = Date.now();
-      st.lastSent = st.pending;
-      st.pending  = 0;
-      saveJson(stateKey, st);
+  function cleanCellText(cell) {
+    if (!cell) return '';
+    const clone = cell.cloneNode(true);
+    clone.querySelectorAll('script, style, input, button, [style*="display:none"], [style*="display: none"]').forEach(node => node.remove());
+    return normalizeText(clone.textContent);
+  }
+
+  function stripCustomerNumber(value) {
+    return normalizeText(value)
+      .replace(/^\d+\s*/, '')
+      .replace(/^([A-ZÆØÅ]{1,8})\s*-\s*/i, '$1 - ')
+      .trim();
+  }
+
+  function cleanCustomerName(cell) {
+    if (!cell) return '';
+    const preferred = cell.querySelector('[id^="kunde_navn_span_"], .fullname');
+    const text = normalizeText(preferred?.getAttribute('title') || preferred?.textContent || cleanCellText(cell));
+    return stripCustomerNumber(text);
+  }
+
+  function parseInterestOverviewHTML(html) {
+    const doc = parseHtml(html);
+    const shifts = [];
+    const seen = new Set();
+    const boxes = Array.from(doc.querySelectorAll('[id^="vagtlist_synlig_interesse_display_number_"], [id*="interesse"][id*="display_number"]'));
+
+    for (const box of boxes) {
+      const match = (box.id || '').match(/display_number_(\d+)_(single|multi)/i);
+      if (!match) continue;
+      const id = match[1];
+      const type = match[2].toLowerCase();
+      const countMatch = normalizeText(box.textContent).match(/\d+/);
+      const count = countMatch ? clampInteger(countMatch[0], 0) : 0;
+      if (count <= 0 || seen.has(`${id}:${type}`)) continue;
+      seen.add(`${id}:${type}`);
+
+      const row = box.closest('tr');
+      const cells = row ? Array.from(row.children).filter(child => child.tagName === 'TD') : [];
+      const date = cleanCellText(cells[7]);
+      const time = cleanCellText(cells[8]);
+      const education = cleanCellText(cells[10]);
+      const customer = cleanCustomerName(cells[11]);
+
+      shifts.push({ id, type, count, date, time, education, customer });
+    }
+
+    return {
+      shifts,
+      total: shifts.reduce((sum, shift) => sum + shift.count, 0),
+      recognized: boxes.length > 0
+    };
+  }
+
+  function parseInterestDetailHTML(html, shift) {
+    const doc = parseHtml(html);
+    const entries = [];
+    const rows = Array.from(doc.querySelectorAll('.vikar_interresse_list_container, [id^="vagter_synlig_container_"]'));
+    const seen = new Set();
+
+    for (const row of rows) {
+      const match = (row.id || '').match(/vagter_synlig_container_(\d+)_(\d+)/i);
+      if (!match) continue;
+      const vikarId = match[1];
+      const vagtId = match[2];
+      if (String(vagtId) !== String(shift.id)) continue;
+      const key = `${vagtId}:${vikarId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const name = getFirstText(row, ['.vikar_interresse_list_navn_container', '[class*="_navn_"]', '[class*="navn"]']);
+      const education = getFirstText(row, ['.vikar_interresse_list_udd_container', '[class*="_udd_"]', '[class*="udd"]']);
+      const interestDate = getFirstText(row, ['.vikar_interresse_list_dato_container', '[class*="_dato_"]', '[class*="dato"]']);
+      entries.push({
+        key,
+        vikarId,
+        vagtId,
+        name: name || 'Ukendt vikar',
+        education,
+        interestDate,
+        shift: { ...shift }
+      });
+    }
+    return entries;
+  }
+
+  function entriesToMap(entries) {
+    const map = {};
+    for (const entry of entries || []) {
+      if (entry?.key) map[entry.key] = entry;
+    }
+    return map;
+  }
+
+  function diffInterestPairs(previousMap, currentMap) {
+    const previous = previousMap || {};
+    const current = currentMap || {};
+    return Object.values(current)
+      .filter(entry => entry?.key && !previous[entry.key])
+      .map(entry => ({
+        kind: 'interest',
+        key: entry.key,
+        eventId: entry.key,
+        entry
+      }));
+  }
+
+  function prunePendingInterestEvents(pending, currentMap) {
+    const current = currentMap || {};
+    return (pending || []).filter(event => !!current[event.key]);
+  }
+
+  function formatShift(shift) {
+    const customer = normalizeText(shift?.customer) || `Vagt ${shift?.id || ''}`.trim();
+    const when = normalizeText([shift?.date, shift?.time].filter(Boolean).join(' '));
+    return [customer, when].filter(Boolean).join(' · ');
+  }
+
+  function formatMessageNotification(events) {
+    const list = Array.isArray(events) ? events : [];
+    const total = list.reduce((sum, event) => sum + Math.max(1, clampInteger(event.delta, 1)), 0);
+    let title;
+    let body;
+
+    if (list.length === 1 && list[0].kind !== 'generic') {
+      const record = list[0].record || {};
+      title = `Ny besked fra ${record.name || 'en vikar'}`;
+      const lines = [];
+      if (record.snippet) lines.push(truncateText(record.snippet, 500));
+      else lines.push('Ny ulæst besked');
+      if (record.type === 'vagt' && record.context) {
+        lines.push('Vagt: ' + truncateText(record.context, 260));
+      }
+      body = lines.join('\n');
+    } else {
+      title = `${total || list.length} nye Temponizer-beskeder`;
+      const lines = list.slice(0, 3).map(event => {
+        if (event.kind === 'generic') return event.text || 'Ny ulæst besked';
+        const record = event.record || {};
+        const detail = record.snippet
+          || (record.type === 'vagt' ? record.context : '')
+          || 'Ny ulæst besked';
+        return `${record.name || 'Ukendt vikar'}: ${truncateText(detail, 190)}`;
+      });
+      if (list.length > 3) lines.push(`+${list.length - 3} flere`);
+      body = lines.join('\n');
+    }
+
+    title = truncateText(title, 80);
+    body = truncateText(body, 850);
+    return { title, body, toast: truncateText(`${title}: ${body}`, 260) };
+  }
+
+  function formatInterestNotification(events) {
+    const list = Array.isArray(events) ? events : [];
+    let title;
+    let body;
+
+    if (list.length === 1) {
+      const entry = list[0].entry || {};
+      title = `Ny interesse fra ${entry.name || 'en vikar'}`;
+      const lines = [formatShift(entry.shift)];
+      if (entry.education) lines.push(truncateText(entry.education, 160));
+      body = lines.filter(Boolean).join('\n');
+    } else {
+      title = `${list.length} nye interesser`;
+      const lines = list.slice(0, 3).map(event => {
+        const entry = event.entry || {};
+        return `${entry.name || 'Ukendt vikar'}: ${truncateText(formatShift(entry.shift), 190)}`;
+      });
+      if (list.length > 3) lines.push(`+${list.length - 3} flere`);
+      body = lines.join('\n');
+    }
+
+    title = truncateText(title, 80);
+    body = truncateText(body, 850);
+    return { title, body, toast: truncateText(`${title}: ${body}`, 260) };
+  }
+
+  async function mapLimit(items, limit, mapper) {
+    const list = Array.from(items || []);
+    const results = new Array(list.length);
+    let nextIndex = 0;
+    const workerCount = Math.max(1, Math.min(clampInteger(limit, 1), list.length || 1));
+
+    async function worker() {
+      while (nextIndex < list.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await mapper(list[index], index);
+      }
+    }
+
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return results;
+  }
+
+  function loadJson(key, fallback) {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : structuredCloneFallback(fallback);
+    } catch (_) {
+      return structuredCloneFallback(fallback);
+    }
+  }
+
+  function structuredCloneFallback(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function saveJson(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (error) {
+      console.warn('[TP] Kunne ikke gemme lokal status', error);
+    }
+  }
+
+  async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        ...options,
+        signal: controller.signal,
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+          ...(options.headers || {})
+        }
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function fetchText(url, options) {
+    return (await fetchWithTimeout(url, options)).text();
+  }
+
+  async function fetchJson(url, options) {
+    return (await fetchWithTimeout(url, options)).json();
+  }
+
+  async function fetchMessageSnapshot() {
+    const stamp = Date.now();
+    const [counterResult, vagtResult, generalResult] = await Promise.allSettled([
+      fetchJson(MSG_COUNTER_URL + '&_=' + stamp),
+      fetchText(MSG_LIST_URLS.vagt + '&_=' + stamp),
+      fetchText(MSG_LIST_URLS.generel + '&_=' + stamp)
+    ]);
+
+    if (counterResult.status === 'rejected' && vagtResult.status === 'rejected' && generalResult.status === 'rejected') {
+      throw new Error('Alle beskedkilder fejlede');
+    }
+
+    const counters = counterResult.status === 'fulfilled'
+      ? parseMessageCounters(counterResult.value)
+      : { vagt: null, generel: null, brugere: null };
+    const vagtIndex = vagtResult.status === 'fulfilled'
+      ? parseMessageIndexHTML(vagtResult.value, 'vagt')
+      : { records: [], unread: 0, recognized: false };
+    const generalIndex = generalResult.status === 'fulfilled'
+      ? parseMessageIndexHTML(generalResult.value, 'generel')
+      : { records: [], unread: 0, recognized: false };
+    if (counterResult.status === 'rejected' && !vagtIndex.recognized && !generalIndex.recognized) {
+      throw new Error('Beskedsvarene lignede ikke en aktiv Temponizer-session');
+    }
+
+    let effectiveCounters = counters;
+    let sidebar = parseSidebarPreviews(document);
+    const openThread = parseOpenThreadPreview(document);
+    const sourceRecords = [...vagtIndex.records, ...generalIndex.records].filter(record => record.unread > 0);
+    const vagtTotal = counters.vagt
+      ?? vagtIndex.records.filter(record => record.unread > 0).length;
+    const counterTotal = resolveMessageCounterTotal(counters, vagtIndex.records, generalIndex.records);
+    const previousState = loadJson(ST_MSG_KEY, getDefaultMessageState());
+    let recordMap = carryForwardMessageDetails(
+      buildMessageRecordMap(sourceRecords, sidebar, openThread),
+      previousState.records || {}
+    );
+    let detailedTotal = countUnreadMessageThreads(recordMap);
+    let incomingTotal = countIncomingUnreadThreads(recordMap);
+    const topMenuTotal = parseTopMenuMessageCount(document);
+    let topMenuFallback = 0;
+    let homepageEnriched = false;
+
+    // Topmenuens DOM kan være forsinket. Brug den kun som signal til at hente
+    // en frisk, læsende forside og accepter først derefter en højere total.
+    if ((topMenuTotal ?? 0) > counterTotal) {
+      try {
+        const homepageDoc = parseHtml(await fetchText(ORIGIN + '/index.php?_=' + Date.now()));
+        const freshTopMenuTotal = parseTopMenuMessageCount(homepageDoc) ?? 0;
+        if (freshTopMenuTotal > counterTotal) {
+          const inferredGeneral = Math.max(0, freshTopMenuTotal - vagtTotal);
+          effectiveCounters = {
+            ...counters,
+            generel: Math.max(counters.generel ?? 0, inferredGeneral)
+          };
+          sidebar = parseSidebarPreviews(homepageDoc);
+          recordMap = carryForwardMessageDetails(
+            buildMessageRecordMap(sourceRecords, sidebar, openThread),
+            previousState.records || {}
+          );
+          detailedTotal = countUnreadMessageThreads(recordMap);
+          incomingTotal = countIncomingUnreadThreads(recordMap);
+          topMenuFallback = freshTopMenuTotal;
+          homepageEnriched = true;
+        }
+      } catch (error) {
+        console.warn('[TP][MSG] Kunne ikke bekræfte topmenuens beskedtal', error);
+      }
+    }
+
+    const rawTotal = Math.max(counterTotal, topMenuFallback);
+    const indexedVagtTotal = sourceRecords.filter(record => record.type === 'vagt').length;
+    const vagtFallback = Math.max(0, vagtTotal - indexedVagtTotal);
+    const userFallback = counters.brugere ?? 0;
+    const total = incomingTotal + vagtFallback + userFallback;
+
+    return {
+      total,
+      rawTotal,
+      records: recordMap,
+      sourceRecords,
+      counters: effectiveCounters,
+      detailedTotal,
+      incomingTotal,
+      vagtFallback,
+      userFallback,
+      topMenuTotal,
+      homepageEnriched,
+      observedAt: Date.now()
+    };
+  }
+
+  async function refreshMessageEnrichmentIfNeeded(snapshot) {
+    if (snapshot.homepageEnriched) return snapshot;
+    const state = { ...getDefaultMessageState(), ...loadJson(ST_MSG_KEY, getDefaultMessageState()) };
+    const generalUnread = (snapshot.counters?.generel ?? 0) + (snapshot.counters?.brugere ?? 0);
+    const hasUndetailedGeneral = generalUnread > 0
+      && !(snapshot.sourceRecords || []).some(record => record.type === 'generel');
+    const hasUnresolvedGeneral = hasUnresolvedGeneralDirection(snapshot.records);
+    if (!state.initialized && !hasUndetailedGeneral && !hasUnresolvedGeneral) return snapshot;
+    const hasThreadChange = diffMessageThreads(state.records || {}, snapshot.records || {}).length > 0;
+    const hasCountIncrease = snapshot.total > clampInteger(state.total, 0);
+    if (!hasThreadChange && !hasCountIncrease && !hasUndetailedGeneral) return snapshot;
+
+    try {
+      const homepageHtml = await fetchText(ORIGIN + '/index.php?_=' + Date.now());
+      const homepageDoc = parseHtml(homepageHtml);
+      const freshPreviews = parseSidebarPreviews(homepageDoc);
+      const records = buildMessageRecordMap(
+        snapshot.sourceRecords || Object.values(snapshot.records || {}),
+        freshPreviews,
+        parseOpenThreadPreview(document)
+      );
+      const detailedTotal = countUnreadMessageThreads(records);
+      const incomingTotal = countIncomingUnreadThreads(records);
+      return {
+        ...snapshot,
+        records,
+        detailedTotal,
+        incomingTotal,
+        total: incomingTotal
+          + clampInteger(snapshot.vagtFallback, 0)
+          + clampInteger(snapshot.userFallback, 0)
+      };
+    } catch (error) {
+      console.warn('[TP][MSG] Kunne ikke hente frisk beskedoversigt', error);
+      return snapshot;
+    }
+  }
+
+  async function fetchInterestEntriesForShift(shift) {
+    const url = INTEREST_DETAIL_URL
+      + '&vagt_type=' + encodeURIComponent(shift.type)
+      + '&vagt_avail_id=' + encodeURIComponent(shift.id)
+      + '&_=' + Date.now();
+    let entries = parseInterestDetailHTML(await fetchText(url), shift);
+    if (entries.length !== shift.count) {
+      await sleep(650);
+      entries = parseInterestDetailHTML(await fetchText(url + '&retry=' + Date.now()), shift);
+    }
+    if (entries.length !== shift.count) {
+      throw new Error(`Interesselisten for vagt ${shift.id} var ufuldstændig (${entries.length}/${shift.count})`);
+    }
+    return entries;
+  }
+
+  async function fetchInterestSnapshot() {
+    const overview = parseInterestOverviewHTML(await fetchText(INTEREST_URL + '&_=' + Date.now()));
+    if (!overview.recognized && overview.shifts.length === 0) {
+      throw new Error('Kunne ikke genkende interessetællerne på siden');
+    }
+    const nested = await mapLimit(overview.shifts, INTEREST_DETAIL_CONCURRENCY, fetchInterestEntriesForShift);
+    const entries = nested.flat();
+    return {
+      total: overview.total,
+      pairs: entriesToMap(entries),
+      observedAt: Date.now()
+    };
+  }
+
+  function getLeader() {
+    try {
+      return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function setLeader(value) {
+    try {
+      localStorage.setItem(LEADER_KEY, JSON.stringify(value));
+    } catch (_) {}
+  }
+
+  function isLeader() {
+    const leader = getLeader();
+    return !!(leader && leader.id === TAB_ID && leader.until > now());
+  }
+
+  function writeLeadership(time = now()) {
+    setLeader({
+      id: TAB_ID,
+      until: time + LEASE_MS,
+      ts: time,
+      visible: !document.hidden
+    });
+  }
+
+  function tryBecomeLeader(preferVisible = !document.hidden) {
+    const leader = getLeader();
+    const time = now();
+    const expired = !leader || clampInteger(leader.until, 0) <= time;
+    const visibleTakeover = preferVisible && leader && leader.id !== TAB_ID && leader.visible === false;
+    if (expired || leader?.id === TAB_ID || visibleTakeover) {
+      writeLeadership(time);
+    }
+    return isLeader();
+  }
+
+  function heartbeatLeadership() {
+    if (isLeader()) {
+      writeLeadership();
+      return true;
+    }
+    return tryBecomeLeader();
+  }
+
+  async function withLocalStorageMutex(name, task) {
+    const key = 'tpMutexV1_' + name;
+    const token = `${TAB_ID}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const deadline = Date.now() + MUTEX_WAIT_MS;
+
+    while (Date.now() < deadline) {
+      let current = null;
+      try { current = JSON.parse(localStorage.getItem(key) || 'null'); } catch (_) {}
+      if (!current || clampInteger(current.until, 0) <= Date.now()) {
+        try {
+          localStorage.setItem(key, JSON.stringify({ token, until: Date.now() + MUTEX_LEASE_MS }));
+          await sleep(25 + Math.floor(Math.random() * 35));
+          const verified = JSON.parse(localStorage.getItem(key) || 'null');
+          if (verified?.token === token) {
+            try {
+              return await task();
+            } finally {
+              try {
+                const latest = JSON.parse(localStorage.getItem(key) || 'null');
+                if (latest?.token === token) localStorage.removeItem(key);
+              } catch (_) {}
+            }
+          }
+        } catch (_) {}
+      }
+      await sleep(40 + Math.floor(Math.random() * 60));
+    }
+    console.warn('[TP] Springer en poll over, fordi flerfanelåsen var optaget:', name);
+    return undefined;
+  }
+
+  async function withCrossTabProcessLock(name, task) {
+    try {
+      if (globalThis.navigator?.locks?.request) {
+        return await globalThis.navigator.locks.request(
+          'ajourcare-temponizer-' + name,
+          { mode: 'exclusive' },
+          task
+        );
+      }
+    } catch (error) {
+      console.warn('[TP] Browserens flerfanelås fejlede; bruger lokal reserve.', error);
+    }
+    return withLocalStorageMutex(name, task);
+  }
+
+  function takeChannelLock(kind) {
+    const keys = ['tpPushLockV2_' + kind, 'tpPushLock_' + kind];
+    try {
+      const time = Date.now();
+      for (const key of keys) {
+        const lock = JSON.parse(localStorage.getItem(key) || '{"t":0}');
+        if (time - clampInteger(lock.t, 0) < LOCK_MS) return false;
+      }
+      const value = JSON.stringify({ t: time, id: TAB_ID });
+      for (const key of keys) localStorage.setItem(key, value);
+      return true;
+    } catch (_) {
       return true;
     }
   }
-  return false;
-}
 
-/*──────── 5) POLLERS: BESKED ────────*/
-function setBadge(el, n) {
-  if (!el) return;
-  el.textContent = String(n);
-  el.style.opacity = n > 0 ? '1' : '.45';
-}
-function badgePulse(el){
-  if (!el) return;
-  el.animate([{ transform:'scale(1)'},{ transform:'scale(1.18)'},{ transform:'scale(1)'}], { duration: 420, easing: 'ease-out' });
-}
+  function setBadge(element, count) {
+    if (!element) return;
+    const value = clampInteger(count, 0);
+    element.textContent = String(value);
+    element.style.opacity = value > 0 ? '1' : '.45';
+  }
 
-function pollMessages() {
-  // flush evt. pending
-  maybeFlushPending('msg', 'tpPushEnableMsg', ST_MSG_KEY, (n)=>`🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`);
+  function badgePulse(element) {
+    if (!element?.animate) return;
+    element.animate(
+      [{ transform: 'scale(1)', offset: 0 }, { transform: 'scale(1.12)', offset: .35 }, { transform: 'scale(1)', offset: 1 }],
+      { duration: 320, easing: 'ease-out' }
+    );
+  }
 
-  fetch(MSG_URL + '&ts=' + Date.now(), { credentials: 'same-origin', cache: 'no-store', headers: {'Cache-Control':'no-cache','Pragma':'no-cache'} })
-    .then(r => r.json())
-    .then(d => {
-      const st = loadJson(ST_MSG_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
-      const n  = MSG_KEYS.reduce((s, k) => s + Number(d[k] || 0), 0);
-      const en = localStorage.getItem('tpPushEnableMsg') === 'true';
+  function updateMessageBadge(total) {
+    const badge = document.getElementById('tpMsgCountBadge');
+    const previous = clampInteger(badge?.textContent, 0);
+    setBadge(badge, total);
+    if (total > previous) badgePulse(badge);
+  }
 
-      if (n > st.count && n !== st.lastSent) {
-        const canPush = (Date.now() - st.lastPush > SUPPRESS_MS) && takeLock('msg');
-        if (canPush) {
-          const m = `🔔 Du har nu ${n} ulæst(e) Temponizer-besked(er).`;
-          if (en) sendPushover(m);
-          showToastOnce('msg', m);
-          st.lastPush = Date.now();
-          st.lastSent = n;
-        } else {
-          st.pending = Math.max(st.pending||0, n);
-        }
-      } else if (n < st.count) {
-        st.lastPush = 0;
-        st.lastSent = n;
-        if (st.pending && n <= st.pending) st.pending = 0;
-      }
+  function updateInterestBadge(total) {
+    const badge = document.getElementById('tpIntCountBadge');
+    const previous = clampInteger(badge?.textContent, 0);
+    setBadge(badge, total);
+    if (total > previous) badgePulse(badge);
+  }
 
-      st.count = n; saveJson(ST_MSG_KEY, st);
+  function getDefaultMessageState() {
+    return { initialized: false, total: 0, rawTotal: 0, records: {}, pending: [], seen: {}, lastPush: 0 };
+  }
 
-      const badge = document.getElementById('tpMsgCountBadge'); setBadge(badge, n);
-      const prevBadge = Number(localStorage.getItem('tpMsgPrevBadge')||0);
-      if (n > prevBadge) badgePulse(badge);
-      localStorage.setItem('tpMsgPrevBadge', String(n));
-    })
-    .catch(e => console.warn('[TP][ERR][MSG]', e));
-}
+  function getDefaultInterestState() {
+    return { initialized: false, total: 0, pairs: {}, pending: [], lastPush: 0 };
+  }
 
-/*──────── 6) INTERESSE (HEAD→GET) ────────*/
-const HTML_URL = location.origin + '/index.php?page=freevagter';
-let lastETagSeen = localStorage.getItem('tpLastETag') || null;
+  function dispatchNotification(kind, enableKey, notification) {
+    const enabled = localStorage.getItem(enableKey) === 'true';
+    if (enabled) sendPushover(notification.body, notification.title);
+    showToast(notification.toast);
+    broadcastToast(kind, notification.toast);
+  }
 
-let lastIntParseTS = 0;
-function markParsedNow(){ lastIntParseTS = Date.now(); }
-function mustForceParse(){ return (Date.now() - lastIntParseTS) > (POLL_MS * 2); }
+  function processMessageSnapshot(snapshot) {
+    const state = { ...getDefaultMessageState(), ...loadJson(ST_MSG_KEY, getDefaultMessageState()) };
+    state.records = state.records && typeof state.records === 'object' ? state.records : {};
+    state.pending = Array.isArray(state.pending) ? state.pending : [];
+    const observedAt = Date.now();
+    let seen = rememberMessageRecords(
+      pruneSeenMessageEvents(state.seen, observedAt),
+      state.records,
+      observedAt
+    );
 
-function parseInterestHTML(html) {
-  const doc   = new DOMParser().parseFromString(html, 'text/html');
-  let boxes = Array.prototype.slice.call(doc.querySelectorAll('div[id^="vagtlist_synlig_interesse_display_number_"]'));
-  if (!boxes.length) boxes = Array.prototype.slice.call(doc.querySelectorAll('[id*="interesse"][id*="display_number"]'));
-  const c = boxes.reduce((s, el) => { const v = parseInt((el.textContent||'').replace(/\D+/g,''), 10); return s + (isNaN(v) ? 0 : v); }, 0);
-  return c;
-}
+    if (!state.initialized) {
+      seen = rememberMessageRecords(seen, snapshot.records, observedAt);
+      saveJson(ST_MSG_KEY, {
+        initialized: true,
+        total: snapshot.total,
+        rawTotal: clampInteger(snapshot.rawTotal, snapshot.total),
+        records: snapshot.records,
+        pending: [],
+        seen,
+        lastPush: 0
+      });
+      updateMessageBadge(snapshot.total);
+      return { baseline: true, events: [] };
+    }
 
-function buildInterestMsg(count) {
-  return '👀 ' + count + ' vikar(er) har vist interesse for ledige vagter.';
-}
-
-function pollInterest() {
-  // flush evt. pending
-  maybeFlushPending('int', 'tpPushEnableInt', ST_INT_KEY, buildInterestMsg);
-
-  const force = mustForceParse();
-  fetch(HTML_URL, {
-    method: 'HEAD',
-    credentials: 'same-origin',
-    cache: 'no-store',
-    headers: { ...(lastETagSeen ? { 'If-None-Match': lastETagSeen } : {}), 'Cache-Control':'no-cache','Pragma':'no-cache' }
-  })
-  .then(h => {
-    const et = h.headers.get('ETag') || null;
-    const changed = et && et !== lastETagSeen;
-    if (et) localStorage.setItem('tpLastETag', et);
-    lastETagSeen = et || lastETagSeen || null;
-
-    if (changed || h.status !== 304 || force || !et) {
-      return fetch(HTML_URL + '&_=' + Date.now(), {
-        credentials: 'same-origin',
-        cache: 'no-store',
-        headers: { 'Cache-Control':'no-cache', 'Pragma':'no-cache', 'Range':'bytes=0-40000' }
-      })
-      .then(r => r.text())
-      .then((html) => {
-        const total = parseInterestHTML(html);
-        markParsedNow();
-
-        const st = loadJson(ST_INT_KEY, {count:0,lastPush:0,lastSent:0,pending:0});
-        const en = localStorage.getItem('tpPushEnableInt') === 'true';
-
-        if (total > st.count && total !== st.lastSent) {
-          const canPush = (Date.now() - st.lastPush > SUPPRESS_MS) && takeLock('int');
-          const m = buildInterestMsg(total);
-          if (canPush) {
-            if (en) sendPushover(m);
-            showToastOnce('int', m);
-            st.lastPush = Date.now();
-            st.lastSent = total;
-          } else {
-            st.pending = Math.max(st.pending||0, total);
-          }
-        } else if (total < st.count) {
-          st.lastPush = 0;
-          st.lastSent = total;
-          if (st.pending && total <= st.pending) st.pending = 0;
-        }
-
-        st.count = total; saveJson(ST_INT_KEY, st);
-
-        const badgeI = document.getElementById('tpIntCountBadge'); setBadge(badgeI, total);
-        const prevBadge = Number(localStorage.getItem('tpIntPrevBadge')||0);
-        if (total > prevBadge) badgePulse(badgeI);
-        localStorage.setItem('tpIntPrevBadge', String(total));
+    let events = diffMessageThreads(state.records, snapshot.records)
+      .filter(event => event.kind !== 'thread' || isIncomingMessageRecord(event.record));
+    const detailedDelta = events.reduce((sum, event) => sum + event.delta, 0);
+    const totalDelta = Math.max(0, snapshot.total - clampInteger(state.total, 0));
+    if (totalDelta > detailedDelta) {
+      const unknownDelta = totalDelta - detailedDelta;
+      events.push({
+        kind: 'generic',
+        key: `generic:${snapshot.total}`,
+        eventId: `generic:${snapshot.total}:${clampInteger(state.total, 0)}`,
+        delta: unknownDelta,
+        targetTotal: snapshot.total,
+        text: unknownDelta === 1 ? 'Ny ulæst besked' : `${unknownDelta} nye ulæste beskeder`
       });
     }
-  })
-  .catch(e => console.warn('[TP][ERR][INT][HEAD]', e));
-}
 
-/*──────── 12) UI (panel + gear i boksen + SMS) ────────*/
-const POS_KEY = 'tpPanelPosV3';
+    events = events.filter(event => !seen[event.eventId]);
+    for (const event of events) seen[event.eventId] = observedAt;
+    seen = rememberMessageRecords(seen, snapshot.records, observedAt);
 
-function injectUI() {
-  if (document.getElementById('tpPanel')) return;
+    let pending = prunePendingMessageEvents(state.pending, snapshot.records, snapshot.total);
+    pending = mergePendingEvents(pending, events);
+    let lastPush = clampInteger(state.lastPush, 0);
+    let sent = [];
 
-  const d = document.createElement('div');
-  d.id = 'tpPanel';
-  d.style.cssText = [
-    'position:fixed','z-index:2147483645','background:#fff','border:1px solid #d7d7d7',
-    'padding:8px','border-radius:8px','font-size:12px','font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
-    'box-shadow:0 8px 24px rgba(0,0,0,15)','max-width:240px','min-width:170px','line-height:1.25'
-  ].join(';');
+    if (pending.length && Date.now() - lastPush > SUPPRESS_MS && takeChannelLock('msg')) {
+      dispatchNotification('msg', 'tpPushEnableMsg', formatMessageNotification(pending));
+      sent = pending;
+      pending = [];
+      lastPush = Date.now();
+    }
 
-  d.innerHTML =
-    '<div id="tpHeader" style="cursor:move; display:flex; align-items:center; gap:6px; margin-bottom:4px;">' +
-      '<div style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">TP Notifikationer</div>' +
-      '<div style="margin-left:auto; display:flex; align-items:center; gap:6px;">' +
-        '<div id="tpDragHint" style="font-size:10px; color:#888">træk</div>' +
-        '<button id="tpGearBtn" title="Indstillinger" style="width:22px;height:22px;line-height:20px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:50%;box-shadow:0 4px 12px rgba(0,0,0,.18);cursor:pointer;padding:0;user-select:none">⚙️</button>' +
-      '</div>' +
-    '</div>' +
+    saveJson(ST_MSG_KEY, {
+      initialized: true,
+      total: snapshot.total,
+      rawTotal: clampInteger(snapshot.rawTotal, snapshot.total),
+      records: snapshot.records,
+      pending,
+      seen,
+      lastPush
+    });
+    updateMessageBadge(snapshot.total);
+    return { baseline: false, events, sent, pending };
+  }
 
-    '<div style="display:flex; align-items:center; gap:6px; margin:2px 0 2px 0; white-space:nowrap;">' +
-      '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableMsg"> <span>Besked</span></label>' +
-      '<span id="tpMsgCountBadge" style="display:flex;align-items:center;justify-content:center;margin-left:auto;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span>' +
-    '</div>' +
+  function processInterestSnapshot(snapshot) {
+    const state = { ...getDefaultInterestState(), ...loadJson(ST_INT_KEY, getDefaultInterestState()) };
+    state.pairs = state.pairs && typeof state.pairs === 'object' ? state.pairs : {};
+    state.pending = Array.isArray(state.pending) ? state.pending : [];
 
-    '<div style="display:flex; align-items:center; gap:6px; margin:2px 0 6px 0; white-space:nowrap;">' +
-      '<label style="display:flex; align-items:center; gap:6px; min-width:0;"><input type="checkbox" id="tpEnableInt"> <span>Interesse</span></label>' +
-      '<span id="tpIntCountBadge" style="display:flex;align-items:center;justify-content:center;margin-left:auto;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span>' +
-    '</div>' +
+    if (!state.initialized) {
+      saveJson(ST_INT_KEY, {
+        initialized: true,
+        total: snapshot.total,
+        pairs: snapshot.pairs,
+        pending: [],
+        lastPush: 0
+      });
+      updateInterestBadge(snapshot.total);
+      return { baseline: true, events: [] };
+    }
 
-    '<div style="display:flex; align-items:center; gap:6px; margin:0 0 2px 0;">' +
-      '<span id="tpSMSStatus" style="font-size:11px;color:#666">SMS: …</span>' +
-      '<button id="tpSMSOneBtn" style="margin-left:auto; padding:4px 8px;font-size:11px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;flex:0 0 auto">Aktivér</button>' +
-    '</div>';
+    const events = diffInterestPairs(state.pairs, snapshot.pairs);
+    let pending = prunePendingInterestEvents(state.pending, snapshot.pairs);
+    pending = mergePendingEvents(pending, events);
+    let lastPush = clampInteger(state.lastPush, 0);
+    let sent = [];
 
-  document.body.appendChild(d);
+    if (pending.length && Date.now() - lastPush > SUPPRESS_MS && takeChannelLock('int')) {
+      dispatchNotification('int', 'tpPushEnableInt', formatInterestNotification(pending));
+      sent = pending;
+      pending = [];
+      lastPush = Date.now();
+    }
 
-  // Gear-menu (⚙️) – inde i boksen
-  const gearBtn = d.querySelector('#tpGearBtn');
-  let menu = null;
+    saveJson(ST_INT_KEY, {
+      initialized: true,
+      total: snapshot.total,
+      pairs: snapshot.pairs,
+      pending,
+      lastPush
+    });
+    updateInterestBadge(snapshot.total);
+    return { baseline: false, events, sent, pending };
+  }
 
-  function buildMenu() {
-    if (menu) return menu;
-    menu = document.createElement('div');
-    menu.id = 'tpMenu';
-    Object.assign(menu.style, {
-      position: 'fixed',
-      zIndex: 2147483647,
-      background: '#fff',
-      border: '1px solid #ccc',
-      borderRadius: '8px',
-      boxShadow: '0 10px 28px rgba(0,0,0,.20)',
-      padding: '10px',
-      width: '320px',
-      maxWidth: 'calc(100vw - 16px)',
-      maxHeight: '70vh',
-      overflow: 'auto',
-      display: 'none'
+  async function pollMessages() {
+    if (!isLeader() || messagePollInFlight) return;
+    messagePollInFlight = true;
+    try {
+      const snapshot = await fetchMessageSnapshot();
+      const enriched = await refreshMessageEnrichmentIfNeeded(snapshot);
+      if (!isLeader()) return;
+      await withCrossTabProcessLock('message-state', async () => {
+        if (!isLeader()) return;
+        processMessageSnapshot(enriched);
+      });
+    } catch (error) {
+      console.warn('[TP][ERR][MSG]', error);
+    } finally {
+      messagePollInFlight = false;
+    }
+  }
+
+  async function pollInterest() {
+    if (!isLeader() || interestPollInFlight) return;
+    interestPollInFlight = true;
+    try {
+      const snapshot = await fetchInterestSnapshot();
+      if (!isLeader()) return;
+      await withCrossTabProcessLock('interest-state', async () => {
+        if (!isLeader()) return;
+        processInterestSnapshot(snapshot);
+      });
+    } catch (error) {
+      console.warn('[TP][ERR][INT]', error);
+    } finally {
+      interestPollInFlight = false;
+    }
+  }
+
+  function gmRequest(options) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: options.method || 'GET',
+        url: options.url,
+        headers: options.headers || {},
+        data: options.data,
+        anonymous: false,
+        withCredentials: true,
+        timeout: options.timeout || FETCH_TIMEOUT_MS,
+        onload: response => response.status >= 200 && response.status < 300
+          ? resolve(response)
+          : reject(new Error('HTTP ' + response.status + ' - ' + (response.responseText || '').slice(0, 300))),
+        onerror: reject,
+        ontimeout: () => reject(new Error('Timeout'))
+      });
+    });
+  }
+
+  async function gmGET(url) {
+    const response = await gmRequest({
+      method: 'GET',
+      url,
+      headers: {
+        'Accept': '*/*',
+        'Referer': globalThis.location?.href || ORIGIN,
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+      }
+    });
+    return response.responseText;
+  }
+
+  function getUserKey() {
+    try {
+      return String(GM_getValue('tpUserKey') || '').trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function sendPushover(message, title = 'Temponizer') {
+    const userKey = getUserKey();
+    if (!PUSHOVER_TOKEN || !userKey) return;
+    const safeTitle = truncateText(title, 80);
+    const safeMessage = truncateText(message, 850);
+    const body = [
+      'token=' + encodeURIComponent(PUSHOVER_TOKEN),
+      'user=' + encodeURIComponent(userKey),
+      'title=' + encodeURIComponent(safeTitle),
+      'message=' + encodeURIComponent(safeMessage)
+    ].join('&');
+
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url: 'https://api.pushover.net/1/messages.json',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      data: body,
+      timeout: FETCH_TIMEOUT_MS,
+      onload: response => {
+        if (response.status < 200 || response.status >= 300) {
+          console.warn('[TP][PUSHOVER] HTTP', response.status);
+        }
+      },
+      onerror: error => console.warn('[TP][PUSHOVER] Netværksfejl', error),
+      ontimeout: () => console.warn('[TP][PUSHOVER] Timeout')
+    });
+  }
+
+  function showOsNotification(message, duration = 4500) {
+    const safeMessage = truncateText(message, 260);
+    try {
+      if ('Notification' in window && Notification.permission === 'granted') {
+        const notification = new Notification('Temponizer', { body: safeMessage });
+        setTimeout(() => notification.close(), Math.min(duration, 6000));
+      }
+    } catch (_) {}
+  }
+
+  function showDomToast(message, duration = 4500) {
+    const safeMessage = truncateText(message, 260);
+    try {
+      let element = document.getElementById('tpToast');
+      if (!element) {
+        element = document.createElement('div');
+        element.id = 'tpToast';
+        element.style.cssText = [
+          'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483646',
+          'background:#111', 'color:#fff', 'padding:10px 12px', 'border-radius:8px',
+          'box-shadow:0 10px 30px rgba(0,0,0,.35)', 'font-size:13px',
+          'font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif',
+          'max-width:360px', 'white-space:pre-line', 'opacity:0', 'transition:opacity .25s'
+        ].join(';');
+        document.body.appendChild(element);
+        requestAnimationFrame(() => { element.style.opacity = '1'; });
+      }
+      element.textContent = safeMessage;
+      clearTimeout(element._tpTimer);
+      element._tpTimer = setTimeout(() => {
+        element.style.opacity = '0';
+        setTimeout(() => element.remove(), 250);
+      }, duration);
+    } catch (_) {}
+  }
+
+  function showToast(message, duration = 4500) {
+    showOsNotification(message, duration);
+    showDomToast(message, duration);
+  }
+
+  function broadcastToast(type, message) {
+    try {
+      localStorage.setItem(TOAST_EVT_KEY, JSON.stringify({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        type,
+        message,
+        ts: Date.now()
+      }));
+    } catch (_) {}
+  }
+
+  function initToastBroadcast() {
+    window.addEventListener('storage', event => {
+      if (event.key === TOAST_EVT_KEY && event.newValue) {
+        try {
+          const data = JSON.parse(event.newValue);
+          const seenKey = 'tpToastSeen_' + data.id;
+          if (sessionStorage.getItem(seenKey)) return;
+          sessionStorage.setItem(seenKey, '1');
+          if (!document.hidden) showDomToast(data.message);
+        } catch (_) {}
+      }
+      if (event.key === ST_MSG_KEY && event.newValue) {
+        try { updateMessageBadge(JSON.parse(event.newValue).total); } catch (_) {}
+      }
+      if (event.key === ST_INT_KEY && event.newValue) {
+        try { updateInterestBadge(JSON.parse(event.newValue).total); } catch (_) {}
+      }
+    });
+  }
+
+  function odataQuote(value) {
+    return String(value).replace(/'/g, "''");
+  }
+
+  function spListBaseUrl() {
+    return TP_MAIL_PUSH.spSite.replace(/\/$/, '')
+      + "/_api/web/lists/getbytitle('" + odataQuote(TP_MAIL_PUSH.listTitle) + "')";
+  }
+
+  function setLocalMailPushEnabled(enabled) {
+    try { GM_setValue(TP_MAIL_PUSH.key, !!enabled); } catch (_) {}
+    try { localStorage.setItem(TP_MAIL_PUSH.key, enabled ? 'true' : 'false'); } catch (_) {}
+  }
+
+  function getLocalMailPushEnabled() {
+    try {
+      const value = GM_getValue(TP_MAIL_PUSH.key, null);
+      if (value === true || value === false) return value;
+    } catch (_) {}
+    try { return localStorage.getItem(TP_MAIL_PUSH.key) === 'true'; } catch (_) { return false; }
+  }
+
+  function paintMailPushUI(enabled, statusText, color) {
+    const checkbox = document.getElementById('tpEnableMail');
+    const status = document.getElementById('tpMailStatus');
+    if (checkbox && typeof enabled === 'boolean') checkbox.checked = enabled;
+    if (status) {
+      status.textContent = statusText || (enabled ? 'til' : 'fra');
+      status.style.color = color || (enabled ? '#0a7a35' : '#a33');
+    }
+  }
+
+  async function getSharePointDigest() {
+    const time = Date.now();
+    if (tpSpDigestCache.value && tpSpDigestCache.expires > time) return tpSpDigestCache.value;
+    const response = await gmRequest({
+      method: 'POST',
+      url: TP_MAIL_PUSH.spSite.replace(/\/$/, '') + '/_api/contextinfo',
+      headers: { 'Accept': 'application/json;odata=verbose' }
+    });
+    const json = JSON.parse(response.responseText || '{}');
+    const info = json?.d?.GetContextWebInformation || json?.GetContextWebInformation || json;
+    const digest = info.FormDigestValue;
+    const timeoutSeconds = Number(info.FormDigestTimeoutSeconds || 1500);
+    if (!digest) throw new Error('SharePoint digest mangler');
+    tpSpDigestCache = {
+      value: digest,
+      expires: time + Math.max(60, timeoutSeconds - 60) * 1000
+    };
+    return digest;
+  }
+
+  async function getSharePointListEntityType() {
+    if (tpSpEntityTypeCache) return tpSpEntityTypeCache;
+    const response = await gmRequest({
+      url: spListBaseUrl() + '?$select=ListItemEntityTypeFullName',
+      headers: { 'Accept': 'application/json;odata=verbose' }
+    });
+    const json = JSON.parse(response.responseText || '{}');
+    const type = json?.d?.ListItemEntityTypeFullName || json?.ListItemEntityTypeFullName;
+    if (!type) throw new Error('Kan ikke læse SharePoint list entity type');
+    tpSpEntityTypeCache = type;
+    return type;
+  }
+
+  async function getMailPushSetting() {
+    const filter = encodeURIComponent("Title eq '" + odataQuote(TP_MAIL_PUSH.itemTitle) + "'");
+    const url = spListBaseUrl() + '/items?$select=Id,Title,Enabled&$filter=' + filter + '&$top=1';
+    const response = await gmRequest({
+      url,
+      headers: { 'Accept': 'application/json;odata=nometadata' }
+    });
+    const json = JSON.parse(response.responseText || '{}');
+    const rows = json.value || json?.d?.results || [];
+    if (!rows.length) throw new Error('Fandt ikke PushoverMail i TemponizerSettings');
+    return { id: rows[0].Id, enabled: !!rows[0].Enabled };
+  }
+
+  async function setMailPushSetting(enabled) {
+    const item = await getMailPushSetting();
+    const digest = await getSharePointDigest();
+    const entityType = await getSharePointListEntityType();
+    await gmRequest({
+      method: 'POST',
+      url: spListBaseUrl() + '/items(' + item.id + ')',
+      headers: {
+        'Accept': 'application/json;odata=verbose',
+        'Content-Type': 'application/json;odata=verbose',
+        'X-RequestDigest': digest,
+        'IF-MATCH': '*',
+        'X-HTTP-Method': 'MERGE'
+      },
+      data: JSON.stringify({
+        __metadata: { type: entityType },
+        Enabled: !!enabled
+      })
+    });
+    setLocalMailPushEnabled(enabled);
+    paintMailPushUI(enabled, enabled ? 'til' : 'fra');
+  }
+
+  async function refreshMailPushSetting() {
+    if (tpMailPushBusy || tpMailRefreshInFlight) return;
+    if (!document.getElementById('tpEnableMail')) return;
+    const generation = ++tpMailRefreshGeneration;
+    tpMailRefreshInFlight = true;
+    try {
+      paintMailPushUI(undefined, 'synk…', '#888');
+      const setting = await getMailPushSetting();
+      if (generation !== tpMailRefreshGeneration || tpMailPushBusy) return;
+      setLocalMailPushEnabled(setting.enabled);
+      paintMailPushUI(setting.enabled, setting.enabled ? 'til' : 'fra');
+    } catch (error) {
+      if (generation === tpMailRefreshGeneration) {
+        console.warn('[TP][MAIL] refresh error', error);
+        paintMailPushUI(undefined, 'fejl', '#a33');
+      }
+    } finally {
+      if (generation === tpMailRefreshGeneration) tpMailRefreshInFlight = false;
+    }
+  }
+
+  function initMailPushControls(root) {
+    const checkbox = root.querySelector('#tpEnableMail');
+    if (!checkbox) return;
+    checkbox.checked = getLocalMailPushEnabled();
+    paintMailPushUI(checkbox.checked, 'synk…', '#888');
+
+    checkbox.addEventListener('change', async () => {
+      if (tpMailPushBusy) return;
+      const wantOn = checkbox.checked;
+      tpMailPushBusy = true;
+      tpMailRefreshGeneration += 1;
+      tpMailRefreshInFlight = false;
+      checkbox.disabled = true;
+      paintMailPushUI(wantOn, wantOn ? 'slår til…' : 'slår fra…', '#888');
+      try {
+        await setMailPushSetting(wantOn);
+      } catch (error) {
+        console.warn('[TP][MAIL] update error', error);
+        checkbox.checked = !wantOn;
+        paintMailPushUI(checkbox.checked, 'fejl', '#a33');
+      } finally {
+        checkbox.disabled = false;
+        tpMailPushBusy = false;
+        setTimeout(refreshMailPushSetting, 1200);
+      }
     });
 
-    menu.innerHTML =
-      '<div style="font-weight:700;margin-bottom:6px">Indstillinger</div>' +
+    refreshMailPushSetting();
+    if (!tpMailPushTimer) {
+      tpMailPushTimer = setInterval(refreshMailPushSetting, TP_MAIL_PUSH.pollMs);
+    }
+  }
 
-      '<div style="margin-bottom:10px">' +
-        '<div style="font-weight:600;margin-bottom:4px">Pushover USER-token</div>' +
-        '<input id="tpUserKeyMenu" type="text" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:6px">' +
-        '<div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
-          '<button id="tpSaveUserKeyMenu" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Gem</button>' +
-          '<a href="https://pushover.net/" target="_blank" rel="noopener" style="color:#06c;text-decoration:none">Guide</a>' +
+  function loadPanelPosition(element) {
+    const position = loadJson(POS_KEY, null);
+    if (!position || !Number.isFinite(Number(position.x)) || !Number.isFinite(Number(position.y))) {
+      element.style.bottom = '12px';
+      element.style.right = '8px';
+      element.style.top = 'auto';
+      element.style.left = 'auto';
+      return;
+    }
+    element.style.left = Number(position.x) + 'px';
+    element.style.top = Number(position.y) + 'px';
+    element.style.right = 'auto';
+    element.style.bottom = 'auto';
+    requestAnimationFrame(clampPanelIntoView);
+  }
+
+  function injectUI() {
+    if (document.getElementById('tpPanel')) return;
+
+    const panel = document.createElement('div');
+    panel.id = 'tpPanel';
+    panel.style.cssText = [
+      'position:fixed', 'z-index:2147483645', 'background:#fff', 'border:1px solid #d7d7d7',
+      'padding:8px', 'border-radius:8px', 'font-size:12px',
+      'font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif',
+      'box-shadow:0 8px 24px rgba(0,0,0,.15)', 'max-width:240px', 'min-width:170px',
+      'line-height:1.25'
+    ].join(';');
+
+    panel.innerHTML =
+      '<div id="tpHeader" style="cursor:move;display:flex;align-items:center;gap:6px;margin-bottom:4px">' +
+        '<div style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">TP Notifikationer</div>' +
+        '<div style="margin-left:auto;display:flex;align-items:center;gap:6px">' +
+          '<div id="tpDragHint" style="font-size:10px;color:#888">træk</div>' +
+          '<button id="tpGearBtn" type="button" title="Indstillinger" aria-label="Indstillinger" style="width:22px;height:22px;line-height:20px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:50%;box-shadow:0 4px 12px rgba(0,0,0,.18);cursor:pointer;padding:0;user-select:none">⚙</button>' +
         '</div>' +
       '</div>' +
-
-      '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
-      '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
-        '<button id="tpTestPushover" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Test Pushover</button>' +
-        '<button id="tpCheckUpdate" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Tjek update</button>' +
+      '<div style="display:flex;align-items:center;gap:6px;margin:2px 0;white-space:nowrap">' +
+        '<label style="display:flex;align-items:center;gap:6px;min-width:0"><input type="checkbox" id="tpEnableMsg"> <span>Besked</span></label>' +
+        '<span id="tpMsgCountBadge" style="display:flex;align-items:center;justify-content:center;margin-left:auto;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span>' +
       '</div>' +
-      '<div style="margin-top:8px;font-size:11px;color:#666">Version: ' + TP_VERSION + '</div>';
+      '<div style="display:flex;align-items:center;gap:6px;margin:2px 0 6px;white-space:nowrap">' +
+        '<label style="display:flex;align-items:center;gap:6px;min-width:0"><input type="checkbox" id="tpEnableInt"> <span>Interesse</span></label>' +
+        '<span id="tpIntCountBadge" style="display:flex;align-items:center;justify-content:center;margin-left:auto;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span>' +
+      '</div>' +
+      '<div style="display:flex;align-items:center;gap:6px;margin:2px 0 6px;white-space:nowrap">' +
+        '<label style="display:flex;align-items:center;gap:6px;min-width:0"><input type="checkbox" id="tpEnableMail"> <span>Mail</span></label>' +
+        '<span id="tpMailStatus" style="margin-left:auto;font-size:10px;color:#888">…</span>' +
+      '</div>' +
+      '<div style="display:flex;align-items:center;gap:6px;margin:0 0 2px">' +
+        '<span id="tpSMSStatus" style="font-size:11px;color:#666">SMS: …</span>' +
+        '<button id="tpSMSOneBtn" type="button" style="margin-left:auto;padding:4px 8px;font-size:11px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;flex:0 0 auto">Aktivér</button>' +
+      '</div>';
 
-    document.body.appendChild(menu);
+    document.body.appendChild(panel);
+    const gearButton = panel.querySelector('#tpGearBtn');
+    let menu = null;
 
-    const inp  = menu.querySelector('#tpUserKeyMenu');
-    const save = menu.querySelector('#tpSaveUserKeyMenu');
-    const test = menu.querySelector('#tpTestPushover');
-    const chk  = menu.querySelector('#tpCheckUpdate');
+    function buildMenu() {
+      if (menu) return menu;
+      menu = document.createElement('div');
+      menu.id = 'tpMenu';
+      Object.assign(menu.style, {
+        position: 'fixed',
+        zIndex: 2147483647,
+        background: '#fff',
+        border: '1px solid #ccc',
+        borderRadius: '8px',
+        boxShadow: '0 10px 28px rgba(0,0,0,.20)',
+        padding: '10px',
+        width: '320px',
+        maxWidth: 'calc(100vw - 16px)',
+        maxHeight: '70vh',
+        overflow: 'auto',
+        display: 'none'
+      });
 
-    inp.value = getUserKey();
-    save.addEventListener('click', () => { GM_setValue('tpUserKey', (inp.value||'').trim()); showToast('USER-token gemt.'); });
-    inp.addEventListener('keydown', e => { if (e.key==='Enter'){ e.preventDefault(); GM_setValue('tpUserKey',(inp.value||'').trim()); showToast('USER-token gemt.'); }});
+      menu.innerHTML =
+        '<div style="font-weight:700;margin-bottom:6px">Indstillinger</div>' +
+        '<div style="margin-bottom:10px">' +
+          '<div style="font-weight:600;margin-bottom:4px">Pushover USER-token</div>' +
+          '<input id="tpUserKeyMenu" type="text" autocomplete="off" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:6px">' +
+          '<div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
+            '<button id="tpSaveUserKeyMenu" type="button" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Gem</button>' +
+            '<a href="https://pushover.net/" target="_blank" rel="noopener" style="color:#06c;text-decoration:none">Guide</a>' +
+          '</div>' +
+        '</div>' +
+        '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+          '<button id="tpTestPushover" type="button" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Test Pushover</button>' +
+          '<button id="tpCheckUpdate" type="button" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Tjek update</button>' +
+        '</div>' +
+        '<div style="margin-top:8px;font-size:11px;color:#666">Version: ' + TP_VERSION + '</div>';
 
-    test.addEventListener('click', () => { tpTestPushoverBoth(); toggleMenu(false); });
+      document.body.appendChild(menu);
+      const input = menu.querySelector('#tpUserKeyMenu');
+      input.value = getUserKey();
+      menu.querySelector('#tpSaveUserKeyMenu').addEventListener('click', () => {
+        GM_setValue('tpUserKey', String(input.value || '').trim());
+        showToast('USER-token gemt.');
+      });
+      input.addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        GM_setValue('tpUserKey', String(input.value || '').trim());
+        showToast('USER-token gemt.');
+      });
+      menu.querySelector('#tpTestPushover').addEventListener('click', () => {
+        tpTestPushoverBoth();
+        toggleMenu(false);
+      });
+      menu.querySelector('#tpCheckUpdate').addEventListener('click', async () => {
+        try {
+          const raw = await gmGET(SCRIPT_RAW_URL + '?t=' + Date.now());
+          const match = raw.match(/@version\s+([0-9.]+)/);
+          if (!match) {
+            showToast('Kunne ikke læse remote version.');
+            return;
+          }
+          const remote = match[1];
+          const comparison = compareVersions(remote, TP_VERSION);
+          if (comparison === 0) {
+            showToast('Du kører allerede nyeste version (' + remote + ').');
+          } else if (comparison > 0) {
+            showToast('Ny version tilgængelig: ' + remote + ' (du kører ' + TP_VERSION + '). Åbner…');
+            window.open(SCRIPT_RAW_URL, '_blank', 'noopener');
+          } else {
+            showToast('Din version ' + TP_VERSION + ' er nyere end den offentliggjorte ' + remote + '.');
+          }
+        } catch (error) {
+          console.warn('[TP][UPDATE]', error);
+          showToast('Update-tjek fejlede.');
+        }
+      });
+      return menu;
+    }
 
-    chk.addEventListener('click', async () => {
-      try {
-        const raw = await gmGET(SCRIPT_RAW_URL+'?t='+Date.now());
-        const m = raw.match(/@version\s+([0-9.]+)/);
-        if (!m) { showToast('Kunne ikke læse remote version.'); return; }
-        const remote = m[1];
-        if (remote === TP_VERSION) showToast('Du kører allerede nyeste version ('+remote+').');
-        else { showToast('Ny version tilgængelig: '+remote+' (du kører '+TP_VERSION+'). Starter…'); window.open(SCRIPT_RAW_URL, '_blank'); }
-      } catch(_) { showToast('Update-tjek fejlede.'); }
+    function positionMenu(element) {
+      const panelRect = panel.getBoundingClientRect();
+      const width = Math.min(element.offsetWidth || 320, window.innerWidth - 16);
+      const height = Math.min(element.offsetHeight || 260, Math.floor(window.innerHeight * .7));
+      let top = panelRect.top - height - 10;
+      let below = false;
+      if (top < 8) {
+        top = panelRect.bottom + 8;
+        below = true;
+      }
+      let left = panelRect.right - width;
+      if (left < 8) left = 8;
+      if (left + width > window.innerWidth - 8) left = window.innerWidth - 8 - width;
+      if (below && top + height > window.innerHeight - 8) {
+        top = Math.max(8, window.innerHeight - 8 - height);
+      }
+      Object.assign(element.style, {
+        left: left + 'px',
+        top: top + 'px',
+        right: 'auto',
+        bottom: 'auto',
+        display: 'block'
+      });
+    }
+
+    function toggleMenu(show) {
+      const element = buildMenu();
+      if (show === false) {
+        element.style.display = 'none';
+        return;
+      }
+      element.style.display = element.style.display === 'block' ? 'none' : 'block';
+      if (element.style.display !== 'block') return;
+      element.style.visibility = 'hidden';
+      positionMenu(element);
+      element.style.visibility = 'visible';
+      ensureFullyVisible(element);
+      const input = element.querySelector('#tpUserKeyMenu');
+      if (input) input.value = getUserKey();
+
+      const outside = event => {
+        if (element.style.display !== 'block') return cleanup();
+        if (element.contains(event.target) || event.target === gearButton) return;
+        element.style.display = 'none';
+        cleanup();
+      };
+      const escape = event => {
+        if (event.key !== 'Escape') return;
+        element.style.display = 'none';
+        cleanup();
+      };
+      function cleanup() {
+        document.removeEventListener('mousedown', outside, true);
+        document.removeEventListener('keydown', escape, true);
+      }
+      document.addEventListener('mousedown', outside, true);
+      document.addEventListener('keydown', escape, true);
+    }
+
+    gearButton.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleMenu();
     });
 
-    return menu;
+    const messageCheckbox = panel.querySelector('#tpEnableMsg');
+    const interestCheckbox = panel.querySelector('#tpEnableInt');
+    messageCheckbox.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
+    interestCheckbox.checked = localStorage.getItem('tpPushEnableInt') === 'true';
+    messageCheckbox.addEventListener('change', () => {
+      localStorage.setItem('tpPushEnableMsg', messageCheckbox.checked ? 'true' : 'false');
+    });
+    interestCheckbox.addEventListener('change', () => {
+      localStorage.setItem('tpPushEnableInt', interestCheckbox.checked ? 'true' : 'false');
+    });
+
+    initMailPushControls(panel);
+    makeDraggable(panel, '#tpHeader');
+    loadPanelPosition(panel);
+    initSMSControls(panel);
+
+    const messageState = loadJson(ST_MSG_KEY, getDefaultMessageState());
+    const interestState = loadJson(ST_INT_KEY, getDefaultInterestState());
+    setBadge(panel.querySelector('#tpMsgCountBadge'), messageState.total);
+    setBadge(panel.querySelector('#tpIntCountBadge'), interestState.total);
   }
 
-  function positionMenu(menu) {
-    const pr = d.getBoundingClientRect();
-    const mw = Math.min(menu.offsetWidth || 320, window.innerWidth - 16);
-    const mh = Math.min(menu.offsetHeight || 260, Math.floor(window.innerHeight * 0.7));
-    let top = pr.top - mh - 10;
-    let below = false;
-    if (top < 8) { top = pr.bottom + 8; below = true; }
-    let left = pr.right - mw;
-    if (left < 8) left = 8;
-    if (left + mw > window.innerWidth - 8) left = window.innerWidth - 8 - mw;
-    if (below && top + mh > window.innerHeight - 8) top = Math.max(8, window.innerHeight - 8 - mh);
-    Object.assign(menu.style, { left:left+'px', top:top+'px', right:'auto', bottom:'auto', display:'block', maxWidth:'calc(100vw - 16px)', maxHeight:'70vh' });
+  function makeDraggable(element, handleSelector) {
+    const handle = handleSelector ? element.querySelector(handleSelector) : element;
+    if (!handle) return;
+    handle.style.cursor = 'move';
+    handle.style.userSelect = 'none';
+    let drag = null;
+
+    handle.addEventListener('mousedown', event => {
+      if (event.button !== 0) return;
+      if (event.target?.closest?.('button,input,select,textarea,a')) return;
+      const rect = element.getBoundingClientRect();
+      drag = { dx: event.clientX - rect.left, dy: event.clientY - rect.top };
+      event.preventDefault();
+    });
+    document.addEventListener('mousemove', event => {
+      if (!drag) return;
+      const x = Math.min(window.innerWidth - element.offsetWidth - 8, Math.max(8, event.clientX - drag.dx));
+      const y = Math.min(window.innerHeight - element.offsetHeight - 8, Math.max(8, event.clientY - drag.dy));
+      element.style.left = x + 'px';
+      element.style.top = y + 'px';
+      element.style.right = 'auto';
+      element.style.bottom = 'auto';
+      saveJson(POS_KEY, { x, y });
+    });
+    document.addEventListener('mouseup', () => { drag = null; });
+    window.addEventListener('resize', clampPanelIntoView);
   }
 
-  function toggleMenu(show) {
-    const mnu = buildMenu();
-    if (show === false) { mnu.style.display = 'none'; return; }
-    mnu.style.display = (mnu.style.display === 'block' ? 'none' : 'block');
-    if (mnu.style.display === 'block') {
-      mnu.style.visibility = 'hidden';
-      positionMenu(mnu); mnu.style.visibility = 'visible';
-      ensureFullyVisible(mnu);
-      const inp  = mnu.querySelector('#tpUserKeyMenu');
-      if (inp) inp.value = getUserKey();
+  function clampPanelIntoView() {
+    const panel = document.getElementById('tpPanel');
+    if (!panel) return;
+    const rect = panel.getBoundingClientRect();
+    const maxX = Math.max(8, window.innerWidth - panel.offsetWidth - 8);
+    const maxY = Math.max(8, window.innerHeight - panel.offsetHeight - 8);
+    const x = Math.min(maxX, Math.max(8, rect.left));
+    const y = Math.min(maxY, Math.max(8, rect.top));
+    panel.style.left = x + 'px';
+    panel.style.top = y + 'px';
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+    saveJson(POS_KEY, { x, y });
+  }
 
-      // klik udenfor → luk
-      const outside = (e) => {
-        if (!mnu || mnu.style.display !== 'block') return cleanup();
-        if (e.target === mnu || mnu.contains(e.target) || e.target === gearBtn) return;
-        mnu.style.display = 'none'; cleanup();
+  function ensureFullyVisible(element, margin = 8) {
+    if (!element) return;
+    const rect = element.getBoundingClientRect();
+    let left = rect.left;
+    let top = rect.top;
+    if (left < margin) left = margin;
+    if (top < margin) top = margin;
+    if (left + rect.width > window.innerWidth - margin) {
+      left = Math.max(margin, window.innerWidth - margin - rect.width);
+    }
+    if (top + rect.height > window.innerHeight - margin) {
+      top = Math.max(margin, window.innerHeight - margin - rect.height);
+    }
+    element.style.position = 'fixed';
+    element.style.left = left + 'px';
+    element.style.top = top + 'px';
+    element.style.right = 'auto';
+    element.style.bottom = 'auto';
+  }
+
+  // SMS-blokken er bevidst bevaret tæt på den fungerende 7.11.9-version.
+  function hasDisplayBlock(element) {
+    if (!element) return false;
+    const style = (element.getAttribute('style') || '').replace(/\s+/g, '').toLowerCase();
+    if (style.includes('display:none')) return false;
+    if (style.includes('display:block')) return true;
+    return false;
+  }
+
+  function parseSmsStatusFromDoc(doc) {
+    const activeElement = doc.getElementById('sms_notifikation_aktiv');
+    const inactiveElement = doc.getElementById('sms_notifikation_ikke_aktiv');
+    const activeShown = hasDisplayBlock(activeElement);
+    const inactiveShown = hasDisplayBlock(inactiveElement);
+    const hasDeactivateLink = !!(
+      doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]')
+      || doc.querySelector('#sms_notifikation_aktiv a[href*="deactivate_cell_sms_notifikationer"]')
+    );
+    const hasActivateLink = !!(
+      doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]')
+      || doc.querySelector('#sms_notifikation_ikke_aktiv a[href*="activate_cell_sms_notifikationer"]')
+    );
+    let state = 'unknown';
+    let phone = '';
+    if (activeShown || (!inactiveShown && hasDeactivateLink && !hasActivateLink)) state = 'active';
+    else if (inactiveShown || (!activeShown && hasActivateLink && !hasDeactivateLink)) state = 'inactive';
+    const referenceText = state === 'active'
+      ? (activeElement?.textContent || '')
+      : (inactiveElement?.textContent || '');
+    const match = referenceText.replace(/\u00a0/g, ' ').match(/\+?\d[\d\s]{5,}/);
+    if (match) phone = match[0].replace(/\s+/g, '');
+    return { state, phone };
+  }
+
+  function parseSmsStatusFromHTML(html) {
+    return parseSmsStatusFromDoc(parseHtml(html));
+  }
+
+  async function fetchSmsStatusHTML() {
+    return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now());
+  }
+
+  async function getSmsStatus() {
+    try {
+      return parseSmsStatusFromHTML(await fetchSmsStatusHTML());
+    } catch (_) {
+      return { state: 'unknown' };
+    }
+  }
+
+  function hardenSmsIframe(iframe) {
+    try {
+      const frameWindow = iframe.contentWindow;
+      const frameDocument = iframe.contentDocument;
+      if (!frameWindow || !frameDocument) return;
+      frameWindow.open = () => null;
+      frameWindow.alert = () => {};
+      frameWindow.confirm = () => true;
+      frameDocument.addEventListener('click', event => {
+        const link = event.target.closest?.('a');
+        if (!link) return;
+        event.preventDefault();
+        event.stopPropagation();
+        return false;
+      }, true);
+    } catch (_) {}
+  }
+
+  async function ensureSmsFrameLoaded() {
+    let iframe = document.getElementById('tpSmsFrame');
+    if (!iframe) {
+      iframe = document.createElement('iframe');
+      iframe.id = 'tpSmsFrame';
+      Object.assign(iframe.style, {
+        position: 'fixed',
+        left: '-10000px',
+        top: '-10000px',
+        width: '1px',
+        height: '1px',
+        opacity: '0',
+        pointerEvents: 'none',
+        border: '0'
+      });
+      document.body.appendChild(iframe);
+    }
+    const loadOnce = () => new Promise(resolve => {
+      iframe.onload = () => {
+        hardenSmsIframe(iframe);
+        resolve();
       };
-      const esc = (e) => { if (e.key === 'Escape') { if (mnu) mnu.style.display='none'; cleanup(); } };
-      function cleanup(){ document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', esc, true); }
-      document.addEventListener('mousedown', outside, true);
-      document.addEventListener('keydown', esc, true);
+    });
+    const wantUrl = SMS_SETTINGS_URL;
+    if (iframe.src !== wantUrl) {
+      iframe.src = wantUrl;
+      await loadOnce();
+    } else if (!iframe.contentWindow || !iframe.contentDocument || !iframe.contentDocument.body) {
+      iframe.src = wantUrl;
+      await loadOnce();
+    } else {
+      hardenSmsIframe(iframe);
     }
+    return iframe;
   }
 
-  gearBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); toggleMenu(); });
-
-  // toggles
-  const msg = d.querySelector('#tpEnableMsg');
-  const intr = d.querySelector('#tpEnableInt');
-  msg.checked = localStorage.getItem('tpPushEnableMsg') === 'true';
-  intr.checked = localStorage.getItem('tpPushEnableInt') === 'true';
-  msg.onchange = () => localStorage.setItem('tpPushEnableMsg', msg.checked ? 'true' : 'false');
-  intr.onchange = () => localStorage.setItem('tpPushEnableInt', intr.checked ? 'true' : 'false');
-
-  makeDraggable(d, POS_KEY, '#tpHeader');
-
-  // **Always start bottom-right (still draggable)**
-  d.style.bottom = '12px';
-  d.style.right  = '8px';
-  d.style.top    = 'auto';
-  d.style.left   = 'auto';
-
-  // SMS UI
-  initSMSControls(d);
-
-  // initial badges
-  setBadge(document.getElementById('tpMsgCountBadge'), Number(loadJson(ST_MSG_KEY,{count:0}).count||0));
-  setBadge(document.getElementById('tpIntCountBadge'), Number(loadJson(ST_INT_KEY,{count:0}).count||0));
-}
-
-function makeDraggable(el, storageKey, handleSelector) {
-  const handle = handleSelector ? el.querySelector(handleSelector) : el;
-  if (!handle) return;
-  handle.style.cursor = 'move'; handle.style.userSelect = 'none';
-
-  let drag = null;
-  handle.addEventListener('mousedown', (e) => {
-    if (e.button !== 0) return;
-    if (e.target && e.target.closest && e.target.closest('button,input,select,textarea,a')) return; // ikke drag på UI controls
-    const r = el.getBoundingClientRect();
-    drag = { dx: e.clientX - r.left, dy: e.clientY - r.top };
-    e.preventDefault();
-  });
-  document.addEventListener('mousemove', (e) => {
-    if (!drag) return;
-    const x = Math.min(window.innerWidth - el.offsetWidth - 8, Math.max(8, e.clientX - drag.dx));
-    const y = Math.min(window.innerHeight - el.offsetHeight - 8, Math.max(8, e.clientY - drag.dy));
-    el.style.position='fixed';
-    el.style.left = x + 'px'; el.style.top = y + 'px';
-    el.style.right='auto'; el.style.bottom='auto';
-    savePos(x, y);
-  });
-  document.addEventListener('mouseup', () => drag = null);
-  window.addEventListener('resize', clampPanelIntoView);
-}
-function savePos(x, y){ localStorage.setItem(POS_KEY, JSON.stringify({ x, y })); }
-function clampPanelIntoView(){
-  const d = document.getElementById('tpPanel'); if (!d) return;
-  const r = d.getBoundingClientRect();
-  let x = r.left, y = r.top;
-  const maxX = window.innerWidth - d.offsetWidth - 8;
-  const maxY = window.innerHeight - d.offsetHeight - 8;
-  if (x > maxX) x = maxX;
-  if (y > maxY) y = maxY;
-  if (x < 8) x = 8;
-  if (y < 8) y = 8;
-  d.style.left = x + 'px'; d.style.top = y + 'px';
-  d.style.right='auto'; d.style.bottom='auto';
-  savePos(x, y);
-}
-function ensureFullyVisible(el, margin = 8) {
-  if (!el) return;
-  const r = el.getBoundingClientRect();
-  let left = r.left, top = r.top;
-  const w = r.width, h = r.height;
-  if (left < margin) left = margin;
-  if (top  < margin) top  = margin;
-  if (left + w > window.innerWidth  - margin) left = Math.max(margin, window.innerWidth  - margin - w);
-  if (top  + h > window.innerHeight - margin) top = Math.max(margin, window.innerHeight - margin - h);
-  el.style.position = 'fixed';
-  el.style.left = left + 'px';
-  el.style.top  = top  + 'px';
-  el.style.right  = 'auto';
-  el.style.bottom = 'auto';
-}
-
-/* Badges */
-function badgePulse(el){
-  if (!el) return;
-  el.animate([{ transform:'scale(1)', offset:0 }, { transform:'scale(1.12)', offset:.35 }, { transform:'scale(1)', offset:1 }], { duration:320, easing:'ease-out' });
-}
-
-/*──────── 13) SMS (status + én knap toggle via iframe) ────────*/
-const SMS_SETTINGS_URL = `${location.origin}/index.php?page=showmy_settings`;
-function hasDisplayBlock(el) {
-  if (!el) return false;
-  const s = (el.getAttribute('style') || '').replace(/\s+/g,'').toLowerCase();
-  if (s.includes('display:none'))  return false;
-  if (s.includes('display:block')) return true;
-  return false;
-}
-function parseSmsStatusFromDoc(doc) {
-  const elAktiv   = doc.getElementById('sms_notifikation_aktiv');
-  const elInaktiv = doc.getElementById('sms_notifikation_ikke_aktiv');
-  const aktivShown   = hasDisplayBlock(elAktiv);
-  const inaktivShown = hasDisplayBlock(elInaktiv);
-  const hasDeactivateLink = !!(doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_aktiv a[href*="deactivate_cell_sms_notifikationer"]'));
-  const hasActivateLink   = !!(doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_ikke_aktiv a[href*="activate_cell_sms_notifikationer"]'));
-  let state = 'unknown', phone = '';
-  if (aktivShown || (!inaktivShown && hasDeactivateLink && !hasActivateLink)) state = 'active';
-  else if (inaktivShown || (!aktivShown && hasActivateLink && !hasDeactivateLink)) state = 'inactive';
-  const refTxt = state === 'active' ? (elAktiv?.textContent || '') : (elInaktiv?.textContent || '');
-  const m = refTxt.replace(/\u00A0/g,' ').match(/\+?\d[\d\s]{5,}/);
-  if (m) phone = m[0].replace(/\s+/g,'');
-  return { state, phone };
-}
-function parseSmsStatusFromHTML(html) { return parseSmsStatusFromDoc(new DOMParser().parseFromString(html, 'text/html')); }
-async function fetchSmsStatusHTML() { return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now()); }
-async function getSmsStatus() { try { return parseSmsStatusFromHTML(await fetchSmsStatusHTML()); } catch { return { state: 'unknown' }; } }
-function hardenSmsIframe(ifr){
-  try {
-    const w=ifr.contentWindow, d=ifr.contentDocument;
-    if(!w||!d) return;
-    w.open=()=>null; w.alert=()=>{}; w.confirm=()=>true;
-    d.addEventListener('click',ev=>{
-      const a=ev.target.closest&&ev.target.closest('a');
-      if(!a) return;
-      ev.preventDefault(); ev.stopPropagation(); return false;
-    },true);
-  } catch(_){}
-}
-async function ensureSmsFrameLoaded() {
-  let ifr = document.getElementById('tpSmsFrame');
-  if (!ifr) {
-    ifr = document.createElement('iframe');
-    ifr.id = 'tpSmsFrame';
-    Object.assign(ifr.style, { position:'fixed', left:'-10000px', top:'-10000px', width:'1px', height:'1px', opacity:'0', pointerEvents:'none', border:'0' });
-    document.body.appendChild(ifr);
-  }
-  const loadOnce = () => new Promise(res => { ifr.onload = () => { hardenSmsIframe(ifr); res(); }; });
-  const wantUrl = SMS_SETTINGS_URL;
-  if (ifr.src !== wantUrl) { ifr.src = wantUrl; await loadOnce(); }
-  else if (!ifr.contentWindow || !ifr.contentDocument || !ifr.contentDocument.body) { ifr.src = wantUrl; await loadOnce(); }
-  else hardenSmsIframe(ifr);
-  return ifr;
-}
-function getIframeStatus(ifr) { try { return parseSmsStatusFromDoc(ifr.contentDocument); } catch { return { state:'unknown' }; } }
-function invokeIframeAction(ifr, wantOn) {
-  const win = ifr.contentWindow, doc = ifr.contentDocument;
-  try {
-    if (wantOn && typeof win.activate_cell_sms_notifikationer === 'function') { win.activate_cell_sms_notifikationer(); return true; }
-    if (!wantOn && typeof win.deactivate_cell_sms_notifikationer === 'function') { win.deactivate_cell_sms_notifikationer(); return true; }
-  } catch(_) {}
-  try {
-    const link = wantOn
-      ? (doc.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_ikke_aktiv a'))
-      : (doc.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') || doc.querySelector('#sms_notifikation_aktiv a'));
-    if (link) { link.click(); return true; }
-  } catch(_) {}
-  return false;
-}
-async function toggleSmsInIframe(wantOn, timeoutMs=15000, pollMs=500) {
-  const ifr = await ensureSmsFrameLoaded();
-  let st0 = getIframeStatus(ifr);
-  if ((wantOn && st0.state === 'active') || (!wantOn && st0.state === 'inactive')) return st0;
-  const invoked = invokeIframeAction(ifr, wantOn);
-  if (!invoked) throw new Error('Kan ikke udløse aktivering/deaktivering i iframe.');
-  const maybeReloaded = new Promise(res => { let done=false; ifr.addEventListener('load', () => { if (!done){ done=true; res(); } }, { once:true }); setTimeout(() => { if (!done) res(); }, 1200); });
-  await maybeReloaded;
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
-    const st = getIframeStatus(ifr);
-    if (wantOn && st.state === 'active') return st;
-    if (!wantOn && st.state === 'inactive') return st;
-    await new Promise(r => setTimeout(r, pollMs));
-  }
-  const reload = () => new Promise(res => { ifr.onload = () => res(); ifr.src = SMS_SETTINGS_URL + '&ts=' + Date.now(); });
-  await reload();
-  return getIframeStatus(ifr);
-}
-const sms = {
-  _busy: false,
-  _last: null,
-  async refresh(cb) { const st = await getSmsStatus(); this._last = st; cb && cb(st); },
-  async setEnabled(wantOn, uiBusy, cb) {
-    if (this._busy) return;
-    this._busy = true;
-    uiBusy && uiBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
+  function getIframeStatus(iframe) {
     try {
-      const st = await toggleSmsInIframe(wantOn, 15000, 500);
-      this._last = st; cb && cb(st);
-    } catch (e) {
-      console.warn('[TP][SMS] setEnabled error', e);
-      const st = await getSmsStatus(); this._last = st; cb && cb(st);
-    } finally {
-      this._busy = false; uiBusy && uiBusy(false);
+      return parseSmsStatusFromDoc(iframe.contentDocument);
+    } catch (_) {
+      return { state: 'unknown' };
     }
   }
-};
-function initSMSControls(root){
-  const lbl   = root.querySelector('#tpSMSStatus');
-  const btn   = root.querySelector('#tpSMSOneBtn');
-  function setBusy(on, text){ btn.disabled = on; btn.style.opacity = on ? .6 : 1; if (on && text) lbl.textContent = text; }
-  function paint(st){
-    switch (st.state) {
-      case 'active':   btn.textContent = 'Deaktiver'; lbl.textContent = 'SMS: Aktiv'   + (st.phone ? ' — ' + st.phone : ''); lbl.style.color='#0a7a35'; break;
-      case 'inactive': btn.textContent = 'Aktivér';   lbl.textContent = 'SMS: Ikke aktiv' + (st.phone ? ' — ' + st.phone : ''); lbl.style.color='#a33'; break;
-      default:         btn.textContent = 'Aktivér';   lbl.textContent = 'SMS: Ukendt'; lbl.style.color='#666';
-    }
-  }
-  btn.addEventListener('click', async () => {
-    const wantOn = (sms._last?.state !== 'active');
-    setBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
-    await sms.setEnabled(wantOn, setBusy, paint);
-  });
-  (async()=>{ setBusy(true,'indlæser…'); await sms.refresh(paint); setBusy(false); })();
-}
 
-
-/* Test-knap */
-function tpTestPushoverBoth(){
-  const userKey = getUserKey();
-  if (!userKey) { showToast('Indsæt din USER-token i ⚙️-menuen før test.'); return; }
-  const ts = new Date().toLocaleTimeString();
-  sendPushover('🧪 [TEST] Besked-kanal OK — ' + ts);
-  setTimeout(() => sendPushover('🧪 [TEST] Interesse-kanal OK — ' + ts), 800);
-  showToast('Sendte Pushover-test. Tjek Pushover.');
-}
-
-/*──────── 14) STARTUP ────────*/
-// UI
-injectUI();
-
-// Leader liv, men ikke afgørende længere
-tryBecomeLeader();
-setInterval(heartbeatIfLeader, HEARTBEAT_MS);
-setInterval(tryBecomeLeader, HEARTBEAT_MS + 1200);
-
-// Pollers kører i ALLE faner (dup-beskyttet via lock/pending/once)
-function doPoll() { pollMessages(); pollInterest(); }
-doPoll();
-setInterval(doPoll, POLL_MS);
-
-// Ekstra: poll lige når man vender tilbage til tab (hurtig catch-up)
-document.addEventListener('visibilitychange', () => { if (!document.hidden) doPoll(); });
-
-/*──────── 15) HOVER / “Intet Svar” auto (beholdt) ────────*/
-(function(){
-  let auto = false;
-  const OBS = new MutationObserver(() => {
-    if (auto) return;
-    const hsWrap = document.querySelector('#highslide-wrapper-0');
-    if (!hsWrap) return;
-
-    const btn = hsWrap.querySelector('input[type="button"][value*="Intet"]');
-    if (!btn) return;
-
-    auto = true;
+  function invokeIframeAction(iframe, wantOn) {
+    const frameWindow = iframe.contentWindow;
+    const frameDocument = iframe.contentDocument;
     try {
-      hsWrap.style.transition = 'opacity .15s, transform .15s';
-      hsWrap.style.opacity = '0.35';
-      hsWrap.style.pointerEvents = 'none';
-      hsWrap.style.transform = 'scale(.99)';
-    } catch(_) {}
+      if (wantOn && typeof frameWindow.activate_cell_sms_notifikationer === 'function') {
+        frameWindow.activate_cell_sms_notifikationer();
+        return true;
+      }
+      if (!wantOn && typeof frameWindow.deactivate_cell_sms_notifikationer === 'function') {
+        frameWindow.deactivate_cell_sms_notifikationer();
+        return true;
+      }
+    } catch (_) {}
+    try {
+      const link = wantOn
+        ? (frameDocument.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') || frameDocument.querySelector('#sms_notifikation_ikke_aktiv a'))
+        : (frameDocument.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') || frameDocument.querySelector('#sms_notifikation_aktiv a'));
+      if (link) {
+        link.click();
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
 
-    setTimeout(() => {
-      try { btn.click(); } catch (_) {}
-      setTimeout(() => {
-        const saveBtn = hsWrap.querySelector('input[type="submit"], button[type="submit"], input[value*="Gem"]');
-        if (saveBtn) {
-          setTimeout(function () {
-            try { saveBtn.click(); } catch (_) {}
-            try { if ((unsafeWindow && unsafeWindow.hs && unsafeWindow.hs.close)) unsafeWindow.hs.close(); } catch (_) {}
-            if (hsWrap) { setTimeout(()=>{ hsWrap.style.opacity = ''; hsWrap.style.pointerEvents = ''; hsWrap.style.transform=''; }, 120); }
-          }, 30);
+  async function toggleSmsInIframe(wantOn, timeoutMs = 15000, pollMs = 500) {
+    const iframe = await ensureSmsFrameLoaded();
+    const initialStatus = getIframeStatus(iframe);
+    if ((wantOn && initialStatus.state === 'active') || (!wantOn && initialStatus.state === 'inactive')) {
+      return initialStatus;
+    }
+    if (!invokeIframeAction(iframe, wantOn)) {
+      throw new Error('Kan ikke udløse aktivering/deaktivering i iframe.');
+    }
+    const maybeReloaded = new Promise(resolve => {
+      let done = false;
+      iframe.addEventListener('load', () => {
+        if (!done) {
+          done = true;
+          resolve();
         }
-        auto = false;
-      }, 120);
-    }, 30);
+      }, { once: true });
+      setTimeout(() => {
+        if (!done) resolve();
+      }, 1200);
+    });
+    await maybeReloaded;
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const status = getIframeStatus(iframe);
+      if (wantOn && status.state === 'active') return status;
+      if (!wantOn && status.state === 'inactive') return status;
+      await sleep(pollMs);
+    }
+    const reload = () => new Promise(resolve => {
+      iframe.onload = () => resolve();
+      iframe.src = SMS_SETTINGS_URL + '&ts=' + Date.now();
+    });
+    await reload();
+    return getIframeStatus(iframe);
+  }
+
+  const sms = {
+    _busy: false,
+    _last: null,
+    async refresh(callback) {
+      const status = await getSmsStatus();
+      this._last = status;
+      if (callback) callback(status);
+    },
+    async setEnabled(wantOn, uiBusy, callback) {
+      if (this._busy) return;
+      this._busy = true;
+      if (uiBusy) uiBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
+      try {
+        const status = await toggleSmsInIframe(wantOn, 15000, 500);
+        this._last = status;
+        if (callback) callback(status);
+      } catch (error) {
+        console.warn('[TP][SMS] setEnabled error', error);
+        const status = await getSmsStatus();
+        this._last = status;
+        if (callback) callback(status);
+      } finally {
+        this._busy = false;
+        if (uiBusy) uiBusy(false);
+      }
+    }
+  };
+
+  function initSMSControls(root) {
+    const label = root.querySelector('#tpSMSStatus');
+    const button = root.querySelector('#tpSMSOneBtn');
+    function setBusy(on, text) {
+      button.disabled = on;
+      button.style.opacity = on ? .6 : 1;
+      if (on && text) label.textContent = text;
+    }
+    function paint(status) {
+      switch (status.state) {
+        case 'active':
+          button.textContent = 'Deaktiver';
+          label.textContent = 'SMS: Aktiv' + (status.phone ? ' - ' + status.phone : '');
+          label.style.color = '#0a7a35';
+          break;
+        case 'inactive':
+          button.textContent = 'Aktivér';
+          label.textContent = 'SMS: Ikke aktiv' + (status.phone ? ' - ' + status.phone : '');
+          label.style.color = '#a33';
+          break;
+        default:
+          button.textContent = 'Aktivér';
+          label.textContent = 'SMS: Ukendt';
+          label.style.color = '#666';
+      }
+    }
+    button.addEventListener('click', async () => {
+      const wantOn = sms._last?.state !== 'active';
+      setBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
+      await sms.setEnabled(wantOn, setBusy, paint);
+    });
+    (async () => {
+      setBusy(true, 'indlæser…');
+      await sms.refresh(paint);
+      setBusy(false);
+    })();
+  }
+
+  function tpTestPushoverBoth() {
+    if (!getUserKey()) {
+      showToast('Indsæt din USER-token i indstillingerne før test.');
+      return;
+    }
+    const time = new Date().toLocaleTimeString();
+    sendPushover('Besked-kanal OK - ' + time, '[TEST] Temponizer besked');
+    setTimeout(() => sendPushover('Interesse-kanal OK - ' + time, '[TEST] Temponizer interesse'), 800);
+    showToast('Sendte Pushover-test. Tjek Pushover.');
+  }
+
+  function migrateUserKeyToGM() {
+    try {
+      const gmValue = String(GM_getValue('tpUserKey') || '').trim();
+      if (gmValue) return;
+      const localValue = String(localStorage.getItem('tpUserKey') || '').trim();
+      if (localValue) {
+        GM_setValue('tpUserKey', localValue);
+        localStorage.removeItem('tpUserKey');
+      }
+    } catch (_) {}
+  }
+
+  function initQuickNoAnswer() {
+    let auto = false;
+    const observer = new MutationObserver(() => {
+      if (auto) return;
+      const highslideWrapper = document.querySelector('#highslide-wrapper-0');
+      if (!highslideWrapper) return;
+      const noAnswerButton = highslideWrapper.querySelector('input[type="button"][value*="Intet"]');
+      if (!noAnswerButton) return;
+
+      auto = true;
+      try {
+        highslideWrapper.style.transition = 'opacity .15s, transform .15s';
+        highslideWrapper.style.opacity = '0.35';
+        highslideWrapper.style.pointerEvents = 'none';
+        highslideWrapper.style.transform = 'scale(.99)';
+      } catch (_) {}
+
+      setTimeout(() => {
+        try { noAnswerButton.click(); } catch (_) {}
+        setTimeout(() => {
+          const saveButton = highslideWrapper.querySelector('input[type="submit"], button[type="submit"], input[value*="Gem"]');
+          if (saveButton) {
+            setTimeout(() => {
+              try { saveButton.click(); } catch (_) {}
+              try {
+                if (typeof unsafeWindow !== 'undefined' && unsafeWindow.hs?.close) unsafeWindow.hs.close();
+              } catch (_) {}
+              setTimeout(() => {
+                highslideWrapper.style.opacity = '';
+                highslideWrapper.style.pointerEvents = '';
+                highslideWrapper.style.transform = '';
+              }, 120);
+            }, 30);
+          }
+          auto = false;
+        }, 120);
+      }, 30);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function startPolling() {
+    heartbeatLeadership();
+    pollMessages();
+    pollInterest();
+
+    setInterval(() => {
+      const wasLeader = isLeader();
+      const leaderNow = heartbeatLeadership();
+      if (!wasLeader && leaderNow) {
+        pollMessages();
+        pollInterest();
+      }
+    }, HEARTBEAT_MS);
+    setInterval(pollMessages, MESSAGE_POLL_MS);
+    setInterval(pollInterest, INTEREST_POLL_MS);
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        if (isLeader()) writeLeadership();
+        return;
+      }
+      tryBecomeLeader(true);
+      pollMessages();
+      pollInterest();
+      refreshMailPushSetting();
+    });
+
+    window.addEventListener('beforeunload', () => {
+      const leader = getLeader();
+      if (leader?.id === TAB_ID) {
+        try { localStorage.removeItem(LEADER_KEY); } catch (_) {}
+      }
+    });
+  }
+
+  function startRuntime() {
+    migrateUserKeyToGM();
+    initToastBroadcast();
+    injectUI();
+    initQuickNoAnswer();
+    startPolling();
+  }
+
+  const TEST_API = Object.freeze({
+    TP_VERSION,
+    parseNullableCount,
+    parseMessageCounters,
+    compareVersions,
+    normalizeText,
+    truncateText,
+    parseMessageIndexHTML,
+    parseSidebarPreviews,
+    parseOpenThreadPreview,
+    enrichMessageRecords,
+    buildMessageRecordMap,
+    messageRecordSignature,
+    recordsToMap,
+    countUnreadMessageThreads,
+    isIncomingMessageRecord,
+    countIncomingUnreadThreads,
+    hasUnresolvedGeneralDirection,
+    resolveMessageCounterTotal,
+    messageEventId,
+    pruneSeenMessageEvents,
+    rememberMessageRecords,
+    carryForwardMessageDetails,
+    diffMessageThreads,
+    mergePendingEvents,
+    prunePendingMessageEvents,
+    parseTopMenuMessageCount,
+    stripCustomerNumber,
+    parseInterestOverviewHTML,
+    parseInterestDetailHTML,
+    entriesToMap,
+    diffInterestPairs,
+    prunePendingInterestEvents,
+    formatMessageNotification,
+    formatInterestNotification,
+    mapLimit,
+    withLocalStorageMutex,
+    withCrossTabProcessLock,
+    takeChannelLock,
+    parseSmsStatusFromHTML,
+    fetchMessageSnapshot,
+    refreshMessageEnrichmentIfNeeded,
+    processMessageSnapshot,
+    processInterestSnapshot,
+    constants: Object.freeze({
+      ST_MSG_KEY,
+      ST_INT_KEY,
+      SUPPRESS_MS,
+      MESSAGE_POLL_MS,
+      INTEREST_POLL_MS,
+      HEARTBEAT_MS,
+      LEASE_MS,
+      MSG_GENERAL_LIST_URL: MSG_LIST_URLS.generel
+    })
   });
-  OBS.observe(document.body, { childList: true, subtree: true });
+
+  if (IS_TEST) {
+    globalThis.__TP_TEST_API__ = TEST_API;
+    return;
+  }
+
+  if (document.body) startRuntime();
+  else window.addEventListener('DOMContentLoaded', startRuntime, { once: true });
 })();
