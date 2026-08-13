@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.5
+// @version      7.14.6
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, "Intet svar", vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -22,7 +22,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.5';
+  const TP_VERSION = '7.14.6';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -3252,9 +3252,21 @@
     return matches.length === 1 ? 'found' : matches.length > 1 ? 'multiple' : 'not-found';
   }
 
-  function formatAuthorizationDate(value) {
+  function isMeaningfulAuthorizationDate(value) {
     const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
-    return match ? [match[3], match[2], match[1]].join('.') : 'Ikke oplyst';
+    if (!match) return false;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    if (year < 1800 || year > 2999) return false;
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+  }
+
+  function formatAuthorizationDate(value) {
+    if (!isMeaningfulAuthorizationDate(value)) return 'Ikke oplyst';
+    const match = String(value).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    return [match[3], match[2], match[1]].join('.');
   }
 
   function getAuthorizationSpecialities(record) {
@@ -3278,7 +3290,8 @@
   }
 
   function isTemporaryAuthorization(record) {
-    return Boolean(record?.TempAuthorizationBegin || record?.TempAuthorizationEnd);
+    return isMeaningfulAuthorizationDate(record?.TempAuthorizationBegin) ||
+      isMeaningfulAuthorizationDate(record?.TempAuthorizationEnd);
   }
 
   function getAuthorizationType(record) {
@@ -3554,7 +3567,7 @@
       appendAuthorizationDetail(details, 'Autorisationsdato', formatAuthorizationDate(record.AuthorizationDate));
       appendAuthorizationDetail(details, 'Faggruppe', normalizeText(record.ProfessionCodeName) || options.profile?.professionLabel || 'Ikke oplyst');
       appendAuthorizationDetail(details, 'Type', getAuthorizationType(record));
-      if (isTemporaryAuthorization(record)) {
+      if (isMeaningfulAuthorizationDate(record.TempAuthorizationEnd)) {
         appendAuthorizationDetail(details, 'Gyldig til', formatAuthorizationDate(record.TempAuthorizationEnd));
       }
       appendAuthorizationDetail(details, 'Specialisering', getAuthorizationSpecialities(record));
@@ -4062,6 +4075,7 @@
     buildAuthorizationLookupURL,
     getAuthorizationLookupMatches,
     parseAuthorizationLookupResponse,
+    isMeaningfulAuthorizationDate,
     formatAuthorizationDate,
     getAuthorizationSpecialities,
     getAuthorizationType,
