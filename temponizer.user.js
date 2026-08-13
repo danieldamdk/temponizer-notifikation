@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.13.7
+// @version      7.13.8
 // @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status, SMS, "Intet svar" og kompakt vikaroverblik ved profilbilleder.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.13.7';
+  const TP_VERSION = '7.13.8';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -76,7 +76,7 @@
   const TOAST_EVT_KEY = 'tpToastEventV2';
   const QUICK_NO_ANSWER_TEXT = 'Intet Svar';
   const QUICK_NO_ANSWER_LINK_SELECTOR = 'a[onclick*="RingVikarOp("]';
-  const WORKER_HOVER_CACHE_KEY = 'tpWorkerHoverCacheV1';
+  const WORKER_HOVER_CACHE_KEY = 'tpWorkerHoverCacheV2';
   const WORKER_ROW_SELECTOR = 'tr[id^="row_"]';
   const WORKER_SICK_COLOR = '#b32727';
   const WORKER_WITHDRAWN_COLOR = '#1736e6';
@@ -110,7 +110,7 @@
     const text = normalizeText(value);
     if (text.length <= maxLength) return text;
     if (maxLength <= 1) return text.slice(0, maxLength);
-    return text.slice(0, maxLength - 1).trimEnd() + '…';
+    return text.slice(0, maxLength - 1).trimEnd() + 'â€¦';
   }
 
   function clampInteger(value, fallback = 0) {
@@ -183,10 +183,17 @@
 
   function parseWorkerProfileHTML(html) {
     const doc = parseHtml(html);
-    const paidTab = doc.querySelector('#loenudbetalt_link');
+    const completedTabs = [
+      doc.querySelector('#afholdtikkegodkendt_link'),
+      doc.querySelector('#afholdtgodkendt_link'),
+      doc.querySelector('#loenudbetalt_link')
+    ];
+    const completedCounts = completedTabs.map(tab => tab ? parseLabelCount(tab.textContent, true) : null);
     const complaintTab = doc.querySelector('#klager_link');
     return {
-      paidShifts: paidTab ? parseLabelCount(paidTab.textContent, true) : null,
+      totalCompletedShifts: completedCounts.every(Number.isInteger)
+        ? completedCounts.reduce((sum, count) => sum + count, 0)
+        : null,
       complaints: complaintTab ? parseLabelCount(complaintTab.textContent, true) : null
     };
   }
@@ -649,7 +656,7 @@
   function stripCustomerNumber(value) {
     return normalizeText(value)
       .replace(/^\d+\s*/, '')
-      .replace(/^([A-ZÆØÅ]{1,8})\s*-\s*/i, '$1 - ')
+      .replace(/^([A-ZÃ†Ã˜Ã…]{1,8})\s*-\s*/i, '$1 - ')
       .trim();
   }
 
@@ -754,7 +761,7 @@
   function formatShift(shift) {
     const customer = normalizeText(shift?.customer) || `Vagt ${shift?.id || ''}`.trim();
     const when = normalizeText([shift?.date, shift?.time].filter(Boolean).join(' '));
-    return [customer, when].filter(Boolean).join(' · ');
+    return [customer, when].filter(Boolean).join(' Â· ');
   }
 
   function formatMessageNotification(events) {
@@ -768,7 +775,7 @@
       title = `Ny besked fra ${record.name || 'en vikar'}`;
       const lines = [];
       if (record.snippet) lines.push(truncateText(record.snippet, 500));
-      else lines.push('Ny ulæst besked');
+      else lines.push('Ny ulÃ¦st besked');
       if (record.type === 'vagt' && record.context) {
         lines.push('Vagt: ' + truncateText(record.context, 260));
       }
@@ -776,11 +783,11 @@
     } else {
       title = `${total || list.length} nye Temponizer-beskeder`;
       const lines = list.slice(0, 3).map(event => {
-        if (event.kind === 'generic') return event.text || 'Ny ulæst besked';
+        if (event.kind === 'generic') return event.text || 'Ny ulÃ¦st besked';
         const record = event.record || {};
         const detail = record.snippet
           || (record.type === 'vagt' ? record.context : '')
-          || 'Ny ulæst besked';
+          || 'Ny ulÃ¦st besked';
         return `${record.name || 'Ukendt vikar'}: ${truncateText(detail, 190)}`;
       });
       if (list.length > 3) lines.push(`+${list.length - 3} flere`);
@@ -970,12 +977,11 @@
     const cancellations = cancellationResult.status === 'fulfilled' ? cancellationResult.value : {};
     const data = {
       completedShifts: stats.completedShifts ?? null,
-      paidShifts: profile.paidShifts ?? null,
+      totalCompletedShifts: profile.totalCompletedShifts ?? null,
       sickShifts: stats.sickShifts ?? null,
       withdrawnShifts: cancellations.withdrawnShifts ?? null,
       complaints: profile.complaints ?? null,
-      blockings: blockingsResult.status === 'fulfilled' ? blockingsResult.value : null,
-      rangeEnd: range.endText
+      blockings: blockingsResult.status === 'fulfilled' ? blockingsResult.value : null
     };
     if (Object.values(data).every(value => value !== null && value !== undefined)) {
       saveCachedWorkerHoverData(workerId, data);
@@ -1034,8 +1040,8 @@
     let topMenuFallback = 0;
     let homepageEnriched = false;
 
-    // Topmenuens DOM kan være forsinket. Brug den kun som signal til at hente
-    // en frisk, læsende forside og accepter først derefter en højere total.
+    // Topmenuens DOM kan vÃ¦re forsinket. Brug den kun som signal til at hente
+    // en frisk, lÃ¦sende forside og accepter fÃ¸rst derefter en hÃ¸jere total.
     if ((topMenuTotal ?? 0) > counterTotal) {
       try {
         const homepageDoc = parseHtml(await fetchText(ORIGIN + '/index.php?_=' + Date.now()));
@@ -1057,7 +1063,7 @@
           homepageEnriched = true;
         }
       } catch (error) {
-        console.warn('[TP][MSG] Kunne ikke bekræfte topmenuens beskedtal', error);
+        console.warn('[TP][MSG] Kunne ikke bekrÃ¦fte topmenuens beskedtal', error);
       }
     }
 
@@ -1132,7 +1138,7 @@
       entries = parseInterestDetailHTML(await fetchText(url + '&retry=' + Date.now()), shift);
     }
     if (entries.length !== shift.count) {
-      throw new Error(`Interesselisten for vagt ${shift.id} var ufuldstændig (${entries.length}/${shift.count})`);
+      throw new Error(`Interesselisten for vagt ${shift.id} var ufuldstÃ¦ndig (${entries.length}/${shift.count})`);
     }
     return entries;
   }
@@ -1140,7 +1146,7 @@
   async function fetchInterestSnapshot() {
     const overview = parseInterestOverviewHTML(await fetchText(INTEREST_URL + '&_=' + Date.now()));
     if (!overview.recognized && overview.shifts.length === 0) {
-      throw new Error('Kunne ikke genkende interessetællerne på siden');
+      throw new Error('Kunne ikke genkende interessetÃ¦llerne pÃ¥ siden');
     }
     const nested = await mapLimit(overview.shifts, INTEREST_DETAIL_CONCURRENCY, fetchInterestEntriesForShift);
     const entries = nested.flat();
@@ -1225,7 +1231,7 @@
       }
       await sleep(40 + Math.floor(Math.random() * 60));
     }
-    console.warn('[TP] Springer en poll over, fordi flerfanelåsen var optaget:', name);
+    console.warn('[TP] Springer en poll over, fordi flerfanelÃ¥sen var optaget:', name);
     return undefined;
   }
 
@@ -1239,7 +1245,7 @@
         );
       }
     } catch (error) {
-      console.warn('[TP] Browserens flerfanelås fejlede; bruger lokal reserve.', error);
+      console.warn('[TP] Browserens flerfanelÃ¥s fejlede; bruger lokal reserve.', error);
     }
     return withLocalStorageMutex(name, task);
   }
@@ -1342,7 +1348,7 @@
         eventId: `generic:${snapshot.total}:${clampInteger(state.total, 0)}`,
         delta: unknownDelta,
         targetTotal: snapshot.total,
-        text: unknownDelta === 1 ? 'Ny ulæst besked' : `${unknownDelta} nye ulæste beskeder`
+        text: unknownDelta === 1 ? 'Ny ulÃ¦st besked' : `${unknownDelta} nye ulÃ¦ste beskeder`
       });
     }
 
@@ -1515,7 +1521,7 @@
           console.warn('[TP][PUSHOVER] HTTP', response.status);
         }
       },
-      onerror: error => console.warn('[TP][PUSHOVER] Netværksfejl', error),
+      onerror: error => console.warn('[TP][PUSHOVER] NetvÃ¦rksfejl', error),
       ontimeout: () => console.warn('[TP][PUSHOVER] Timeout')
     });
   }
@@ -1654,7 +1660,7 @@
     });
     const json = JSON.parse(response.responseText || '{}');
     const type = json?.d?.ListItemEntityTypeFullName || json?.ListItemEntityTypeFullName;
-    if (!type) throw new Error('Kan ikke læse SharePoint list entity type');
+    if (!type) throw new Error('Kan ikke lÃ¦se SharePoint list entity type');
     tpSpEntityTypeCache = type;
     return type;
   }
@@ -1701,7 +1707,7 @@
     const generation = ++tpMailRefreshGeneration;
     tpMailRefreshInFlight = true;
     try {
-      paintMailPushUI(undefined, 'synk…', '#888');
+      paintMailPushUI(undefined, 'synkâ€¦', '#888');
       const setting = await getMailPushSetting();
       if (generation !== tpMailRefreshGeneration || tpMailPushBusy) return;
       setLocalMailPushEnabled(setting.enabled);
@@ -1720,7 +1726,7 @@
     const checkbox = root.querySelector('#tpEnableMail');
     if (!checkbox) return;
     checkbox.checked = getLocalMailPushEnabled();
-    paintMailPushUI(checkbox.checked, 'synk…', '#888');
+    paintMailPushUI(checkbox.checked, 'synkâ€¦', '#888');
 
     checkbox.addEventListener('change', async () => {
       if (tpMailPushBusy) return;
@@ -1729,7 +1735,7 @@
       tpMailRefreshGeneration += 1;
       tpMailRefreshInFlight = false;
       checkbox.disabled = true;
-      paintMailPushUI(wantOn, wantOn ? 'slår til…' : 'slår fra…', '#888');
+      paintMailPushUI(wantOn, wantOn ? 'slÃ¥r tilâ€¦' : 'slÃ¥r fraâ€¦', '#888');
       try {
         await setMailPushSetting(wantOn);
       } catch (error) {
@@ -1782,8 +1788,8 @@
       '<div id="tpHeader" style="cursor:move;display:flex;align-items:center;gap:6px;margin-bottom:4px">' +
         '<div style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">TP Notifikationer</div>' +
         '<div style="margin-left:auto;display:flex;align-items:center;gap:6px">' +
-          '<div id="tpDragHint" style="font-size:10px;color:#888">træk</div>' +
-          '<button id="tpGearBtn" type="button" title="Indstillinger" aria-label="Indstillinger" style="width:22px;height:22px;line-height:20px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:50%;box-shadow:0 4px 12px rgba(0,0,0,.18);cursor:pointer;padding:0;user-select:none">⚙</button>' +
+          '<div id="tpDragHint" style="font-size:10px;color:#888">trÃ¦k</div>' +
+          '<button id="tpGearBtn" type="button" title="Indstillinger" aria-label="Indstillinger" style="width:22px;height:22px;line-height:20px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:50%;box-shadow:0 4px 12px rgba(0,0,0,.18);cursor:pointer;padding:0;user-select:none">âš™</button>' +
         '</div>' +
       '</div>' +
       '<div style="display:flex;align-items:center;gap:6px;margin:2px 0;white-space:nowrap">' +
@@ -1796,12 +1802,12 @@
       '</div>' +
       '<div style="display:flex;align-items:center;gap:6px;margin:2px 0 6px;white-space:nowrap">' +
         '<label style="display:flex;align-items:center;gap:6px;min-width:0"><input type="checkbox" id="tpEnableMail"> <span>Mail</span></label>' +
-        '<span id="tpMailStatus" style="margin-left:auto;font-size:10px;color:#888">…</span>' +
+        '<span id="tpMailStatus" style="margin-left:auto;font-size:10px;color:#888">â€¦</span>' +
         '<a id="tpMailLoginLink" href="' + TP_MAIL_PUSH.loginUrl + '" target="_blank" rel="noopener noreferrer" style="display:none;font-size:10px;color:#1769aa;text-decoration:underline">Log ind</a>' +
       '</div>' +
       '<div style="display:flex;align-items:center;gap:6px;margin:0 0 2px">' +
-        '<span id="tpSMSStatus" style="font-size:11px;color:#666">SMS: …</span>' +
-        '<button id="tpSMSOneBtn" type="button" style="margin-left:auto;padding:4px 8px;font-size:11px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;flex:0 0 auto">Aktivér</button>' +
+        '<span id="tpSMSStatus" style="font-size:11px;color:#666">SMS: â€¦</span>' +
+        '<button id="tpSMSOneBtn" type="button" style="margin-left:auto;padding:4px 8px;font-size:11px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;flex:0 0 auto">AktivÃ©r</button>' +
       '</div>';
 
     document.body.appendChild(panel);
@@ -1866,15 +1872,15 @@
           const raw = await gmGET(SCRIPT_RAW_URL + '?t=' + Date.now());
           const match = raw.match(/@version\s+([0-9.]+)/);
           if (!match) {
-            showToast('Kunne ikke læse remote version.');
+            showToast('Kunne ikke lÃ¦se remote version.');
             return;
           }
           const remote = match[1];
           const comparison = compareVersions(remote, TP_VERSION);
           if (comparison === 0) {
-            showToast('Du kører allerede nyeste version (' + remote + ').');
+            showToast('Du kÃ¸rer allerede nyeste version (' + remote + ').');
           } else if (comparison > 0) {
-            showToast('Ny version tilgængelig: ' + remote + ' (du kører ' + TP_VERSION + '). Åbner…');
+            showToast('Ny version tilgÃ¦ngelig: ' + remote + ' (du kÃ¸rer ' + TP_VERSION + '). Ã…bnerâ€¦');
             window.open(SCRIPT_RAW_URL, '_blank', 'noopener');
           } else {
             showToast('Din version ' + TP_VERSION + ' er nyere end den offentliggjorte ' + remote + '.');
@@ -2037,7 +2043,7 @@
     element.style.bottom = 'auto';
   }
 
-  // SMS-blokken er bevidst bevaret tæt på den fungerende 7.11.9-version.
+  // SMS-blokken er bevidst bevaret tÃ¦t pÃ¥ den fungerende 7.11.9-version.
   function hasDisplayBlock(element) {
     if (!element) return false;
     const style = (element.getAttribute('style') || '').replace(/\s+/g, '').toLowerCase();
@@ -2181,7 +2187,7 @@
       return initialStatus;
     }
     if (!invokeIframeAction(iframe, wantOn)) {
-      throw new Error('Kan ikke udløse aktivering/deaktivering i iframe.');
+      throw new Error('Kan ikke udlÃ¸se aktivering/deaktivering i iframe.');
     }
     const maybeReloaded = new Promise(resolve => {
       let done = false;
@@ -2222,7 +2228,7 @@
     async setEnabled(wantOn, uiBusy, callback) {
       if (this._busy) return;
       this._busy = true;
-      if (uiBusy) uiBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
+      if (uiBusy) uiBusy(true, wantOn ? 'aktivererâ€¦' : 'deaktivererâ€¦');
       try {
         const status = await toggleSmsInIframe(wantOn, 15000, 500);
         this._last = status;
@@ -2255,23 +2261,23 @@
           label.style.color = '#0a7a35';
           break;
         case 'inactive':
-          button.textContent = 'Aktivér';
+          button.textContent = 'AktivÃ©r';
           label.textContent = 'SMS: Ikke aktiv' + (status.phone ? ' - ' + status.phone : '');
           label.style.color = '#a33';
           break;
         default:
-          button.textContent = 'Aktivér';
+          button.textContent = 'AktivÃ©r';
           label.textContent = 'SMS: Ukendt';
           label.style.color = '#666';
       }
     }
     button.addEventListener('click', async () => {
       const wantOn = sms._last?.state !== 'active';
-      setBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
+      setBusy(true, wantOn ? 'aktivererâ€¦' : 'deaktivererâ€¦');
       await sms.setEnabled(wantOn, setBusy, paint);
     });
     (async () => {
-      setBusy(true, 'indlæser…');
+      setBusy(true, 'indlÃ¦serâ€¦');
       await sms.refresh(paint);
       setBusy(false);
     })();
@@ -2279,7 +2285,7 @@
 
   function tpTestPushoverBoth() {
     if (!getUserKey()) {
-      showToast('Indsæt din USER-token i indstillingerne før test.');
+      showToast('IndsÃ¦t din USER-token i indstillingerne fÃ¸r test.');
       return;
     }
     const time = new Date().toLocaleTimeString();
@@ -2381,6 +2387,39 @@
         color: #777c7e;
         font-size: 10px;
       }
+      .tp-worker-hover-row-completed {
+        grid-template-columns: minmax(0, 1fr) auto 12px;
+        min-height: 36px;
+      }
+      .tp-worker-hover-counts {
+        display: flex;
+        align-items: stretch;
+        color: #555b5e;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .tp-worker-hover-count {
+        display: flex;
+        min-width: 42px;
+        flex-direction: column;
+        align-items: flex-end;
+        justify-content: center;
+        line-height: 1.05;
+      }
+      .tp-worker-hover-count + .tp-worker-hover-count {
+        min-width: 49px;
+        margin-left: 7px;
+        padding-left: 7px;
+        border-left: 1px solid #d8dadb;
+      }
+      .tp-worker-hover-count strong {
+        font-weight: 600;
+      }
+      .tp-worker-hover-count small {
+        margin-top: 2px;
+        color: #777c7e;
+        font-size: 9px;
+      }
       .tp-worker-hover-arrow {
         color: #888d90;
         font-size: 14px;
@@ -2420,7 +2459,7 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
-  function createWorkerHoverHead(name, rangeEnd = '') {
+  function createWorkerHoverHead(name) {
     const head = document.createElement('div');
     head.className = 'tp-worker-hover-head';
     const nameElement = document.createElement('span');
@@ -2428,7 +2467,7 @@
     nameElement.textContent = name;
     const period = document.createElement('span');
     period.className = 'tp-worker-hover-period';
-    period.textContent = rangeEnd ? '90 dage · t.o.m. ' + rangeEnd : 'Seneste 90 dage';
+    period.textContent = 'Seneste 90 dage';
     head.append(nameElement, period);
     return head;
   }
@@ -2451,7 +2490,7 @@
     const valueElement = document.createElement('span');
     valueElement.className = 'tp-worker-hover-value';
     const strong = document.createElement('strong');
-    strong.textContent = value === null || value === undefined ? '–' : String(value);
+    strong.textContent = value === null || value === undefined ? 'â€“' : String(value);
     valueElement.appendChild(strong);
     if (detail) {
       const detailElement = document.createElement('span');
@@ -2463,25 +2502,53 @@
     const arrow = document.createElement('span');
     arrow.className = 'tp-worker-hover-arrow';
     arrow.setAttribute('aria-hidden', 'true');
-    arrow.textContent = '›';
+    arrow.textContent = 'â€º';
     link.append(labelElement, valueElement, arrow);
+    return link;
+  }
+
+  function createWorkerCompletedRow({ recentValue, totalValue, href }) {
+    const link = document.createElement('a');
+    link.className = 'tp-worker-hover-row tp-worker-hover-row-completed';
+    link.href = href;
+
+    const label = document.createElement('span');
+    label.className = 'tp-worker-hover-label';
+    label.textContent = 'Afholdte vagter';
+
+    const counts = document.createElement('span');
+    counts.className = 'tp-worker-hover-counts';
+    for (const [value, caption] of [[recentValue, '90 dage'], [totalValue, 'I alt']]) {
+      const count = document.createElement('span');
+      count.className = 'tp-worker-hover-count';
+      const strong = document.createElement('strong');
+      strong.textContent = value === null || value === undefined ? 'â€“' : String(value);
+      const small = document.createElement('small');
+      small.textContent = caption;
+      count.append(strong, small);
+      counts.appendChild(count);
+    }
+
+    const arrow = document.createElement('span');
+    arrow.className = 'tp-worker-hover-arrow';
+    arrow.setAttribute('aria-hidden', 'true');
+    arrow.textContent = 'â€º';
+    link.append(label, counts, arrow);
     return link;
   }
 
   function renderWorkerHoverLoading(popover, context) {
     const loading = document.createElement('div');
     loading.className = 'tp-worker-hover-loading';
-    loading.textContent = 'Henter vikaroverblik…';
+    loading.textContent = 'Henter vikaroverblikâ€¦';
     popover.replaceChildren(createWorkerHoverHead(context.name), loading);
   }
 
   function renderWorkerHoverData(popover, context, data) {
-    const paidDetail = data.paidShifts === null ? '' : data.paidShifts + ' løn udb.';
-    const completed = createWorkerHoverRow({
-      label: 'Afholdte vagter',
-      value: data.completedShifts,
-      detail: paidDetail,
-      href: buildWorkerProfileURL(context.workerId, '#vagter,loenudbetalt')
+    const completed = createWorkerCompletedRow({
+      recentValue: data.completedShifts,
+      totalValue: data.totalCompletedShifts,
+      href: buildWorkerProfileURL(context.workerId, '#vagter')
     });
     const sick = createWorkerHoverRow({
       label: 'Sygemeldinger',
@@ -2510,7 +2577,7 @@
       })
     );
     popover.replaceChildren(
-      createWorkerHoverHead(context.name, data.rangeEnd),
+      createWorkerHoverHead(context.name),
       completed,
       sick,
       withdrawn,
@@ -2525,7 +2592,7 @@
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'tp-worker-hover-retry';
-    button.textContent = 'Prøv igen';
+    button.textContent = 'PrÃ¸v igen';
     button.addEventListener('click', retry, { once: true });
     error.appendChild(button);
     popover.replaceChildren(createWorkerHoverHead(context.name), error);
@@ -2999,3 +3066,4 @@
   if (document.body) startRuntime();
   else window.addEventListener('DOMContentLoaded', startRuntime, { once: true });
 })();
+
