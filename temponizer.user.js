@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.13.4
-// @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status med SharePoint-login, SMS-toggle og hover-genvej til "Intet svar".
+// @version      7.13.5
+// @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status med SharePoint-login, SMS-toggle og stabil hover-genvej til "Intet svar".
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.13.4';
+  const TP_VERSION = '7.13.5';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -2104,8 +2104,10 @@
       }
       .tp-quick-no-answer-menu {
         position: absolute;
-        right: -4px;
-        bottom: calc(100% - 1px);
+        left: calc(100% - 1px);
+        top: 50%;
+        right: auto;
+        bottom: auto;
         z-index: 10020;
         display: block;
         min-width: 92px;
@@ -2117,15 +2119,16 @@
         opacity: 0;
         visibility: hidden;
         pointer-events: none;
-        transform: translateY(2px);
+        transform: translate(4px, -50%);
         transition: opacity 80ms ease, transform 80ms ease, visibility 80ms ease;
       }
       .tp-quick-no-answer-cell:hover > .tp-quick-no-answer-menu,
+      .tp-quick-no-answer-cell.tp-quick-no-answer-open > .tp-quick-no-answer-menu,
       .tp-quick-no-answer-cell:focus-within > .tp-quick-no-answer-menu {
         opacity: 1;
         visibility: visible;
         pointer-events: auto;
-        transform: translateY(0);
+        transform: translate(0, -50%);
       }
       .tp-quick-no-answer-button {
         display: block;
@@ -2244,6 +2247,26 @@
 
       menu.appendChild(button);
       cell.appendChild(menu);
+
+      let hideTimer = null;
+      const showMenu = () => {
+        if (hideTimer) clearTimeout(hideTimer);
+        hideTimer = null;
+        cell.classList.add('tp-quick-no-answer-open');
+      };
+      const hideMenuSoon = () => {
+        if (hideTimer) clearTimeout(hideTimer);
+        hideTimer = setTimeout(() => {
+          hideTimer = null;
+          cell.classList.remove('tp-quick-no-answer-open');
+        }, 700);
+      };
+      cell.addEventListener('mouseenter', showMenu);
+      cell.addEventListener('mouseleave', hideMenuSoon);
+      menu.addEventListener('mouseenter', showMenu);
+      menu.addEventListener('mouseleave', hideMenuSoon);
+      menu.addEventListener('focusin', showMenu);
+      menu.addEventListener('focusout', hideMenuSoon);
     }
   }
 
