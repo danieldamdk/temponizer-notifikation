@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.13.5
+// @version      7.13.6
 // @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status med SharePoint-login, SMS-toggle og stabil hover-genvej til "Intet svar".
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.13.5';
+  const TP_VERSION = '7.13.6';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -2259,7 +2259,7 @@
         hideTimer = setTimeout(() => {
           hideTimer = null;
           cell.classList.remove('tp-quick-no-answer-open');
-        }, 700);
+        }, 50);
       };
       cell.addEventListener('mouseenter', showMenu);
       cell.addEventListener('mouseleave', hideMenuSoon);
