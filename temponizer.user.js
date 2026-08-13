@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.3
+// @version      7.14.4
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, "Intet svar", vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -22,7 +22,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.3';
+  const TP_VERSION = '7.14.4';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -3222,7 +3222,7 @@
       .trim();
   }
 
-  function parseAuthorizationLookupResponse(payload, profile) {
+  function getAuthorizationLookupMatches(payload, profile) {
     const records = Array.isArray(payload?.GetHealthProfessionalsResult)
       ? payload.GetHealthProfessionalsResult
       : [];
@@ -3244,7 +3244,54 @@
       String(record?.AuthorizationID || JSON.stringify(record)),
       record
     ]));
-    return uniqueMatches.size === 1 ? 'found' : uniqueMatches.size > 1 ? 'multiple' : 'not-found';
+    return [...uniqueMatches.values()];
+  }
+
+  function parseAuthorizationLookupResponse(payload, profile) {
+    const matches = getAuthorizationLookupMatches(payload, profile);
+    return matches.length === 1 ? 'found' : matches.length > 1 ? 'multiple' : 'not-found';
+  }
+
+  function formatAuthorizationDate(value) {
+    const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+    return match ? [match[3], match[2], match[1]].join('.') : 'Ikke oplyst';
+  }
+
+  function getAuthorizationSpecialities(record) {
+    const source = record?.Specialities;
+    const items = Array.isArray(source)
+      ? source
+      : Array.isArray(source?.GetSpecialitiesResult)
+        ? source.GetSpecialitiesResult
+        : source ? [source] : [];
+    const names = items.map(item => {
+      if (typeof item === 'string') return normalizeText(item);
+      return normalizeText(
+        item?.SpecialityName ||
+        item?.SpecialityCodeName ||
+        item?.Name ||
+        item?.Title ||
+        ''
+      );
+    }).filter(Boolean);
+    return [...new Set(names)].join(', ') || 'Ingen registreret';
+  }
+
+  function isTemporaryAuthorization(record) {
+    return Boolean(record?.TempAuthorizationBegin || record?.TempAuthorizationEnd);
+  }
+
+  function getAuthorizationType(record) {
+    const returnedType = normalizeText(record?.AuthorizationTypeName || record?.AuthorizationType);
+    if (returnedType) return returnedType;
+    return isTemporaryAuthorization(record) ? 'Midlertidig autorisation' : 'Varig autorisation';
+  }
+
+  function buildAuthorizationRegisterURL(record, profile) {
+    const query = normalizeText(record?.AuthorizationID || profile?.name);
+    const url = new URL('https://autregweb.stps.dk/da/searchResults');
+    if (query) url.searchParams.set('quickSearch', query);
+    return url.href;
   }
 
   function fetchPublicJson(url) {
@@ -3291,10 +3338,6 @@
     style.id = 'tpAuthorizationLookupStyles';
     style.textContent = `
       #tpAuthorizationLookup {
-        display: flex;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 4px;
         margin-top: 5px;
         width: 152px;
         max-width: 100%;
@@ -3327,46 +3370,201 @@
         background: #aeb6ba;
         cursor: wait;
       }
-      #tpAuthorizationLookupStatus {
+      #tpAuthorizationLookupPopup {
+        position: fixed;
+        z-index: 2147483646;
         box-sizing: border-box;
-        width: 152px;
-        max-width: 100%;
-        min-height: 25px;
-        padding: 5px 6px;
-        border: 1px solid #b7c0c4;
-        border-radius: 3px;
-        background: #f2f4f5;
-        color: #344047;
-        font: 600 10.5px/14px Arial, sans-serif;
+        width: 330px;
+        max-width: calc(100vw - 20px);
+        max-height: calc(100vh - 20px);
+        overflow: auto;
+        border: 1px solid #9fa9ae;
+        border-radius: 4px;
+        background: #ffffff;
+        color: #252c30;
+        box-shadow: 0 7px 18px rgba(39, 48, 54, 0.2);
+        font: 12px/16px Arial, sans-serif;
         letter-spacing: 0;
         text-align: left;
       }
-      #tpAuthorizationLookupStatus[hidden] { display: none; }
-      #tpAuthorizationLookupStatus[data-state="success"] {
-        border-color: #7da75f;
-        background: #e8f3df;
-        color: #315f16;
+      #tpAuthorizationLookupPopup[hidden] { display: none; }
+      #tpAuthorizationLookupPopupHeader {
+        display: grid;
+        grid-template-columns: 28px minmax(0, 1fr) 28px;
+        gap: 8px;
+        align-items: center;
+        padding: 10px;
+        border-bottom: 1px solid #d6dbdd;
+        background: #edf5e8;
       }
-      #tpAuthorizationLookupStatus[data-state="missing"] {
-        border-color: #bd6b6b;
-        background: #f8e7e7;
-        color: #7c2525;
+      #tpAuthorizationLookupPopup[data-state="temporary"] #tpAuthorizationLookupPopupHeader,
+      #tpAuthorizationLookupPopup[data-state="warning"] #tpAuthorizationLookupPopupHeader,
+      #tpAuthorizationLookupPopup[data-state="loading"] #tpAuthorizationLookupPopupHeader {
+        background: #fff5d9;
       }
-      #tpAuthorizationLookupStatus[data-state="warning"] {
-        border-color: #c29c46;
-        background: #fff4d4;
-        color: #705514;
+      #tpAuthorizationLookupPopup[data-state="missing"] #tpAuthorizationLookupPopupHeader {
+        background: #faeaea;
+      }
+      #tpAuthorizationLookupPopupIcon {
+        display: grid;
+        place-items: center;
+        width: 28px;
+        height: 28px;
+        color: #4d8a28;
+        font-size: 19px;
+        font-weight: 700;
+      }
+      #tpAuthorizationLookupPopup[data-state="temporary"] #tpAuthorizationLookupPopupIcon,
+      #tpAuthorizationLookupPopup[data-state="warning"] #tpAuthorizationLookupPopupIcon,
+      #tpAuthorizationLookupPopup[data-state="loading"] #tpAuthorizationLookupPopupIcon {
+        color: #9a6a0d;
+      }
+      #tpAuthorizationLookupPopup[data-state="missing"] #tpAuthorizationLookupPopupIcon {
+        color: #a53f3f;
+      }
+      #tpAuthorizationLookupPopupTitle,
+      #tpAuthorizationLookupPopupSubtitle {
+        display: block;
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      #tpAuthorizationLookupPopupTitle {
+        margin-bottom: 2px;
+        font-weight: 600;
+      }
+      #tpAuthorizationLookupPopupSubtitle { color: #5b656a; }
+      #tpAuthorizationLookupPopupClose {
+        display: grid;
+        place-items: center;
+        width: 28px;
+        height: 28px;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: #4b555a;
+        font: 20px/28px Arial, sans-serif;
+        cursor: pointer;
+      }
+      #tpAuthorizationLookupPopupClose:hover,
+      #tpAuthorizationLookupPopupClose:focus-visible {
+        color: #172126;
+        outline: 2px solid #287ca5;
+        outline-offset: -2px;
+      }
+      #tpAuthorizationLookupDetails {
+        margin: 0;
+        padding: 5px 10px;
+      }
+      #tpAuthorizationLookupDetails[hidden] { display: none; }
+      #tpAuthorizationLookupDetails > div {
+        display: grid;
+        grid-template-columns: minmax(110px, 0.9fr) minmax(130px, 1.1fr);
+        gap: 10px;
+        padding: 6px 0;
+        border-bottom: 1px solid #e3e6e8;
+      }
+      #tpAuthorizationLookupDetails > div:last-child { border-bottom: 0; }
+      #tpAuthorizationLookupDetails dt { color: #687278; }
+      #tpAuthorizationLookupDetails dd {
+        min-width: 0;
+        margin: 0;
+        overflow-wrap: anywhere;
+        font-weight: 600;
+      }
+      #tpAuthorizationLookupPopupFooter {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 10px;
+        border-top: 1px solid #d6dbdd;
+        background: #f2f4f5;
+      }
+      #tpAuthorizationLookupPopupFooter > span {
+        color: #6a7479;
+        font-size: 11px;
+      }
+      #tpAuthorizationLookupRegisterLink {
+        flex: 0 0 auto;
+        color: #176b94;
+        font: 600 11px/16px Arial, sans-serif;
+        text-decoration: none;
+      }
+      #tpAuthorizationLookupRegisterLink:hover,
+      #tpAuthorizationLookupRegisterLink:focus-visible { text-decoration: underline; }
+      @media (max-width: 380px) {
+        #tpAuthorizationLookupPopupFooter {
+          align-items: flex-start;
+          flex-direction: column;
+        }
       }
     `;
     (document.head || document.documentElement).appendChild(style);
   }
 
-  function setAuthorizationLookupStatus(container, state, text) {
-    const status = container.querySelector('#tpAuthorizationLookupStatus');
-    if (!status) return;
-    status.dataset.state = state;
-    status.textContent = text;
-    status.hidden = false;
+  function positionAuthorizationLookupPopup(button, popup) {
+    if (!button || !popup || popup.hidden) return;
+    const gap = 6;
+    const edge = 10;
+    const buttonRect = button.getBoundingClientRect();
+    const popupRect = popup.getBoundingClientRect();
+    const maxLeft = Math.max(edge, globalThis.innerWidth - popupRect.width - edge);
+    const left = Math.max(edge, Math.min(buttonRect.right - popupRect.width, maxLeft));
+    let top = buttonRect.bottom + gap;
+    if (top + popupRect.height > globalThis.innerHeight - edge && buttonRect.top - popupRect.height - gap >= edge) {
+      top = buttonRect.top - popupRect.height - gap;
+    }
+    const maxTop = Math.max(edge, globalThis.innerHeight - popupRect.height - edge);
+    popup.style.left = Math.round(left) + 'px';
+    popup.style.top = Math.round(Math.max(edge, Math.min(top, maxTop))) + 'px';
+  }
+
+  function closeAuthorizationLookupPopup(button, popup) {
+    if (!popup) return;
+    popup.hidden = true;
+    button?.setAttribute('aria-expanded', 'false');
+  }
+
+  function appendAuthorizationDetail(details, label, value) {
+    const row = document.createElement('div');
+    const term = document.createElement('dt');
+    const description = document.createElement('dd');
+    term.textContent = label;
+    description.textContent = value;
+    row.append(term, description);
+    details.appendChild(row);
+  }
+
+  function showAuthorizationLookupPopup(button, options) {
+    const popup = document.getElementById('tpAuthorizationLookupPopup');
+    if (!popup) return;
+    const state = options.state || 'warning';
+    const icons = { success: '\u2713', temporary: '!', warning: '!', loading: '\u2026', missing: '\u00d7' };
+    popup.dataset.state = state;
+    popup.querySelector('#tpAuthorizationLookupPopupIcon').textContent = icons[state] || '!';
+    popup.querySelector('#tpAuthorizationLookupPopupTitle').textContent = options.title || '';
+    popup.querySelector('#tpAuthorizationLookupPopupSubtitle').textContent = options.subtitle || '';
+
+    const details = popup.querySelector('#tpAuthorizationLookupDetails');
+    details.replaceChildren();
+    details.hidden = !options.record;
+    if (options.record) {
+      const record = options.record;
+      appendAuthorizationDetail(details, 'Autorisations-ID', normalizeText(record.AuthorizationID) || 'Ikke oplyst');
+      appendAuthorizationDetail(details, 'Autorisationsdato', formatAuthorizationDate(record.AuthorizationDate));
+      appendAuthorizationDetail(details, 'Faggruppe', normalizeText(record.ProfessionCodeName) || options.profile?.professionLabel || 'Ikke oplyst');
+      appendAuthorizationDetail(details, 'Type', getAuthorizationType(record));
+      if (isTemporaryAuthorization(record)) {
+        appendAuthorizationDetail(details, 'Gyldig til', formatAuthorizationDate(record.TempAuthorizationEnd));
+      }
+      appendAuthorizationDetail(details, 'Specialisering', getAuthorizationSpecialities(record));
+    }
+
+    const registerLink = popup.querySelector('#tpAuthorizationLookupRegisterLink');
+    registerLink.href = buildAuthorizationRegisterURL(options.record, options.profile);
+    popup.hidden = false;
+    button?.setAttribute('aria-expanded', 'true');
+    positionAuthorizationLookupPopup(button, popup);
   }
 
   async function runAuthorizationLookup(container) {
@@ -3375,30 +3573,77 @@
     const profile = readAuthorizationProfile();
 
     if (!profile.name) {
-      setAuthorizationLookupStatus(container, 'warning', 'Navn mangler');
+      showAuthorizationLookupPopup(button, {
+        state: 'warning',
+        title: 'Navn mangler',
+        subtitle: 'Navnet skal vÃ¦re udfyldt for at sÃ¸ge',
+        profile
+      });
       return;
     }
     if (!profile.birthDate) {
-      setAuthorizationLookupStatus(container, 'warning', 'CPR er ugyldigt');
+      showAuthorizationLookupPopup(button, {
+        state: 'warning',
+        title: 'CPR er ugyldigt',
+        subtitle: 'KontrollÃ©r CPR-nummeret og prÃ¸v igen',
+        profile
+      });
       return;
     }
     if (!profile.professionCode) {
-      setAuthorizationLookupStatus(container, 'warning', 'Kun SSA og SPL');
+      showAuthorizationLookupPopup(button, {
+        state: 'warning',
+        title: 'Uddannelsen understÃ¸ttes ikke',
+        subtitle: 'Automatisk opslag er endnu kun sat op for SSA og SPL',
+        profile
+      });
       return;
     }
 
     button.disabled = true;
     button.textContent = 'Kontrollerer...';
-    setAuthorizationLookupStatus(container, 'warning', 'Kontrollerer...');
+    showAuthorizationLookupPopup(button, {
+      state: 'loading',
+      title: 'Kontrollerer autorisation',
+      subtitle: profile.name + ' \u00b7 ' + profile.professionLabel,
+      profile
+    });
     try {
       const payload = await fetchPublicJson(buildAuthorizationLookupURL(profile));
-      const result = parseAuthorizationLookupResponse(payload, profile);
-      if (result === 'found') setAuthorizationLookupStatus(container, 'success', 'Autorisation fundet');
-      else if (result === 'multiple') setAuthorizationLookupStatus(container, 'warning', 'Flere mulige fund');
-      else setAuthorizationLookupStatus(container, 'missing', 'Autorisation ikke fundet');
+      const matches = getAuthorizationLookupMatches(payload, profile);
+      if (matches.length === 1) {
+        const record = matches[0];
+        const temporary = isTemporaryAuthorization(record);
+        showAuthorizationLookupPopup(button, {
+          state: temporary ? 'temporary' : 'success',
+          title: temporary ? 'Midlertidig autorisation' : 'Gyldig autorisation',
+          subtitle: profile.name + ' \u00b7 ' + profile.professionLabel,
+          record,
+          profile
+        });
+      } else if (matches.length > 1) {
+        showAuthorizationLookupPopup(button, {
+          state: 'warning',
+          title: 'Flere mulige fund',
+          subtitle: 'KontrollÃ©r resultatet manuelt i registeret',
+          profile
+        });
+      } else {
+        showAuthorizationLookupPopup(button, {
+          state: 'missing',
+          title: 'Ingen gyldig autorisation fundet',
+          subtitle: 'KontrollÃ©r oplysningerne manuelt',
+          profile
+        });
+      }
     } catch (error) {
       console.warn('[TP][ERR][AUTREG]', error?.message || 'Kontrol mislykkedes');
-      setAuthorizationLookupStatus(container, 'warning', 'Kontrol mislykkedes');
+      showAuthorizationLookupPopup(button, {
+        state: 'warning',
+        title: 'Kontrol mislykkedes',
+        subtitle: 'PrÃ¸v igen eller Ã¥bn registeret manuelt',
+        profile
+      });
     } finally {
       button.disabled = false;
       button.textContent = 'Tjek autorisation';
@@ -3428,16 +3673,66 @@
       button.type = 'button';
       button.textContent = 'Tjek autorisation';
       button.title = 'Kontroller i Autorisationsregisteret';
+      button.setAttribute('aria-haspopup', 'dialog');
+      button.setAttribute('aria-expanded', 'false');
+      button.setAttribute('aria-controls', 'tpAuthorizationLookupPopup');
       button.addEventListener('click', () => runAuthorizationLookup(container));
 
-      const status = document.createElement('div');
-      status.id = 'tpAuthorizationLookupStatus';
-      status.setAttribute('role', 'status');
-      status.setAttribute('aria-live', 'polite');
-      status.hidden = true;
+      const popup = document.createElement('aside');
+      popup.id = 'tpAuthorizationLookupPopup';
+      popup.setAttribute('role', 'dialog');
+      popup.setAttribute('aria-modal', 'false');
+      popup.setAttribute('aria-labelledby', 'tpAuthorizationLookupPopupTitle');
+      popup.hidden = true;
 
-      container.append(button, status);
+      const header = document.createElement('header');
+      header.id = 'tpAuthorizationLookupPopupHeader';
+      const icon = document.createElement('span');
+      icon.id = 'tpAuthorizationLookupPopupIcon';
+      icon.setAttribute('aria-hidden', 'true');
+      const heading = document.createElement('div');
+      const title = document.createElement('strong');
+      title.id = 'tpAuthorizationLookupPopupTitle';
+      const subtitle = document.createElement('span');
+      subtitle.id = 'tpAuthorizationLookupPopupSubtitle';
+      heading.append(title, subtitle);
+      const closeButton = document.createElement('button');
+      closeButton.id = 'tpAuthorizationLookupPopupClose';
+      closeButton.type = 'button';
+      closeButton.textContent = '\u00d7';
+      closeButton.setAttribute('aria-label', 'Luk autorisationsoplysninger');
+      closeButton.addEventListener('click', () => closeAuthorizationLookupPopup(button, popup));
+      header.append(icon, heading, closeButton);
+
+      const details = document.createElement('dl');
+      details.id = 'tpAuthorizationLookupDetails';
+      details.hidden = true;
+
+      const footer = document.createElement('footer');
+      footer.id = 'tpAuthorizationLookupPopupFooter';
+      const note = document.createElement('span');
+      note.textContent = 'Tilsyn kontrolleres manuelt';
+      const registerLink = document.createElement('a');
+      registerLink.id = 'tpAuthorizationLookupRegisterLink';
+      registerLink.target = '_blank';
+      registerLink.rel = 'noopener noreferrer';
+      registerLink.textContent = 'Ã…bn register \u2197';
+      footer.append(note, registerLink);
+      popup.append(header, details, footer);
+
+      container.appendChild(button);
       select.insertAdjacentElement('afterend', container);
+      document.body.appendChild(popup);
+
+      document.addEventListener('pointerdown', event => {
+        if (popup.hidden || popup.contains(event.target) || button.contains(event.target)) return;
+        closeAuthorizationLookupPopup(button, popup);
+      });
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && !popup.hidden) closeAuthorizationLookupPopup(button, popup);
+      });
+      globalThis.addEventListener('resize', () => positionAuthorizationLookupPopup(button, popup));
+      globalThis.addEventListener('scroll', () => positionAuthorizationLookupPopup(button, popup), true);
     };
     attach();
   }
@@ -3765,7 +4060,11 @@
     parseCprBirthDate,
     getAuthorizationProfession,
     buildAuthorizationLookupURL,
+    getAuthorizationLookupMatches,
     parseAuthorizationLookupResponse,
+    formatAuthorizationDate,
+    getAuthorizationSpecialities,
+    getAuthorizationType,
     initAuthorizationLookup,
     fetchMessageSnapshot,
     refreshMessageEnrichmentIfNeeded,
