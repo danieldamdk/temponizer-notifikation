@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.6
+// @version      7.14.7
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, "Intet svar", vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -22,7 +22,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.6';
+  const TP_VERSION = '7.14.7';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -71,6 +71,13 @@
     batchSize: 20,
     notificationMaxAgeMs: 10 * 60 * 1000
   };
+  const TP_IPNORDIC_SETUP = {
+    itemTitle: 'IPnordicSetup',
+    dataField: 'SetupData',
+    verifiedKey: 'tpIPnordicVerifiedV1',
+    verificationEvent: 'tp-ipnordic-verified',
+    testWaitMs: 90000
+  };
 
   const ORIGIN = globalThis.location?.origin || 'https://ajourcare.temponizer.dk';
   const MSG_COUNTER_URL = ORIGIN + '/index.php?page=get_comcenter_counters&ajax=true';
@@ -104,6 +111,7 @@
   let incomingCallPollInFlight = false;
   let incomingCallUserEmail = '';
   let incomingCallQueueErrorNotifiedAt = 0;
+  let ipnordicSetupConfigCache = null;
   let tpMailPushBusy = false;
   let tpMailRefreshInFlight = false;
   let tpMailRefreshGeneration = 0;
@@ -1903,6 +1911,104 @@
     return email;
   }
 
+  function validateIPnordicSetupConfig(value) {
+    const config = typeof value === 'string' ? JSON.parse(value) : value;
+    if (!config || typeof config !== 'object') throw new Error('IPnordic-opsætningen mangler');
+    const url = normalizeText(config.url);
+    const description = String(config.description || '').trim();
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch (_) {
+      throw new Error('IPnordic-linket er ugyldigt');
+    }
+    if (
+      parsedUrl.protocol !== 'https:' ||
+      !parsedUrl.hostname.endsWith('.api.powerplatform.com') ||
+      !url.includes('<%CallerNumber%>') ||
+      !url.includes('<%OwnEmail%>')
+    ) {
+      throw new Error('IPnordic-linket er ikke godkendt');
+    }
+    if (!description || description.length > 2000) throw new Error('IPnordic-beskrivelsen mangler');
+    return {
+      version: clampInteger(config.version, 1),
+      url,
+      description,
+      autoRun: config.autoRun !== false,
+      direction: normalizeText(config.direction) || 'Indgående',
+      event: normalizeText(config.event) || 'Opkalds start',
+      type: normalizeText(config.type) || 'HTTP metoder',
+      method: normalizeText(config.method).toUpperCase() || 'POST',
+      scope: normalizeText(config.scope) || 'Global'
+    };
+  }
+
+  async function getIPnordicSetupConfig(forceRefresh = false) {
+    if (ipnordicSetupConfigCache && !forceRefresh) return ipnordicSetupConfigCache;
+    const filter = encodeURIComponent("Title eq '" + odataQuote(TP_IPNORDIC_SETUP.itemTitle) + "'");
+    const url = spListBaseUrl()
+      + '/items?$select=Id,Title,' + encodeURIComponent(TP_IPNORDIC_SETUP.dataField)
+      + '&$filter=' + filter + '&$top=1';
+    const response = await gmRequest({
+      url,
+      headers: { 'Accept': 'application/json;odata=nometadata' }
+    });
+    const json = JSON.parse(response.responseText || '{}');
+    const rows = json.value || json?.d?.results || [];
+    if (!rows.length) throw new Error('IPnordicSetup blev ikke fundet i SharePoint');
+    ipnordicSetupConfigCache = validateIPnordicSetupConfig(rows[0][TP_IPNORDIC_SETUP.dataField]);
+    return ipnordicSetupConfigCache;
+  }
+
+  function getIPnordicVerification() {
+    const saved = loadJson(TP_IPNORDIC_SETUP.verifiedKey, null);
+    if (!saved || !clampInteger(saved.verifiedAt, 0)) return null;
+    return {
+      verifiedAt: clampInteger(saved.verifiedAt, 0),
+      email: normalizeText(saved.email).toLocaleLowerCase('da'),
+      eventId: normalizeText(saved.eventId)
+    };
+  }
+
+  function paintIPnordicSetupStatus(state = 'idle') {
+    const status = document.getElementById('tpIPnordicStatus');
+    const button = document.getElementById('tpIPnordicSetupBtn');
+    if (!status) return;
+    const verified = getIPnordicVerification();
+    if (verified && state !== 'login' && state !== 'error') {
+      status.textContent = 'klar';
+      status.style.color = '#0a7a35';
+      if (button) button.textContent = 'Tjek';
+      return;
+    }
+    const states = {
+      checking: ['kontrollerer…', '#777'],
+      ready: ['ikke testet', '#9a6a0d'],
+      login: ['login', '#a33'],
+      error: ['fejl', '#a33'],
+      idle: ['ikke testet', '#9a6a0d']
+    };
+    const current = states[state] || states.idle;
+    status.textContent = current[0];
+    status.style.color = current[1];
+    if (button) button.textContent = 'Opsæt';
+  }
+
+  function markIPnordicVerified(email = incomingCallUserEmail, eventId = '') {
+    const verification = {
+      verifiedAt: now(),
+      email: normalizeText(email).toLocaleLowerCase('da'),
+      eventId: normalizeText(eventId)
+    };
+    saveJson(TP_IPNORDIC_SETUP.verifiedKey, verification);
+    paintIPnordicSetupStatus('ready');
+    try {
+      globalThis.dispatchEvent(new CustomEvent(TP_IPNORDIC_SETUP.verificationEvent, { detail: verification }));
+    } catch (_) {}
+    return verification;
+  }
+
   async function fetchIncomingCallQueueItems(email) {
     const filter = encodeURIComponent("RecipientEmail eq '" + odataQuote(email) + "'");
     const url = incomingCallQueueListBaseUrl()
@@ -1951,6 +2057,7 @@
       const email = await getIncomingCallUserEmail();
       const rows = await fetchIncomingCallQueueItems(email);
       if (!isLeader()) return;
+      paintIPnordicSetupStatus('ready');
 
       await withCrossTabProcessLock('incoming-call-queue', async () => {
         if (!isLeader()) return;
@@ -1960,6 +2067,7 @@
 
         for (const row of pending) {
           await handleIncomingCall(row.phone, 'sharepoint:' + row.id, { queueTagged: row.queueTagged });
+          markIPnordicVerified(email, 'sharepoint:' + row.id);
         }
         saveJson(INCOMING_CALL_QUEUE_STATE_KEY, {
           lastId: latestId,
@@ -1968,6 +2076,7 @@
         });
       });
     } catch (error) {
+      paintIPnordicSetupStatus('login');
       notifyIncomingCallQueueError(error);
     } finally {
       incomingCallPollInFlight = false;
@@ -2162,6 +2271,339 @@
     }
   }
 
+  function injectIPnordicGuideStyles() {
+    if (document.getElementById('tpIPnordicGuideStyles')) return;
+    const style = document.createElement('style');
+    style.id = 'tpIPnordicGuideStyles';
+    style.textContent = `
+      #tpIPnordicGuideBackdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        display: grid;
+        place-items: center;
+        box-sizing: border-box;
+        padding: 12px;
+        background: rgba(25, 31, 34, .36);
+        font: 12px/16px Arial, sans-serif;
+        letter-spacing: 0;
+      }
+      #tpIPnordicGuideBackdrop[hidden] { display: none; }
+      #tpIPnordicGuide {
+        box-sizing: border-box;
+        width: 430px;
+        max-width: calc(100vw - 24px);
+        max-height: calc(100vh - 24px);
+        overflow: auto;
+        border: 1px solid #9fa9ae;
+        border-radius: 4px;
+        background: #fff;
+        color: #252c30;
+        box-shadow: 0 10px 28px rgba(27, 35, 39, .28);
+      }
+      #tpIPnordicGuideHeader {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 12px;
+        border-bottom: 1px solid #d6dbdd;
+        background: #e9ecee;
+      }
+      #tpIPnordicGuideHeader strong { font-size: 13px; }
+      #tpIPnordicGuideClose {
+        margin-left: auto;
+        width: 26px;
+        height: 26px;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: #4b555a;
+        font: 20px/24px Arial, sans-serif;
+        cursor: pointer;
+      }
+      .tp-ip-step { padding: 11px 12px; border-bottom: 1px solid #dfe3e5; }
+      .tp-ip-step:last-of-type { border-bottom: 0; }
+      .tp-ip-step-title {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        margin-bottom: 7px;
+        font-weight: 600;
+      }
+      .tp-ip-step-number {
+        display: grid;
+        place-items: center;
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        background: #59666c;
+        color: #fff;
+        font-size: 11px;
+      }
+      .tp-ip-state { margin-left: auto; font-size: 11px; font-weight: 600; }
+      .tp-ip-state[data-state="success"] { color: #39791f; }
+      .tp-ip-state[data-state="warning"] { color: #8a610d; }
+      .tp-ip-state[data-state="error"] { color: #9c3131; }
+      #tpIPnordicGuideLogin { margin-left: 6px; color: #176b94; }
+      .tp-ip-path {
+        margin: 0 0 8px;
+        color: #4f5b61;
+      }
+      .tp-ip-settings {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px 12px;
+        margin: 0 0 9px;
+        padding: 7px 8px;
+        border: 1px solid #d9dee0;
+        background: #f6f7f7;
+      }
+      .tp-ip-settings span::before { content: '\\2713'; margin-right: 5px; color: #559229; }
+      .tp-ip-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+      .tp-ip-button {
+        min-height: 28px;
+        padding: 0 9px;
+        border: 1px solid #9da7ac;
+        border-radius: 3px;
+        background: #fff;
+        color: #273036;
+        font: 600 11px/26px Arial, sans-serif;
+        cursor: pointer;
+      }
+      .tp-ip-button:hover:not(:disabled),
+      .tp-ip-button:focus-visible { border-color: #287ca5; background: #f0f6f8; }
+      .tp-ip-button:disabled { color: #7b858a; background: #edf0f1; cursor: wait; }
+      #tpIPnordicStartTest { border-color: #559a25; background: #69ad2f; color: #fff; }
+      #tpIPnordicStartTest:hover:not(:disabled) { background: #589a27; }
+      #tpIPnordicTestText { margin: 8px 0 0; color: #59656a; }
+      #tpIPnordicGuideFooter {
+        display: flex;
+        justify-content: flex-end;
+        padding: 8px 12px;
+        border-top: 1px solid #d6dbdd;
+        background: #f2f4f5;
+      }
+      @media (max-width: 440px) {
+        .tp-ip-settings { grid-template-columns: 1fr; }
+        .tp-ip-actions { align-items: stretch; flex-direction: column; }
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  async function copyIPnordicText(value, button) {
+    const text = String(value || '');
+    if (!text) throw new Error('Der er intet at kopiere');
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.cssText = 'position:fixed;left:-9999px;top:0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      if (!document.execCommand('copy')) throw new Error('Kopiering blev afvist');
+      textarea.remove();
+    }
+    const original = button.textContent;
+    button.textContent = 'Kopieret';
+    setTimeout(() => { if (button.isConnected) button.textContent = original; }, 1400);
+  }
+
+  function createIPnordicGuide() {
+    let backdrop = document.getElementById('tpIPnordicGuideBackdrop');
+    if (backdrop) return backdrop;
+    injectIPnordicGuideStyles();
+    backdrop = document.createElement('div');
+    backdrop.id = 'tpIPnordicGuideBackdrop';
+    backdrop.hidden = true;
+    backdrop.innerHTML = `
+      <section id="tpIPnordicGuide" role="dialog" aria-modal="true" aria-labelledby="tpIPnordicGuideTitle">
+        <header id="tpIPnordicGuideHeader">
+          <strong id="tpIPnordicGuideTitle">Telefonintegration</strong>
+          <button id="tpIPnordicGuideClose" type="button" aria-label="Luk">&times;</button>
+        </header>
+        <div class="tp-ip-step">
+          <div class="tp-ip-step-title">
+            <span class="tp-ip-step-number">1</span>
+            <span>Forbindelse</span>
+            <span id="tpIPnordicConnectionState" class="tp-ip-state" data-state="warning">Kontrollerer…</span>
+          </div>
+          <span id="tpIPnordicConnectionText">Kontrollerer SharePoint-adgangen.</span>
+          <a id="tpIPnordicGuideLogin" href="${TP_MAIL_PUSH.loginUrl}" target="_blank" rel="noopener noreferrer" hidden>Log ind på SharePoint</a>
+        </div>
+        <div class="tp-ip-step">
+          <div class="tp-ip-step-title"><span class="tp-ip-step-number">2</span><span>IPnordic Communicator</span></div>
+          <p class="tp-ip-path">Filer &gt; Indstillinger &gt; Programmer &gt; Tilføj</p>
+          <div class="tp-ip-settings" aria-label="Indstillinger">
+            <span>Kør automatisk</span><span>Indgående</span><span>Opkalds start</span>
+            <span>HTTP metoder</span><span>POST</span><span>Global</span>
+          </div>
+          <div class="tp-ip-actions">
+            <button id="tpIPnordicCopyUrl" class="tp-ip-button" type="button" disabled>Kopiér URL</button>
+            <button id="tpIPnordicCopyDescription" class="tp-ip-button" type="button" disabled>Kopiér beskrivelse</button>
+          </div>
+        </div>
+        <div class="tp-ip-step">
+          <div class="tp-ip-step-title">
+            <span class="tp-ip-step-number">3</span>
+            <span>Test et opkald</span>
+            <span id="tpIPnordicTestState" class="tp-ip-state" data-state="warning">Ikke testet</span>
+          </div>
+          <button id="tpIPnordicStartTest" class="tp-ip-button" type="button" disabled>Start test</button>
+          <p id="tpIPnordicTestText">Start testen, og få derefter nogen til at ringe ind til dig.</p>
+        </div>
+        <footer id="tpIPnordicGuideFooter">
+          <button id="tpIPnordicGuideDone" class="tp-ip-button" type="button">Luk</button>
+        </footer>
+      </section>
+    `;
+    document.body.appendChild(backdrop);
+
+    const close = () => {
+      backdrop.hidden = true;
+      if (backdrop._tpTestTimer) clearInterval(backdrop._tpTestTimer);
+      backdrop._tpTestTimer = null;
+    };
+    backdrop.querySelector('#tpIPnordicGuideClose').addEventListener('click', close);
+    backdrop.querySelector('#tpIPnordicGuideDone').addEventListener('click', close);
+    backdrop.addEventListener('pointerdown', event => { if (event.target === backdrop) close(); });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !backdrop.hidden) close();
+    });
+
+    const copyUrlButton = backdrop.querySelector('#tpIPnordicCopyUrl');
+    const copyDescriptionButton = backdrop.querySelector('#tpIPnordicCopyDescription');
+    copyUrlButton.addEventListener('click', async () => {
+      try { await copyIPnordicText(backdrop._tpConfig?.url, copyUrlButton); }
+      catch (_) { showDomToast('URL kunne ikke kopieres.'); }
+    });
+    copyDescriptionButton.addEventListener('click', async () => {
+      try { await copyIPnordicText(backdrop._tpConfig?.description, copyDescriptionButton); }
+      catch (_) { showDomToast('Beskrivelsen kunne ikke kopieres.'); }
+    });
+
+    const finishTest = verification => {
+      if (!verification || !backdrop._tpTestStartedAt || verification.verifiedAt < backdrop._tpTestStartedAt) return;
+      if (backdrop._tpTestTimer) clearInterval(backdrop._tpTestTimer);
+      backdrop._tpTestTimer = null;
+      const testButton = backdrop.querySelector('#tpIPnordicStartTest');
+      const testState = backdrop.querySelector('#tpIPnordicTestState');
+      const testText = backdrop.querySelector('#tpIPnordicTestText');
+      testButton.disabled = false;
+      testButton.textContent = 'Test igen';
+      testState.dataset.state = 'success';
+      testState.textContent = 'Klar';
+      testText.textContent = 'Opkaldet nåede frem. Telefonintegrationen er klar.';
+    };
+    globalThis.addEventListener(TP_IPNORDIC_SETUP.verificationEvent, event => finishTest(event.detail));
+    globalThis.addEventListener('storage', event => {
+      if (event.key === TP_IPNORDIC_SETUP.verifiedKey && event.newValue) {
+        try { finishTest(JSON.parse(event.newValue)); } catch (_) {}
+      }
+    });
+
+    backdrop.querySelector('#tpIPnordicStartTest').addEventListener('click', () => {
+      const testButton = backdrop.querySelector('#tpIPnordicStartTest');
+      const testState = backdrop.querySelector('#tpIPnordicTestState');
+      const testText = backdrop.querySelector('#tpIPnordicTestText');
+      backdrop._tpTestStartedAt = now();
+      const deadline = backdrop._tpTestStartedAt + TP_IPNORDIC_SETUP.testWaitMs;
+      testButton.disabled = true;
+      testState.dataset.state = 'warning';
+      testState.textContent = 'Venter';
+      if (backdrop._tpTestTimer) clearInterval(backdrop._tpTestTimer);
+      const tick = () => {
+        const verification = getIPnordicVerification();
+        if (verification?.verifiedAt >= backdrop._tpTestStartedAt) {
+          finishTest(verification);
+          return;
+        }
+        const seconds = Math.max(0, Math.ceil((deadline - now()) / 1000));
+        if (seconds <= 0) {
+          clearInterval(backdrop._tpTestTimer);
+          backdrop._tpTestTimer = null;
+          testButton.disabled = false;
+          testButton.textContent = 'Prøv igen';
+          testState.dataset.state = 'error';
+          testState.textContent = 'Intet opkald';
+          testText.textContent = 'Kontrollér IPnordic-reglen, og start testen igen.';
+          return;
+        }
+        testText.textContent = 'Venter på et indgående opkald… ' + seconds + ' sek.';
+      };
+      tick();
+      backdrop._tpTestTimer = setInterval(tick, 1000);
+    });
+    return backdrop;
+  }
+
+  async function openIPnordicSetupGuide() {
+    const backdrop = createIPnordicGuide();
+    const connectionState = backdrop.querySelector('#tpIPnordicConnectionState');
+    const connectionText = backdrop.querySelector('#tpIPnordicConnectionText');
+    const loginLink = backdrop.querySelector('#tpIPnordicGuideLogin');
+    const copyButtons = backdrop.querySelectorAll('#tpIPnordicCopyUrl,#tpIPnordicCopyDescription');
+    const testButton = backdrop.querySelector('#tpIPnordicStartTest');
+    const testState = backdrop.querySelector('#tpIPnordicTestState');
+    const testText = backdrop.querySelector('#tpIPnordicTestText');
+    backdrop._tpConfig = null;
+    backdrop.hidden = false;
+    connectionState.dataset.state = 'warning';
+    connectionState.textContent = 'Kontrollerer…';
+    connectionText.textContent = 'Kontrollerer SharePoint-adgangen.';
+    loginLink.hidden = true;
+    copyButtons.forEach(button => { button.disabled = true; });
+    testButton.disabled = true;
+
+    const verification = getIPnordicVerification();
+    if (verification) {
+      testState.dataset.state = 'success';
+      testState.textContent = 'Klar';
+      testText.textContent = 'Senest bekræftet ' + new Date(verification.verifiedAt).toLocaleString('da-DK', {
+        dateStyle: 'short', timeStyle: 'short'
+      }) + '.';
+      testButton.textContent = 'Test igen';
+    } else {
+      testState.dataset.state = 'warning';
+      testState.textContent = 'Ikke testet';
+      testText.textContent = 'Start testen, og få derefter nogen til at ringe ind til dig.';
+      testButton.textContent = 'Start test';
+    }
+
+    try {
+      const [email, config] = await Promise.all([
+        getIncomingCallUserEmail(),
+        getIPnordicSetupConfig(true)
+      ]);
+      backdrop._tpConfig = config;
+      connectionState.dataset.state = 'success';
+      connectionState.textContent = 'Forbundet';
+      connectionText.textContent = 'SharePoint er klar for ' + email + '.';
+      copyButtons.forEach(button => { button.disabled = false; });
+      testButton.disabled = false;
+      paintIPnordicSetupStatus('ready');
+    } catch (error) {
+      console.warn('[TP][IPNORDIC][SETUP]', error);
+      connectionState.dataset.state = 'error';
+      connectionState.textContent = 'Login kræves';
+      connectionText.textContent = 'Log ind på SharePoint i denne browser, og åbn guiden igen.';
+      loginLink.hidden = false;
+      paintIPnordicSetupStatus('login');
+    }
+  }
+
+  function initIPnordicSetupGuide(root = document) {
+    const button = root.querySelector?.('#tpIPnordicSetupBtn') || document.getElementById('tpIPnordicSetupBtn');
+    if (!button || button.dataset.tpReady === '1') return;
+    button.dataset.tpReady = '1';
+    button.addEventListener('click', openIPnordicSetupGuide);
+    globalThis.addEventListener('storage', event => {
+      if (event.key === TP_IPNORDIC_SETUP.verifiedKey) paintIPnordicSetupStatus('ready');
+    });
+    paintIPnordicSetupStatus('idle');
+  }
+
   function loadPanelPosition(element) {
     const position = loadJson(POS_KEY, null);
     if (!position || !Number.isFinite(Number(position.x)) || !Number.isFinite(Number(position.y))) {
@@ -2215,9 +2657,15 @@
       '<div style="display:flex;align-items:center;gap:6px;margin:0 0 2px">' +
         '<span id="tpSMSStatus" style="font-size:11px;color:#666">SMS: …</span>' +
         '<button id="tpSMSOneBtn" type="button" style="margin-left:auto;padding:4px 8px;font-size:11px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;flex:0 0 auto">Aktivér</button>' +
+      '</div>' +
+      '<div style="display:flex;align-items:center;gap:6px;margin:6px 0 0;padding-top:6px;border-top:1px solid #eee;white-space:nowrap">' +
+        '<span style="font-size:11px;color:#555">Telefon</span>' +
+        '<span id="tpIPnordicStatus" style="margin-left:auto;font-size:10px;color:#9a6a0d">ikke testet</span>' +
+        '<button id="tpIPnordicSetupBtn" type="button" style="padding:4px 8px;font-size:11px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer;flex:0 0 auto">Opsæt</button>' +
       '</div>';
 
     document.body.appendChild(panel);
+    initIPnordicSetupGuide(panel);
     const gearButton = panel.querySelector('#tpGearBtn');
     let menu = null;
 
@@ -4060,6 +4508,12 @@
     parseIncomingCallSearchHTML,
     selectPendingIncomingCallRows,
     shouldShowIncomingCallOsNotification,
+    validateIPnordicSetupConfig,
+    getIPnordicSetupConfig,
+    getIPnordicVerification,
+    markIPnordicVerified,
+    initIPnordicSetupGuide,
+    openIPnordicSetupGuide,
     positionDomToast,
     showDomToast,
     showIncomingCallCard,
