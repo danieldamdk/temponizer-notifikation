@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.13.6
-// @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status med SharePoint-login, SMS-toggle og stabil hover-genvej til "Intet svar".
+// @version      7.13.7
+// @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status, SMS, "Intet svar" og kompakt vikaroverblik ved profilbilleder.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.13.6';
+  const TP_VERSION = '7.13.7';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -33,6 +33,10 @@
   const INTEREST_DETAIL_CONCURRENCY = 4;
   const MESSAGE_SEEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
   const MESSAGE_SEEN_LIMIT = 512;
+  const WORKER_HOVER_CACHE_MS = 5 * 60 * 1000;
+  const WORKER_HOVER_CACHE_LIMIT = 80;
+  const WORKER_HOVER_HIDE_MS = 100;
+  const WORKER_HOVER_CANCEL_PAGE_LIMIT = 20;
 
   const LEADER_KEY = 'tpLeaderV3';
   const HEARTBEAT_MS = 5000;
@@ -72,6 +76,10 @@
   const TOAST_EVT_KEY = 'tpToastEventV2';
   const QUICK_NO_ANSWER_TEXT = 'Intet Svar';
   const QUICK_NO_ANSWER_LINK_SELECTOR = 'a[onclick*="RingVikarOp("]';
+  const WORKER_HOVER_CACHE_KEY = 'tpWorkerHoverCacheV1';
+  const WORKER_ROW_SELECTOR = 'tr[id^="row_"]';
+  const WORKER_SICK_COLOR = '#b32727';
+  const WORKER_WITHDRAWN_COLOR = '#1736e6';
 
   let messagePollInFlight = false;
   let interestPollInFlight = false;
@@ -81,6 +89,7 @@
   let tpMailPushTimer = null;
   let tpSpDigestCache = { value: '', expires: 0 };
   let tpSpEntityTypeCache = '';
+  const workerHoverRequests = new Map();
 
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -138,6 +147,108 @@
 
   function parseHtml(html) {
     return new DOMParser().parseFromString(String(html || ''), 'text/html');
+  }
+
+  function parseLabelCount(value, zeroWhenUnnumbered = false) {
+    const text = normalizeText(value);
+    const match = text.match(/\(([\d.]+)\)\s*$/);
+    if (match) return clampInteger(match[1].replace(/\./g, ''), 0);
+    return zeroWhenUnnumbered && text ? 0 : null;
+  }
+
+  function formatDanishDate(date) {
+    if (!(date instanceof Date) || !Number.isFinite(date.getTime())) return '';
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    return `${day}.${month}.${date.getFullYear()}`;
+  }
+
+  function getWorkerHoverDateRange(referenceDate = new Date()) {
+    const end = new Date(referenceDate.getFullYear(), referenceDate.getMonth(), referenceDate.getDate() - 1);
+    const start = new Date(end.getFullYear(), end.getMonth(), end.getDate() - 89);
+    return {
+      start,
+      end,
+      startText: formatDanishDate(start),
+      endText: formatDanishDate(end)
+    };
+  }
+
+  function parseDanishDate(value) {
+    const match = normalizeText(value).match(/\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b/);
+    if (!match) return null;
+    const date = new Date(Number(match[3]), Number(match[2]) - 1, Number(match[1]));
+    return Number.isFinite(date.getTime()) ? date : null;
+  }
+
+  function parseWorkerProfileHTML(html) {
+    const doc = parseHtml(html);
+    const paidTab = doc.querySelector('#loenudbetalt_link');
+    const complaintTab = doc.querySelector('#klager_link');
+    return {
+      paidShifts: paidTab ? parseLabelCount(paidTab.textContent, true) : null,
+      complaints: complaintTab ? parseLabelCount(complaintTab.textContent, true) : null
+    };
+  }
+
+  function parseWorkerStatsHTML(html) {
+    const doc = parseHtml(html);
+    const values = new Map();
+    for (const row of doc.querySelectorAll('tr')) {
+      const cells = Array.from(row.cells || []);
+      for (let index = 0; index + 1 < cells.length; index += 2) {
+        const label = normalizeText(cells[index].textContent).replace(/:\s*$/, '').toLocaleLowerCase('da');
+        if (!label || values.has(label)) continue;
+        const rawValue = normalizeText(cells[index + 1].textContent);
+        const match = rawValue.match(/-?[\d.]+/);
+        if (match) values.set(label, clampInteger(match[0].replace(/\./g, ''), 0));
+      }
+    }
+    return {
+      completedShifts: values.get('antal vagter') ?? null,
+      sickShifts: values.get('antal sygevagter') ?? null
+    };
+  }
+
+  function parseWorkerCancellationHTML(html, range = {}) {
+    const doc = parseHtml(html);
+    const startTime = range.start instanceof Date ? range.start.getTime() : -Infinity;
+    const endTime = range.end instanceof Date ? range.end.getTime() : Infinity;
+    const records = [];
+
+    for (const row of doc.querySelectorAll('tr[id^="vagtrow_"]')) {
+      const date = parseDanishDate(row.textContent);
+      if (!date) continue;
+      const marker = row.querySelector('span[style*="background-color"]');
+      const color = (marker?.getAttribute('style')?.match(/#[0-9a-f]{6}/i)?.[0] || '').toLowerCase();
+      records.push({ date, color });
+    }
+
+    const inRange = records.filter(record => {
+      const time = record.date.getTime();
+      return time >= startTime && time <= endTime;
+    });
+    const offsets = Array.from(doc.querySelectorAll('[onclick*="switchpage"]'))
+      .map(element => element.getAttribute('onclick')?.match(/switchpage\(\s*['"]annullerede['"]\s*,\s*(\d+)/i)?.[1])
+      .filter(Boolean)
+      .map(Number);
+    const oldestTime = records.length
+      ? Math.min(...records.map(record => record.date.getTime()))
+      : null;
+
+    return {
+      withdrawnShifts: inRange.filter(record => record.color === WORKER_WITHDRAWN_COLOR).length,
+      redSickMarkers: inRange.filter(record => record.color === WORKER_SICK_COLOR).length,
+      recordCount: records.length,
+      oldestDate: oldestTime === null ? null : new Date(oldestTime),
+      nextOffsets: Array.from(new Set(offsets.filter(offset => offset > 0))).sort((left, right) => left - right)
+    };
+  }
+
+  function parseWorkerBlockingsHTML(html) {
+    const doc = parseHtml(html);
+    const toggle = doc.querySelector('#fold_knap');
+    return toggle ? parseLabelCount(toggle.textContent, true) : null;
   }
 
   function getFirstText(root, selectors) {
@@ -774,6 +885,110 @@
 
   async function fetchJson(url, options) {
     return (await fetchWithTimeout(url, options)).json();
+  }
+
+  function buildWorkerProfileURL(workerId, hash = '') {
+    return ORIGIN + '/index.php?page=showvikaroplysninger&vikar_id=' + encodeURIComponent(workerId) + hash;
+  }
+
+  function loadWorkerHoverCache() {
+    const cache = loadJson(WORKER_HOVER_CACHE_KEY, { entries: {} });
+    return cache && typeof cache === 'object' && cache.entries && typeof cache.entries === 'object'
+      ? cache
+      : { entries: {} };
+  }
+
+  function getCachedWorkerHoverData(workerId) {
+    const entry = loadWorkerHoverCache().entries[String(workerId)];
+    return entry && entry.expires > now() && entry.data ? entry.data : null;
+  }
+
+  function saveCachedWorkerHoverData(workerId, data) {
+    const cache = loadWorkerHoverCache();
+    const currentTime = now();
+    cache.entries[String(workerId)] = {
+      expires: currentTime + WORKER_HOVER_CACHE_MS,
+      touched: currentTime,
+      data
+    };
+    const entries = Object.entries(cache.entries)
+      .filter(([, entry]) => entry?.expires > currentTime && entry?.data)
+      .sort((left, right) => (right[1].touched || 0) - (left[1].touched || 0))
+      .slice(0, WORKER_HOVER_CACHE_LIMIT);
+    cache.entries = Object.fromEntries(entries);
+    saveJson(WORKER_HOVER_CACHE_KEY, cache);
+  }
+
+  async function fetchWorkerCancellationSummary(workerId, range) {
+    const pendingOffsets = [0];
+    const visitedOffsets = new Set();
+    let withdrawnShifts = 0;
+
+    while (pendingOffsets.length && visitedOffsets.size < WORKER_HOVER_CANCEL_PAGE_LIMIT) {
+      const offset = pendingOffsets.shift();
+      if (visitedOffsets.has(offset)) continue;
+      visitedOffsets.add(offset);
+      const url = ORIGIN + '/index.php?page=vagtlist_get&ajax=true&switchpage=true&vikar_id=' +
+        encodeURIComponent(workerId) + '&type=annullerede&offset=' + offset;
+      const parsed = parseWorkerCancellationHTML(await fetchText(url), range);
+      withdrawnShifts += parsed.withdrawnShifts;
+
+      if (!parsed.recordCount || (parsed.oldestDate && parsed.oldestDate.getTime() <= range.start.getTime())) break;
+      for (const nextOffset of parsed.nextOffsets) {
+        if (!visitedOffsets.has(nextOffset) && !pendingOffsets.includes(nextOffset)) pendingOffsets.push(nextOffset);
+      }
+    }
+
+    return { withdrawnShifts };
+  }
+
+  async function fetchWorkerHoverData(workerId) {
+    const cached = getCachedWorkerHoverData(workerId);
+    if (cached) return cached;
+
+    const range = getWorkerHoverDateRange();
+    const profileUrl = buildWorkerProfileURL(workerId);
+    const statsUrl = ORIGIN + '/index.php?page=get_vikar_statistik_detail&ajax=true&vikar_id=' +
+      encodeURIComponent(workerId) + '&stat_periode_start=' + encodeURIComponent(range.startText) +
+      '&stat_periode_slut=' + encodeURIComponent(range.endText) + '&kunder_stat_sel=0';
+    const blockingsUrl = ORIGIN + '/index.php?page=get_blokeringer&vikar_id=' +
+      encodeURIComponent(workerId) + '&ajax=true';
+
+    const [profileResult, statsResult, cancellationResult, blockingsResult] = await Promise.allSettled([
+      fetchText(profileUrl).then(parseWorkerProfileHTML),
+      fetchText(statsUrl).then(parseWorkerStatsHTML),
+      fetchWorkerCancellationSummary(workerId, range),
+      fetchText(blockingsUrl).then(parseWorkerBlockingsHTML)
+    ]);
+
+    if ([profileResult, statsResult, cancellationResult, blockingsResult].every(result => result.status === 'rejected')) {
+      throw new Error('Alle vikarens datakilder fejlede');
+    }
+
+    const profile = profileResult.status === 'fulfilled' ? profileResult.value : {};
+    const stats = statsResult.status === 'fulfilled' ? statsResult.value : {};
+    const cancellations = cancellationResult.status === 'fulfilled' ? cancellationResult.value : {};
+    const data = {
+      completedShifts: stats.completedShifts ?? null,
+      paidShifts: profile.paidShifts ?? null,
+      sickShifts: stats.sickShifts ?? null,
+      withdrawnShifts: cancellations.withdrawnShifts ?? null,
+      complaints: profile.complaints ?? null,
+      blockings: blockingsResult.status === 'fulfilled' ? blockingsResult.value : null,
+      rangeEnd: range.endText
+    };
+    if (Object.values(data).every(value => value !== null && value !== undefined)) {
+      saveCachedWorkerHoverData(workerId, data);
+    }
+    return data;
+  }
+
+  function getWorkerHoverData(workerId) {
+    const key = String(workerId);
+    if (!workerHoverRequests.has(key)) {
+      workerHoverRequests.set(key, fetchWorkerHoverData(key).finally(() => workerHoverRequests.delete(key)));
+    }
+    return workerHoverRequests.get(key);
   }
 
   async function fetchMessageSnapshot() {
@@ -2085,6 +2300,381 @@
     } catch (_) {}
   }
 
+  function injectWorkerHoverStyles() {
+    if (document.getElementById('tpWorkerHoverStyles')) return;
+    const style = document.createElement('style');
+    style.id = 'tpWorkerHoverStyles';
+    style.textContent = `
+      .tp-worker-hover-image {
+        cursor: help !important;
+      }
+      .tp-worker-hover-popover {
+        position: fixed;
+        z-index: 10030;
+        display: none;
+        width: 300px;
+        overflow: hidden;
+        border: 1px solid #aeb2b4;
+        border-radius: 2px;
+        background: #ffffff;
+        color: #333333;
+        box-shadow: 0 5px 13px rgba(30, 35, 38, 0.20);
+        font: 11px/1.25 sans-serif, Verdana, Arial, Helvetica, sans-serif;
+        letter-spacing: 0;
+      }
+      .tp-worker-hover-popover[data-open="true"] {
+        display: block;
+      }
+      .tp-worker-hover-head {
+        display: flex;
+        min-height: 28px;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 7px;
+        border-bottom: 1px solid #c9ccce;
+        background: #e9eaea;
+      }
+      .tp-worker-hover-name {
+        min-width: 0;
+        overflow: hidden;
+        font-weight: 600;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .tp-worker-hover-period {
+        margin-left: auto;
+        color: #6a6a6a;
+        white-space: nowrap;
+      }
+      .tp-worker-hover-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto 12px;
+        min-height: 27px;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 7px;
+        border-bottom: 1px solid #d8dadb;
+        background: #ffffff;
+        color: #333333 !important;
+        text-decoration: none !important;
+      }
+      .tp-worker-hover-row:hover,
+      .tp-worker-hover-row:focus-visible {
+        background: #edf3f5;
+      }
+      .tp-worker-hover-label,
+      .tp-worker-hover-value {
+        display: flex;
+        min-width: 0;
+        align-items: center;
+        gap: 5px;
+      }
+      .tp-worker-hover-value {
+        justify-content: flex-end;
+        color: #555b5e;
+        white-space: nowrap;
+      }
+      .tp-worker-hover-value strong {
+        font-weight: 600;
+      }
+      .tp-worker-hover-detail {
+        color: #777c7e;
+        font-size: 10px;
+      }
+      .tp-worker-hover-arrow {
+        color: #888d90;
+        font-size: 14px;
+        text-align: right;
+      }
+      .tp-worker-hover-marker {
+        flex: 0 0 8px;
+        width: 8px;
+        height: 8px;
+        border: 1px solid rgba(0, 0, 0, 0.13);
+      }
+      .tp-worker-hover-marker-sick { background: ${WORKER_SICK_COLOR}; }
+      .tp-worker-hover-marker-withdrawn { background: ${WORKER_WITHDRAWN_COLOR}; }
+      .tp-worker-hover-pair {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+      }
+      .tp-worker-hover-pair .tp-worker-hover-row:first-child {
+        border-right: 1px solid #d8dadb;
+      }
+      .tp-worker-hover-loading,
+      .tp-worker-hover-error {
+        padding: 11px 8px;
+        color: #666666;
+      }
+      .tp-worker-hover-retry {
+        margin-left: 5px;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: #276f91;
+        font: inherit;
+        text-decoration: underline;
+        cursor: pointer;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function createWorkerHoverHead(name, rangeEnd = '') {
+    const head = document.createElement('div');
+    head.className = 'tp-worker-hover-head';
+    const nameElement = document.createElement('span');
+    nameElement.className = 'tp-worker-hover-name';
+    nameElement.textContent = name;
+    const period = document.createElement('span');
+    period.className = 'tp-worker-hover-period';
+    period.textContent = rangeEnd ? '90 dage · t.o.m. ' + rangeEnd : 'Seneste 90 dage';
+    head.append(nameElement, period);
+    return head;
+  }
+
+  function createWorkerHoverRow({ label, value, detail = '', href, marker = '' }) {
+    const link = document.createElement('a');
+    link.className = 'tp-worker-hover-row';
+    link.href = href;
+
+    const labelElement = document.createElement('span');
+    labelElement.className = 'tp-worker-hover-label';
+    if (marker) {
+      const markerElement = document.createElement('span');
+      markerElement.className = 'tp-worker-hover-marker tp-worker-hover-marker-' + marker;
+      markerElement.setAttribute('aria-hidden', 'true');
+      labelElement.appendChild(markerElement);
+    }
+    labelElement.appendChild(document.createTextNode(label));
+
+    const valueElement = document.createElement('span');
+    valueElement.className = 'tp-worker-hover-value';
+    const strong = document.createElement('strong');
+    strong.textContent = value === null || value === undefined ? '–' : String(value);
+    valueElement.appendChild(strong);
+    if (detail) {
+      const detailElement = document.createElement('span');
+      detailElement.className = 'tp-worker-hover-detail';
+      detailElement.textContent = detail;
+      valueElement.appendChild(detailElement);
+    }
+
+    const arrow = document.createElement('span');
+    arrow.className = 'tp-worker-hover-arrow';
+    arrow.setAttribute('aria-hidden', 'true');
+    arrow.textContent = '›';
+    link.append(labelElement, valueElement, arrow);
+    return link;
+  }
+
+  function renderWorkerHoverLoading(popover, context) {
+    const loading = document.createElement('div');
+    loading.className = 'tp-worker-hover-loading';
+    loading.textContent = 'Henter vikaroverblik…';
+    popover.replaceChildren(createWorkerHoverHead(context.name), loading);
+  }
+
+  function renderWorkerHoverData(popover, context, data) {
+    const paidDetail = data.paidShifts === null ? '' : data.paidShifts + ' løn udb.';
+    const completed = createWorkerHoverRow({
+      label: 'Afholdte vagter',
+      value: data.completedShifts,
+      detail: paidDetail,
+      href: buildWorkerProfileURL(context.workerId, '#vagter,loenudbetalt')
+    });
+    const sick = createWorkerHoverRow({
+      label: 'Sygemeldinger',
+      value: data.sickShifts,
+      href: buildWorkerProfileURL(context.workerId, '#vagter,annullerede'),
+      marker: 'sick'
+    });
+    const withdrawn = createWorkerHoverRow({
+      label: 'Sprunget fra',
+      value: data.withdrawnShifts,
+      href: buildWorkerProfileURL(context.workerId, '#vagter,annullerede'),
+      marker: 'withdrawn'
+    });
+    const pair = document.createElement('div');
+    pair.className = 'tp-worker-hover-pair';
+    pair.append(
+      createWorkerHoverRow({
+        label: 'Klager',
+        value: data.complaints,
+        href: buildWorkerProfileURL(context.workerId, '#klager')
+      }),
+      createWorkerHoverRow({
+        label: 'Blokeringer',
+        value: data.blockings,
+        href: buildWorkerProfileURL(context.workerId, '#blokeringer')
+      })
+    );
+    popover.replaceChildren(
+      createWorkerHoverHead(context.name, data.rangeEnd),
+      completed,
+      sick,
+      withdrawn,
+      pair
+    );
+  }
+
+  function renderWorkerHoverError(popover, context, retry) {
+    const error = document.createElement('div');
+    error.className = 'tp-worker-hover-error';
+    error.appendChild(document.createTextNode('Data kunne ikke hentes.'));
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'tp-worker-hover-retry';
+    button.textContent = 'Prøv igen';
+    button.addEventListener('click', retry, { once: true });
+    error.appendChild(button);
+    popover.replaceChildren(createWorkerHoverHead(context.name), error);
+  }
+
+  function findWorkerHoverContext(image) {
+    const row = image.closest(WORKER_ROW_SELECTOR);
+    const workerId = row?.id.match(/^row_(\d+)$/)?.[1];
+    if (!row || !workerId || !String(image.getAttribute('src') || '').includes('/vikarimages/' + workerId + '/')) return null;
+    const profileLinks = Array.from(row.querySelectorAll('a[href*="page=showvikaroplysninger"][href*="vikar_id="]'));
+    const nameLink = profileLinks.find(link => {
+      const href = String(link.getAttribute('href') || '');
+      const text = normalizeText(link.textContent);
+      return href.startsWith('/index.php') && !href.includes('#') && text && !/^\d+$/.test(text);
+    }) || profileLinks.find(link => {
+      const text = normalizeText(link.textContent);
+      return text && !/^\d+$/.test(text) && !/^(Kalender|Stamdata|Kommunikation|Log)$/i.test(text);
+    });
+    const name = normalizeText(nameLink?.textContent);
+    return name ? { workerId, name } : null;
+  }
+
+  function positionWorkerHover(popover, image) {
+    const imageRect = image.getBoundingClientRect();
+    const popoverRect = popover.getBoundingClientRect();
+    const gap = 5;
+    let left = imageRect.right + gap;
+    if (left + popoverRect.width > window.innerWidth - gap) left = imageRect.left - popoverRect.width - gap;
+    left = Math.max(gap, Math.min(left, window.innerWidth - popoverRect.width - gap));
+    let top = imageRect.top;
+    top = Math.max(gap, Math.min(top, window.innerHeight - popoverRect.height - gap));
+    popover.style.left = Math.round(left) + 'px';
+    popover.style.top = Math.round(top) + 'px';
+  }
+
+  function initWorkerProfileHover() {
+    const page = new URL(globalThis.location.href).searchParams.get('page');
+    if (page !== 'findvikar' || document.getElementById('tpWorkerHoverPopover')) return;
+    injectWorkerHoverStyles();
+
+    const popover = document.createElement('aside');
+    popover.id = 'tpWorkerHoverPopover';
+    popover.className = 'tp-worker-hover-popover';
+    popover.setAttribute('aria-live', 'polite');
+    popover.dataset.open = 'false';
+    document.body.appendChild(popover);
+
+    let activeImage = null;
+    let activeContext = null;
+    let hideTimer = null;
+    let requestGeneration = 0;
+
+    const cancelHide = () => {
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = null;
+    };
+    const hideSoon = () => {
+      cancelHide();
+      hideTimer = setTimeout(() => {
+        popover.dataset.open = 'false';
+        activeImage = null;
+        activeContext = null;
+      }, WORKER_HOVER_HIDE_MS);
+    };
+    const loadActiveWorker = async () => {
+      if (!activeImage || !activeContext) return;
+      const generation = ++requestGeneration;
+      renderWorkerHoverLoading(popover, activeContext);
+      positionWorkerHover(popover, activeImage);
+      try {
+        const data = await getWorkerHoverData(activeContext.workerId);
+        if (generation !== requestGeneration || !activeImage || !activeContext) return;
+        renderWorkerHoverData(popover, activeContext, data);
+        positionWorkerHover(popover, activeImage);
+      } catch (error) {
+        if (generation !== requestGeneration || !activeImage || !activeContext) return;
+        console.warn('[TP][VIKARHOVER] Kunne ikke hente data', error);
+        renderWorkerHoverError(popover, activeContext, loadActiveWorker);
+        positionWorkerHover(popover, activeImage);
+      }
+    };
+    const showForImage = image => {
+      const context = findWorkerHoverContext(image);
+      if (!context) return;
+      cancelHide();
+      activeImage = image;
+      activeContext = context;
+      popover.dataset.open = 'true';
+      loadActiveWorker();
+    };
+    const decorate = (root = document) => {
+      for (const row of root.querySelectorAll?.(WORKER_ROW_SELECTOR) || []) {
+        const workerId = row.id.match(/^row_(\d+)$/)?.[1];
+        if (!workerId) continue;
+        const image = Array.from(row.querySelectorAll('img')).find(candidate =>
+          String(candidate.getAttribute('src') || '').includes('/vikarimages/' + workerId + '/')
+        );
+        if (!image || image.dataset.tpWorkerHoverReady === 'true' || !findWorkerHoverContext(image)) continue;
+        image.dataset.tpWorkerHoverReady = 'true';
+        image.classList.add('tp-worker-hover-image');
+        image.addEventListener('mouseenter', () => showForImage(image));
+        image.addEventListener('mouseleave', hideSoon);
+      }
+    };
+
+    popover.addEventListener('mouseenter', cancelHide);
+    popover.addEventListener('mouseleave', hideSoon);
+    window.addEventListener('scroll', () => {
+      if (activeImage && popover.dataset.open === 'true') positionWorkerHover(popover, activeImage);
+    }, { passive: true });
+    window.addEventListener('resize', () => {
+      if (activeImage && popover.dataset.open === 'true') positionWorkerHover(popover, activeImage);
+    });
+    decorate();
+
+    let decorateScheduled = false;
+    const observer = new MutationObserver(() => {
+      if (decorateScheduled) return;
+      decorateScheduled = true;
+      setTimeout(() => {
+        decorateScheduled = false;
+        decorate();
+      }, 0);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function initWorkerProfileDeepLinks() {
+    const page = new URL(globalThis.location.href).searchParams.get('page');
+    if (page !== 'showvikaroplysninger') return;
+    const parts = globalThis.location.hash.replace(/^#/, '').split(',');
+    if (parts[0] !== 'vagter' || !parts[1]) return;
+    const allowedSubtabs = new Set(['loenudbetalt', 'annullerede']);
+    const subtab = allowedSubtabs.has(parts[1]) ? parts[1] : '';
+    if (!subtab) return;
+
+    let attempts = 0;
+    const openSubtab = () => {
+      const target = document.querySelector('#' + subtab + '_link .sub_ver3tab_content');
+      if (target) {
+        target.click();
+        return;
+      }
+      attempts += 1;
+      if (attempts < 20) setTimeout(openSubtab, 100);
+    };
+    openSubtab();
+  }
+
   function parseCallRegistrationTarget(onclickValue) {
     const match = String(onclickValue || '').match(
       /\bRingVikarOp\(\s*['"]?(\d+)['"]?\s*,\s*['"]?(\d+)['"]?\s*\)/
@@ -2325,6 +2915,8 @@
     migrateUserKeyToGM();
     initToastBroadcast();
     injectUI();
+    initWorkerProfileDeepLinks();
+    initWorkerProfileHover();
     initQuickNoAnswer();
     startPolling();
   }
@@ -2370,6 +2962,17 @@
     takeChannelLock,
     parseSmsStatusFromHTML,
     parseCallRegistrationTarget,
+    parseLabelCount,
+    formatDanishDate,
+    getWorkerHoverDateRange,
+    parseDanishDate,
+    parseWorkerProfileHTML,
+    parseWorkerStatsHTML,
+    parseWorkerCancellationHTML,
+    parseWorkerBlockingsHTML,
+    buildWorkerProfileURL,
+    initWorkerProfileHover,
+    initWorkerProfileDeepLinks,
     fetchMessageSnapshot,
     refreshMessageEnrichmentIfNeeded,
     processMessageSnapshot,
@@ -2382,6 +2985,7 @@
       INTEREST_POLL_MS,
       HEARTBEAT_MS,
       LEASE_MS,
+      WORKER_HOVER_CACHE_MS,
       QUICK_NO_ANSWER_TEXT,
       MSG_GENERAL_LIST_URL: MSG_LIST_URLS.generel
     })
@@ -2395,4 +2999,3 @@
   if (document.body) startRuntime();
   else window.addEventListener('DOMContentLoaded', startRuntime, { once: true });
 })();
-
