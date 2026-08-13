@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.13.2
-// @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status, SMS-toggle og Quick "Intet Svar".
+// @version      7.13.3
+// @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status, SMS-toggle og hover-genvej til "Intet svar".
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.13.2';
+  const TP_VERSION = '7.13.3';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -69,6 +69,8 @@
   const ST_INT_KEY = 'tpInterestStateV3';
   const POS_KEY = 'tpPanelPosV4';
   const TOAST_EVT_KEY = 'tpToastEventV2';
+  const QUICK_NO_ANSWER_TEXT = 'Intet Svar';
+  const QUICK_NO_ANSWER_LINK_SELECTOR = 'a[onclick*="RingVikarOp("]';
 
   let messagePollInFlight = false;
   let interestPollInFlight = false;
@@ -2079,43 +2081,180 @@
     } catch (_) {}
   }
 
-  function initQuickNoAnswer() {
-    let auto = false;
-    const observer = new MutationObserver(() => {
-      if (auto) return;
-      const highslideWrapper = document.querySelector('#highslide-wrapper-0');
-      if (!highslideWrapper) return;
-      const noAnswerButton = highslideWrapper.querySelector('input[type="button"][value*="Intet"]');
-      if (!noAnswerButton) return;
+  function parseCallRegistrationTarget(onclickValue) {
+    const match = String(onclickValue || '').match(
+      /\bRingVikarOp\(\s*['"]?(\d+)['"]?\s*,\s*['"]?(\d+)['"]?\s*\)/
+    );
+    if (!match) return null;
+    return { vikarId: match[1], vagtId: match[2] };
+  }
 
-      auto = true;
-      try {
-        highslideWrapper.style.transition = 'opacity .15s, transform .15s';
-        highslideWrapper.style.opacity = '0.35';
-        highslideWrapper.style.pointerEvents = 'none';
-        highslideWrapper.style.transform = 'scale(.99)';
-      } catch (_) {}
+  function injectQuickNoAnswerStyles() {
+    if (document.getElementById('tpQuickNoAnswerStyles')) return;
+    const style = document.createElement('style');
+    style.id = 'tpQuickNoAnswerStyles';
+    style.textContent = `
+      .tp-quick-no-answer-cell {
+        position: relative !important;
+        overflow: visible !important;
+      }
+      .tp-quick-no-answer-menu {
+        position: absolute;
+        right: -4px;
+        bottom: calc(100% - 1px);
+        z-index: 10020;
+        display: block;
+        min-width: 92px;
+        padding: 3px;
+        background: #ffffff;
+        border: 1px solid #aeb8bf;
+        border-radius: 4px;
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.2);
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+        transform: translateY(2px);
+        transition: opacity 80ms ease, transform 80ms ease, visibility 80ms ease;
+      }
+      .tp-quick-no-answer-cell:hover > .tp-quick-no-answer-menu,
+      .tp-quick-no-answer-cell:focus-within > .tp-quick-no-answer-menu {
+        opacity: 1;
+        visibility: visible;
+        pointer-events: auto;
+        transform: translateY(0);
+      }
+      .tp-quick-no-answer-button {
+        display: block;
+        width: 100%;
+        height: 30px;
+        margin: 0;
+        padding: 0 10px;
+        border: 0;
+        border-radius: 3px;
+        background: #ffffff;
+        color: #20272b;
+        font: 600 12px/30px Arial, sans-serif;
+        letter-spacing: 0;
+        text-align: left;
+        white-space: nowrap;
+        cursor: pointer;
+      }
+      .tp-quick-no-answer-button:hover,
+      .tp-quick-no-answer-button:focus-visible {
+        background: #edf3f6;
+        outline: 2px solid #287ca5;
+        outline-offset: -2px;
+      }
+      .tp-quick-no-answer-button:disabled {
+        color: #667177;
+        cursor: wait;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
 
+  function submitQuickNoAnswer(target, button) {
+    const { vikarId, vagtId } = target;
+    const formId = 'registreropkaldvagtid_' + vikarId;
+    if (document.getElementById(formId)) {
+      showToast('Luk den \u00e5bne telefonregistrering f\u00f8rst.');
+      return;
+    }
+
+    const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : globalThis;
+    if (typeof pageWindow.RegistrerOpkald !== 'function') {
+      showToast('Hurtigregistrering er ikke tilg\u00e6ngelig p\u00e5 denne side.');
+      return;
+    }
+
+    const phoneDiv = document.getElementById('phonediv_' + vikarId);
+    if (!phoneDiv || button.disabled) return;
+
+    const form = document.createElement('form');
+    form.id = formId;
+    form.hidden = true;
+    form.dataset.tpQuickNoAnswer = 'true';
+
+    const comment = document.createElement('textarea');
+    comment.id = 'phonetext_' + vikarId;
+    comment.name = 'phonetext';
+    comment.value = QUICK_NO_ANSWER_TEXT;
+    form.appendChild(comment);
+    document.body.appendChild(form);
+
+    button.disabled = true;
+    button.textContent = 'Gemmer...';
+
+    let completed = false;
+    const phoneObserver = new MutationObserver(() => finish(true));
+    const finish = success => {
+      if (completed) return;
+      completed = true;
+      phoneObserver.disconnect();
+      if (form.isConnected) form.remove();
+      button.disabled = false;
+      button.textContent = 'Intet svar';
+      if (!success) showToast('Registreringen kunne ikke bekr\u00e6ftes. Pr\u00f8v igen via telefonikonet.');
+    };
+
+    phoneObserver.observe(phoneDiv, { childList: true, subtree: true });
+    try {
+      pageWindow.RegistrerOpkald(vagtId, vikarId);
       setTimeout(() => {
-        try { noAnswerButton.click(); } catch (_) {}
-        setTimeout(() => {
-          const saveButton = highslideWrapper.querySelector('input[type="submit"], button[type="submit"], input[value*="Gem"]');
-          if (saveButton) {
-            setTimeout(() => {
-              try { saveButton.click(); } catch (_) {}
-              try {
-                if (typeof unsafeWindow !== 'undefined' && unsafeWindow.hs?.close) unsafeWindow.hs.close();
-              } catch (_) {}
-              setTimeout(() => {
-                highslideWrapper.style.opacity = '';
-                highslideWrapper.style.pointerEvents = '';
-                highslideWrapper.style.transform = '';
-              }, 120);
-            }, 30);
-          }
-          auto = false;
-        }, 120);
-      }, 30);
+        if (form.isConnected) form.remove();
+      }, 0);
+      setTimeout(() => finish(false), 7000);
+    } catch (_) {
+      finish(false);
+    }
+  }
+
+  function decorateQuickNoAnswerLinks(root = document) {
+    const links = root.querySelectorAll?.(QUICK_NO_ANSWER_LINK_SELECTOR) || [];
+    for (const link of links) {
+      if (link.dataset.tpQuickNoAnswerReady === 'true') continue;
+      const target = parseCallRegistrationTarget(link.getAttribute('onclick'));
+      const cell = link.closest('td');
+      if (!target || !cell) continue;
+
+      link.dataset.tpQuickNoAnswerReady = 'true';
+      cell.classList.add('tp-quick-no-answer-cell');
+      if (cell.querySelector('.tp-quick-no-answer-menu')) continue;
+
+      const menu = document.createElement('div');
+      menu.className = 'tp-quick-no-answer-menu';
+      menu.setAttribute('role', 'menu');
+      menu.setAttribute('aria-label', 'Hurtig telefonregistrering');
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'tp-quick-no-answer-button';
+      button.textContent = 'Intet svar';
+      button.setAttribute('role', 'menuitem');
+      button.addEventListener('mousedown', event => event.stopPropagation());
+      button.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        submitQuickNoAnswer(target, button);
+      });
+
+      menu.appendChild(button);
+      cell.appendChild(menu);
+    }
+  }
+
+  function initQuickNoAnswer() {
+    injectQuickNoAnswerStyles();
+    decorateQuickNoAnswerLinks();
+
+    let decorateScheduled = false;
+    const observer = new MutationObserver(() => {
+      if (decorateScheduled) return;
+      decorateScheduled = true;
+      setTimeout(() => {
+        decorateScheduled = false;
+        decorateQuickNoAnswerLinks();
+      }, 0);
     });
     observer.observe(document.body, { childList: true, subtree: true });
   }
@@ -2203,6 +2342,7 @@
     withCrossTabProcessLock,
     takeChannelLock,
     parseSmsStatusFromHTML,
+    parseCallRegistrationTarget,
     fetchMessageSnapshot,
     refreshMessageEnrichmentIfNeeded,
     processMessageSnapshot,
@@ -2215,6 +2355,7 @@
       INTEREST_POLL_MS,
       HEARTBEAT_MS,
       LEASE_MS,
+      QUICK_NO_ANSWER_TEXT,
       MSG_GENERAL_LIST_URL: MSG_LIST_URLS.generel
     })
   });
@@ -2227,3 +2368,4 @@
   if (document.body) startRuntime();
   else window.addEventListener('DOMContentLoaded', startRuntime, { once: true });
 })();
+
