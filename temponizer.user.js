@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.13.3
-// @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status, SMS-toggle og hover-genvej til "Intet svar".
+// @version      7.13.4
+// @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status med SharePoint-login, SMS-toggle og hover-genvej til "Intet svar".
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.13.3';
+  const TP_VERSION = '7.13.4';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -51,6 +51,7 @@
     spSite: 'https://vipvikaraps.sharepoint.com/sites/Vikarkonsulenter',
     listTitle: 'TemponizerSettings',
     itemTitle: 'PushoverMail',
+    loginUrl: 'https://vipvikaraps.sharepoint.com/sites/Vikarkonsulenter/Lists/TemponizerSettings/AllItems.aspx',
     pollMs: 30000
   };
 
@@ -1398,14 +1399,16 @@
     try { return localStorage.getItem(TP_MAIL_PUSH.key) === 'true'; } catch (_) { return false; }
   }
 
-  function paintMailPushUI(enabled, statusText, color) {
+  function paintMailPushUI(enabled, statusText, color, showLogin = false) {
     const checkbox = document.getElementById('tpEnableMail');
     const status = document.getElementById('tpMailStatus');
+    const loginLink = document.getElementById('tpMailLoginLink');
     if (checkbox && typeof enabled === 'boolean') checkbox.checked = enabled;
     if (status) {
       status.textContent = statusText || (enabled ? 'til' : 'fra');
       status.style.color = color || (enabled ? '#0a7a35' : '#a33');
     }
+    if (loginLink) loginLink.style.display = showLogin ? 'inline' : 'none';
   }
 
   async function getSharePointDigest() {
@@ -1491,7 +1494,7 @@
     } catch (error) {
       if (generation === tpMailRefreshGeneration) {
         console.warn('[TP][MAIL] refresh error', error);
-        paintMailPushUI(undefined, 'fejl', '#a33');
+        paintMailPushUI(undefined, 'fejl', '#a33', true);
       }
     } finally {
       if (generation === tpMailRefreshGeneration) tpMailRefreshInFlight = false;
@@ -1517,7 +1520,7 @@
       } catch (error) {
         console.warn('[TP][MAIL] update error', error);
         checkbox.checked = !wantOn;
-        paintMailPushUI(checkbox.checked, 'fejl', '#a33');
+        paintMailPushUI(checkbox.checked, 'fejl', '#a33', true);
       } finally {
         checkbox.disabled = false;
         tpMailPushBusy = false;
@@ -1579,6 +1582,7 @@
       '<div style="display:flex;align-items:center;gap:6px;margin:2px 0 6px;white-space:nowrap">' +
         '<label style="display:flex;align-items:center;gap:6px;min-width:0"><input type="checkbox" id="tpEnableMail"> <span>Mail</span></label>' +
         '<span id="tpMailStatus" style="margin-left:auto;font-size:10px;color:#888">…</span>' +
+        '<a id="tpMailLoginLink" href="' + TP_MAIL_PUSH.loginUrl + '" target="_blank" rel="noopener noreferrer" style="display:none;font-size:10px;color:#1769aa;text-decoration:underline">Log ind</a>' +
       '</div>' +
       '<div style="display:flex;align-items:center;gap:6px;margin:0 0 2px">' +
         '<span id="tpSMSStatus" style="font-size:11px;color:#666">SMS: …</span>' +
