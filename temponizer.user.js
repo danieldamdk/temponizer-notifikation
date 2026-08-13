@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.1
+// @version      7.14.2
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, "Intet svar" og kompakt vikaroverblik.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.1';
+  const TP_VERSION = '7.14.2';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -40,6 +40,7 @@
   const INCOMING_CALL_LOCK_MS = 12000;
   const INCOMING_CALL_CARD_MS = 30000;
   const INCOMING_CALL_POLL_MS = 5000;
+  const OUTGOING_CALL_SUPPRESS_MS = 20000;
 
   const LEADER_KEY = 'tpLeaderV3';
   const HEARTBEAT_MS = 5000;
@@ -87,6 +88,7 @@
   const TOAST_EVT_KEY = 'tpToastEventV2';
   const INCOMING_CALL_LOCK_KEY = 'tpIncomingCallLockV1';
   const INCOMING_CALL_QUEUE_STATE_KEY = 'tpIncomingCallQueueStateV1';
+  const OUTGOING_CALL_RECENT_KEY = 'tpRecentOutgoingCallsV1';
   const INCOMING_CALL_HASH_PREFIX = '#tp-call=';
   const QUICK_NO_ANSWER_TEXT = 'Intet Svar';
   const QUICK_NO_ANSWER_LINK_SELECTOR = 'a[onclick*="RingVikarOp("]';
@@ -204,6 +206,50 @@
     if (digits.startsWith('0045') && digits.length >= 12) digits = digits.slice(4);
     else if (digits.startsWith('45') && digits.length === 10) digits = digits.slice(2);
     return digits.length === 8 ? digits : '';
+  }
+
+  function hasIncomingQueueSuffix(value) {
+    return /\*\s*1500(?:\D|$)/.test(String(value || ''));
+  }
+
+  function pruneRecentOutgoingCalls(entries, referenceTime = now()) {
+    return (Array.isArray(entries) ? entries : [])
+      .map(entry => ({
+        phone: normalizePhoneNumber(entry?.phone),
+        ts: clampInteger(entry?.ts, 0)
+      }))
+      .filter(entry => entry.phone && referenceTime - entry.ts >= 0 && referenceTime - entry.ts <= OUTGOING_CALL_SUPPRESS_MS)
+      .slice(-12);
+  }
+
+  function rememberOutgoingCall(phone, referenceTime = now()) {
+    const normalized = normalizePhoneNumber(phone);
+    if (!normalized) return false;
+    const entries = pruneRecentOutgoingCalls(loadJson(OUTGOING_CALL_RECENT_KEY, []), referenceTime);
+    entries.push({ phone: normalized, ts: referenceTime });
+    saveJson(OUTGOING_CALL_RECENT_KEY, entries.slice(-12));
+    return true;
+  }
+
+  async function consumeRecentOutgoingCall(phone, referenceTime = now()) {
+    const normalized = normalizePhoneNumber(phone);
+    if (!normalized) return false;
+    return withCrossTabProcessLock('outgoing-call', () => {
+      const entries = pruneRecentOutgoingCalls(loadJson(OUTGOING_CALL_RECENT_KEY, []), referenceTime);
+      const index = entries.findIndex(entry => entry.phone === normalized);
+      const matched = index >= 0;
+      if (matched) entries.splice(index, 1);
+      saveJson(OUTGOING_CALL_RECENT_KEY, entries);
+      return matched;
+    });
+  }
+
+  function initOutgoingCallTracking() {
+    document.addEventListener('click', event => {
+      const target = event.target?.closest?.('a[href^="tel:"],a[href^="callto:"]') || null;
+      if (!target) return;
+      rememberOutgoingCall(target.getAttribute('href') || target.textContent || '');
+    }, true);
   }
 
   function formatPhoneNumber(value) {
@@ -1793,7 +1839,11 @@
     });
   }
 
-  async function handleIncomingCall(phone, eventId = phone) {
+  async function handleIncomingCall(phone, eventId = phone, options = {}) {
+    if (options.queueTagged !== true && await consumeRecentOutgoingCall(phone)) {
+      console.info('[TP][CALL] Ignorerer callback fra et nyligt udgående opkald', formatPhoneNumber(phone));
+      return;
+    }
     const claimed = await claimIncomingCall(phone, eventId);
     if (!claimed) return;
     showIncomingCallCard({ phone, state: 'loading' });
@@ -1868,6 +1918,7 @@
       .map(row => ({
         id: clampInteger(row.Id, 0),
         phone: normalizePhoneNumber(row.CallerNumber),
+        queueTagged: hasIncomingQueueSuffix(row.CallerNumber),
         createdAt: Date.parse(row.Created || '') || 0
       }))
       .filter(row => row.id > 0 && row.phone);
@@ -1906,7 +1957,7 @@
         const pending = selectPendingIncomingCallRows(rows, state);
 
         for (const row of pending) {
-          await handleIncomingCall(row.phone, 'sharepoint:' + row.id);
+          await handleIncomingCall(row.phone, 'sharepoint:' + row.id, { queueTagged: row.queueTagged });
         }
         saveJson(INCOMING_CALL_QUEUE_STATE_KEY, {
           lastId: latestId,
@@ -3341,6 +3392,7 @@
     if (initIncomingCallReceiver()) return;
     migrateUserKeyToGM();
     initToastBroadcast();
+    initOutgoingCallTracking();
     injectUI();
     initWorkerProfileDeepLinks();
     initWorkerProfileHover();
@@ -3394,6 +3446,11 @@
     getWorkerHoverDateRange,
     parseDanishDate,
     normalizePhoneNumber,
+    hasIncomingQueueSuffix,
+    pruneRecentOutgoingCalls,
+    rememberOutgoingCall,
+    consumeRecentOutgoingCall,
+    initOutgoingCallTracking,
     formatPhoneNumber,
     getIncomingCallNumberFromHash,
     parseIncomingCallSearchHTML,
@@ -3420,6 +3477,7 @@
       MESSAGE_POLL_MS,
       INTEREST_POLL_MS,
       INCOMING_CALL_POLL_MS,
+      OUTGOING_CALL_SUPPRESS_MS,
       HEARTBEAT_MS,
       LEASE_MS,
       WORKER_HOVER_CACHE_MS,
