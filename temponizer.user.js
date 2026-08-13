@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.2
-// @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, "Intet svar" og kompakt vikaroverblik.
+// @version      7.14.3
+// @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, "Intet svar", vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -12,6 +12,7 @@
 // @connect      raw.githubusercontent.com
 // @connect      ajourcare.temponizer.dk
 // @connect      vipvikaraps.sharepoint.com
+// @connect      autregwebservice.stps.dk
 // @run-at       document-idle
 // @noframes
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
@@ -21,7 +22,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.2';
+  const TP_VERSION = '7.14.3';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -78,6 +79,7 @@
     vagt: MSG_LIST_BASE + 'vagt',
     generel: MSG_LIST_BASE + 'gen'
   });
+  const AUTREG_API_URL = 'https://autregwebservice.stps.dk/api/AutReg/GetHealthProfessionals';
   const INTEREST_URL = ORIGIN + '/index.php?page=freevagter';
   const INTEREST_DETAIL_URL = ORIGIN + '/index.php?page=update_vikar_synlighed_from_list&ajax=true';
   const SMS_SETTINGS_URL = ORIGIN + '/index.php?page=showmy_settings';
@@ -129,7 +131,7 @@
     const text = normalizeText(value);
     if (text.length <= maxLength) return text;
     if (maxLength <= 1) return text.slice(0, maxLength);
-    return text.slice(0, maxLength - 1).trimEnd() + '…';
+    return text.slice(0, maxLength - 1).trimEnd() + 'â€¦';
   }
 
   function clampInteger(value, fallback = 0) {
@@ -766,7 +768,7 @@
   function stripCustomerNumber(value) {
     return normalizeText(value)
       .replace(/^\d+\s*/, '')
-      .replace(/^([A-ZÆØÅ]{1,8})\s*-\s*/i, '$1 - ')
+      .replace(/^([A-ZÃ†Ã˜Ã…]{1,8})\s*-\s*/i, '$1 - ')
       .trim();
   }
 
@@ -871,7 +873,7 @@
   function formatShift(shift) {
     const customer = normalizeText(shift?.customer) || `Vagt ${shift?.id || ''}`.trim();
     const when = normalizeText([shift?.date, shift?.time].filter(Boolean).join(' '));
-    return [customer, when].filter(Boolean).join(' · ');
+    return [customer, when].filter(Boolean).join(' Â· ');
   }
 
   function formatMessageNotification(events) {
@@ -885,7 +887,7 @@
       title = `Ny besked fra ${record.name || 'en vikar'}`;
       const lines = [];
       if (record.snippet) lines.push(truncateText(record.snippet, 500));
-      else lines.push('Ny ulæst besked');
+      else lines.push('Ny ulÃ¦st besked');
       if (record.type === 'vagt' && record.context) {
         lines.push('Vagt: ' + truncateText(record.context, 260));
       }
@@ -893,11 +895,11 @@
     } else {
       title = `${total || list.length} nye Temponizer-beskeder`;
       const lines = list.slice(0, 3).map(event => {
-        if (event.kind === 'generic') return event.text || 'Ny ulæst besked';
+        if (event.kind === 'generic') return event.text || 'Ny ulÃ¦st besked';
         const record = event.record || {};
         const detail = record.snippet
           || (record.type === 'vagt' ? record.context : '')
-          || 'Ny ulæst besked';
+          || 'Ny ulÃ¦st besked';
         return `${record.name || 'Ukendt vikar'}: ${truncateText(detail, 190)}`;
       });
       if (list.length > 3) lines.push(`+${list.length - 3} flere`);
@@ -1172,8 +1174,8 @@
     let topMenuFallback = 0;
     let homepageEnriched = false;
 
-    // Topmenuens DOM kan være forsinket. Brug den kun som signal til at hente
-    // en frisk, læsende forside og accepter først derefter en højere total.
+    // Topmenuens DOM kan vÃ¦re forsinket. Brug den kun som signal til at hente
+    // en frisk, lÃ¦sende forside og accepter fÃ¸rst derefter en hÃ¸jere total.
     if ((topMenuTotal ?? 0) > counterTotal) {
       try {
         const homepageDoc = parseHtml(await fetchText(ORIGIN + '/index.php?_=' + Date.now()));
@@ -1195,7 +1197,7 @@
           homepageEnriched = true;
         }
       } catch (error) {
-        console.warn('[TP][MSG] Kunne ikke bekræfte topmenuens beskedtal', error);
+        console.warn('[TP][MSG] Kunne ikke bekrÃ¦fte topmenuens beskedtal', error);
       }
     }
 
@@ -1270,7 +1272,7 @@
       entries = parseInterestDetailHTML(await fetchText(url + '&retry=' + Date.now()), shift);
     }
     if (entries.length !== shift.count) {
-      throw new Error(`Interesselisten for vagt ${shift.id} var ufuldstændig (${entries.length}/${shift.count})`);
+      throw new Error(`Interesselisten for vagt ${shift.id} var ufuldstÃ¦ndig (${entries.length}/${shift.count})`);
     }
     return entries;
   }
@@ -1278,7 +1280,7 @@
   async function fetchInterestSnapshot() {
     const overview = parseInterestOverviewHTML(await fetchText(INTEREST_URL + '&_=' + Date.now()));
     if (!overview.recognized && overview.shifts.length === 0) {
-      throw new Error('Kunne ikke genkende interessetællerne på siden');
+      throw new Error('Kunne ikke genkende interessetÃ¦llerne pÃ¥ siden');
     }
     const nested = await mapLimit(overview.shifts, INTEREST_DETAIL_CONCURRENCY, fetchInterestEntriesForShift);
     const entries = nested.flat();
@@ -1363,7 +1365,7 @@
       }
       await sleep(40 + Math.floor(Math.random() * 60));
     }
-    console.warn('[TP] Springer en poll over, fordi flerfanelåsen var optaget:', name);
+    console.warn('[TP] Springer en poll over, fordi flerfanelÃ¥sen var optaget:', name);
     return undefined;
   }
 
@@ -1377,7 +1379,7 @@
         );
       }
     } catch (error) {
-      console.warn('[TP] Browserens flerfanelås fejlede; bruger lokal reserve.', error);
+      console.warn('[TP] Browserens flerfanelÃ¥s fejlede; bruger lokal reserve.', error);
     }
     return withLocalStorageMutex(name, task);
   }
@@ -1480,7 +1482,7 @@
         eventId: `generic:${snapshot.total}:${clampInteger(state.total, 0)}`,
         delta: unknownDelta,
         targetTotal: snapshot.total,
-        text: unknownDelta === 1 ? 'Ny ulæst besked' : `${unknownDelta} nye ulæste beskeder`
+        text: unknownDelta === 1 ? 'Ny ulÃ¦st besked' : `${unknownDelta} nye ulÃ¦ste beskeder`
       });
     }
 
@@ -1653,7 +1655,7 @@
           console.warn('[TP][PUSHOVER] HTTP', response.status);
         }
       },
-      onerror: error => console.warn('[TP][PUSHOVER] Netværksfejl', error),
+      onerror: error => console.warn('[TP][PUSHOVER] NetvÃ¦rksfejl', error),
       ontimeout: () => console.warn('[TP][PUSHOVER] Timeout')
     });
   }
@@ -1730,17 +1732,17 @@
     const head = document.createElement('div');
     head.style.cssText = 'display:flex;align-items:center;gap:7px;padding:7px 8px;border-bottom:1px solid #c9ccce;background:#e9eaea';
     const icon = document.createElement('span');
-    icon.textContent = '☎';
+    icon.textContent = 'â˜Ž';
     icon.setAttribute('aria-hidden', 'true');
     icon.style.cssText = 'font-size:15px;color:#3f6f85';
     const title = document.createElement('strong');
-    title.textContent = 'Indgående opkald';
+    title.textContent = 'IndgÃ¥ende opkald';
     title.style.cssText = 'font-size:12px;font-weight:600';
     const close = document.createElement('button');
     close.type = 'button';
     close.title = 'Luk';
     close.setAttribute('aria-label', 'Luk');
-    close.textContent = '×';
+    close.textContent = 'Ã—';
     close.style.cssText = 'margin-left:auto;width:22px;height:22px;padding:0;border:0;background:transparent;color:#666;font:18px/20px Arial;cursor:pointer';
     close.addEventListener('click', removeIncomingCallCard);
     head.append(icon, title, close);
@@ -1749,14 +1751,14 @@
     content.style.cssText = 'padding:9px';
     const formattedPhone = formatPhoneNumber(phone);
     if (state === 'loading') {
-      content.textContent = 'Finder vikar for ' + formattedPhone + '…';
+      content.textContent = 'Finder vikar for ' + formattedPhone + 'â€¦';
       content.style.color = '#666';
     } else if (state === 'login') {
       const message = document.createElement('strong');
       message.textContent = 'Log ind i Temponizer';
       message.style.cssText = 'display:block;font-size:13px;font-weight:600';
       const detail = document.createElement('span');
-      detail.textContent = 'Nummeret kan først slås op efter login.';
+      detail.textContent = 'Nummeret kan fÃ¸rst slÃ¥s op efter login.';
       detail.style.cssText = 'display:block;margin-top:3px;color:#6a6a6a';
       content.append(message, detail);
     } else if (state === 'error') {
@@ -1789,7 +1791,7 @@
         name.textContent = match.name;
         name.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:600';
         const action = document.createElement('span');
-        action.textContent = 'Åbn profil ›';
+        action.textContent = 'Ã…bn profil â€º';
         action.style.cssText = 'margin-left:auto;color:#276f91;white-space:nowrap;font-size:11px';
         link.append(name, action);
         content.appendChild(link);
@@ -1809,8 +1811,8 @@
   function showIncomingCallOsNotification(match, phone) {
     try {
       if (!match || !('Notification' in window) || Notification.permission !== 'granted') return;
-      const notification = new Notification('Indgående opkald', {
-        body: match.name + ' · ' + formatPhoneNumber(phone)
+      const notification = new Notification('IndgÃ¥ende opkald', {
+        body: match.name + ' Â· ' + formatPhoneNumber(phone)
       });
       notification.onclick = () => {
         try { globalThis.focus(); } catch (_) {}
@@ -1841,7 +1843,7 @@
 
   async function handleIncomingCall(phone, eventId = phone, options = {}) {
     if (options.queueTagged !== true && await consumeRecentOutgoingCall(phone)) {
-      console.info('[TP][CALL] Ignorerer callback fra et nyligt udgående opkald', formatPhoneNumber(phone));
+      console.info('[TP][CALL] Ignorerer callback fra et nyligt udgÃ¥ende opkald', formatPhoneNumber(phone));
       return;
     }
     const claimed = await claimIncomingCall(phone, eventId);
@@ -2065,7 +2067,7 @@
     });
     const json = JSON.parse(response.responseText || '{}');
     const type = json?.d?.ListItemEntityTypeFullName || json?.ListItemEntityTypeFullName;
-    if (!type) throw new Error('Kan ikke læse SharePoint list entity type');
+    if (!type) throw new Error('Kan ikke lÃ¦se SharePoint list entity type');
     tpSpEntityTypeCache = type;
     return type;
   }
@@ -2112,7 +2114,7 @@
     const generation = ++tpMailRefreshGeneration;
     tpMailRefreshInFlight = true;
     try {
-      paintMailPushUI(undefined, 'synk…', '#888');
+      paintMailPushUI(undefined, 'synkâ€¦', '#888');
       const setting = await getMailPushSetting();
       if (generation !== tpMailRefreshGeneration || tpMailPushBusy) return;
       setLocalMailPushEnabled(setting.enabled);
@@ -2131,7 +2133,7 @@
     const checkbox = root.querySelector('#tpEnableMail');
     if (!checkbox) return;
     checkbox.checked = getLocalMailPushEnabled();
-    paintMailPushUI(checkbox.checked, 'synk…', '#888');
+    paintMailPushUI(checkbox.checked, 'synkâ€¦', '#888');
 
     checkbox.addEventListener('change', async () => {
       if (tpMailPushBusy) return;
@@ -2140,7 +2142,7 @@
       tpMailRefreshGeneration += 1;
       tpMailRefreshInFlight = false;
       checkbox.disabled = true;
-      paintMailPushUI(wantOn, wantOn ? 'slår til…' : 'slår fra…', '#888');
+      paintMailPushUI(wantOn, wantOn ? 'slÃ¥r tilâ€¦' : 'slÃ¥r fraâ€¦', '#888');
       try {
         await setMailPushSetting(wantOn);
       } catch (error) {
@@ -2193,8 +2195,8 @@
       '<div id="tpHeader" style="cursor:move;display:flex;align-items:center;gap:6px;margin-bottom:4px">' +
         '<div style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">TP Notifikationer</div>' +
         '<div style="margin-left:auto;display:flex;align-items:center;gap:6px">' +
-          '<div id="tpDragHint" style="font-size:10px;color:#888">træk</div>' +
-          '<button id="tpGearBtn" type="button" title="Indstillinger" aria-label="Indstillinger" style="width:22px;height:22px;line-height:20px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:50%;box-shadow:0 4px 12px rgba(0,0,0,.18);cursor:pointer;padding:0;user-select:none">⚙</button>' +
+          '<div id="tpDragHint" style="font-size:10px;color:#888">trÃ¦k</div>' +
+          '<button id="tpGearBtn" type="button" title="Indstillinger" aria-label="Indstillinger" style="width:22px;height:22px;line-height:20px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:50%;box-shadow:0 4px 12px rgba(0,0,0,.18);cursor:pointer;padding:0;user-select:none">âš™</button>' +
         '</div>' +
       '</div>' +
       '<div style="display:flex;align-items:center;gap:6px;margin:2px 0;white-space:nowrap">' +
@@ -2207,12 +2209,12 @@
       '</div>' +
       '<div style="display:flex;align-items:center;gap:6px;margin:2px 0 6px;white-space:nowrap">' +
         '<label style="display:flex;align-items:center;gap:6px;min-width:0"><input type="checkbox" id="tpEnableMail"> <span>Mail</span></label>' +
-        '<span id="tpMailStatus" style="margin-left:auto;font-size:10px;color:#888">…</span>' +
+        '<span id="tpMailStatus" style="margin-left:auto;font-size:10px;color:#888">â€¦</span>' +
         '<a id="tpMailLoginLink" href="' + TP_MAIL_PUSH.loginUrl + '" target="_blank" rel="noopener noreferrer" style="display:none;font-size:10px;color:#1769aa;text-decoration:underline">Log ind</a>' +
       '</div>' +
       '<div style="display:flex;align-items:center;gap:6px;margin:0 0 2px">' +
-        '<span id="tpSMSStatus" style="font-size:11px;color:#666">SMS: …</span>' +
-        '<button id="tpSMSOneBtn" type="button" style="margin-left:auto;padding:4px 8px;font-size:11px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;flex:0 0 auto">Aktivér</button>' +
+        '<span id="tpSMSStatus" style="font-size:11px;color:#666">SMS: â€¦</span>' +
+        '<button id="tpSMSOneBtn" type="button" style="margin-left:auto;padding:4px 8px;font-size:11px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;flex:0 0 auto">AktivÃ©r</button>' +
       '</div>';
 
     document.body.appendChild(panel);
@@ -2277,15 +2279,15 @@
           const raw = await gmGET(SCRIPT_RAW_URL + '?t=' + Date.now());
           const match = raw.match(/@version\s+([0-9.]+)/);
           if (!match) {
-            showToast('Kunne ikke læse remote version.');
+            showToast('Kunne ikke lÃ¦se remote version.');
             return;
           }
           const remote = match[1];
           const comparison = compareVersions(remote, TP_VERSION);
           if (comparison === 0) {
-            showToast('Du kører allerede nyeste version (' + remote + ').');
+            showToast('Du kÃ¸rer allerede nyeste version (' + remote + ').');
           } else if (comparison > 0) {
-            showToast('Ny version tilgængelig: ' + remote + ' (du kører ' + TP_VERSION + '). Åbner…');
+            showToast('Ny version tilgÃ¦ngelig: ' + remote + ' (du kÃ¸rer ' + TP_VERSION + '). Ã…bnerâ€¦');
             window.open(SCRIPT_RAW_URL, '_blank', 'noopener');
           } else {
             showToast('Din version ' + TP_VERSION + ' er nyere end den offentliggjorte ' + remote + '.');
@@ -2448,7 +2450,7 @@
     element.style.bottom = 'auto';
   }
 
-  // SMS-blokken er bevidst bevaret tæt på den fungerende 7.11.9-version.
+  // SMS-blokken er bevidst bevaret tÃ¦t pÃ¥ den fungerende 7.11.9-version.
   function hasDisplayBlock(element) {
     if (!element) return false;
     const style = (element.getAttribute('style') || '').replace(/\s+/g, '').toLowerCase();
@@ -2592,7 +2594,7 @@
       return initialStatus;
     }
     if (!invokeIframeAction(iframe, wantOn)) {
-      throw new Error('Kan ikke udløse aktivering/deaktivering i iframe.');
+      throw new Error('Kan ikke udlÃ¸se aktivering/deaktivering i iframe.');
     }
     const maybeReloaded = new Promise(resolve => {
       let done = false;
@@ -2633,7 +2635,7 @@
     async setEnabled(wantOn, uiBusy, callback) {
       if (this._busy) return;
       this._busy = true;
-      if (uiBusy) uiBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
+      if (uiBusy) uiBusy(true, wantOn ? 'aktivererâ€¦' : 'deaktivererâ€¦');
       try {
         const status = await toggleSmsInIframe(wantOn, 15000, 500);
         this._last = status;
@@ -2666,23 +2668,23 @@
           label.style.color = '#0a7a35';
           break;
         case 'inactive':
-          button.textContent = 'Aktivér';
+          button.textContent = 'AktivÃ©r';
           label.textContent = 'SMS: Ikke aktiv' + (status.phone ? ' - ' + status.phone : '');
           label.style.color = '#a33';
           break;
         default:
-          button.textContent = 'Aktivér';
+          button.textContent = 'AktivÃ©r';
           label.textContent = 'SMS: Ukendt';
           label.style.color = '#666';
       }
     }
     button.addEventListener('click', async () => {
       const wantOn = sms._last?.state !== 'active';
-      setBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
+      setBusy(true, wantOn ? 'aktivererâ€¦' : 'deaktivererâ€¦');
       await sms.setEnabled(wantOn, setBusy, paint);
     });
     (async () => {
-      setBusy(true, 'indlæser…');
+      setBusy(true, 'indlÃ¦serâ€¦');
       await sms.refresh(paint);
       setBusy(false);
     })();
@@ -2690,7 +2692,7 @@
 
   function tpTestPushoverBoth() {
     if (!getUserKey()) {
-      showToast('Indsæt din USER-token i indstillingerne før test.');
+      showToast('IndsÃ¦t din USER-token i indstillingerne fÃ¸r test.');
       return;
     }
     const time = new Date().toLocaleTimeString();
@@ -2895,7 +2897,7 @@
     const valueElement = document.createElement('span');
     valueElement.className = 'tp-worker-hover-value';
     const strong = document.createElement('strong');
-    strong.textContent = value === null || value === undefined ? '–' : String(value);
+    strong.textContent = value === null || value === undefined ? 'â€“' : String(value);
     valueElement.appendChild(strong);
     if (detail) {
       const detailElement = document.createElement('span');
@@ -2907,7 +2909,7 @@
     const arrow = document.createElement('span');
     arrow.className = 'tp-worker-hover-arrow';
     arrow.setAttribute('aria-hidden', 'true');
-    arrow.textContent = '›';
+    arrow.textContent = 'â€º';
     link.append(labelElement, valueElement, arrow);
     return link;
   }
@@ -2927,7 +2929,7 @@
       const count = document.createElement('span');
       count.className = 'tp-worker-hover-count';
       const strong = document.createElement('strong');
-      strong.textContent = value === null || value === undefined ? '–' : String(value);
+      strong.textContent = value === null || value === undefined ? 'â€“' : String(value);
       const small = document.createElement('small');
       small.textContent = caption;
       count.append(strong, small);
@@ -2937,7 +2939,7 @@
     const arrow = document.createElement('span');
     arrow.className = 'tp-worker-hover-arrow';
     arrow.setAttribute('aria-hidden', 'true');
-    arrow.textContent = '›';
+    arrow.textContent = 'â€º';
     link.append(label, counts, arrow);
     return link;
   }
@@ -2945,7 +2947,7 @@
   function renderWorkerHoverLoading(popover, context) {
     const loading = document.createElement('div');
     loading.className = 'tp-worker-hover-loading';
-    loading.textContent = 'Henter vikaroverblik…';
+    loading.textContent = 'Henter vikaroverblikâ€¦';
     popover.replaceChildren(createWorkerHoverHead(context.name), loading);
   }
 
@@ -2997,7 +2999,7 @@
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'tp-worker-hover-retry';
-    button.textContent = 'Prøv igen';
+    button.textContent = 'PrÃ¸v igen';
     button.addEventListener('click', retry, { once: true });
     error.appendChild(button);
     popover.replaceChildren(createWorkerHoverHead(context.name), error);
@@ -3145,6 +3147,299 @@
       if (attempts < 20) setTimeout(openSubtab, 100);
     };
     openSubtab();
+  }
+
+  function parseCprBirthDate(value) {
+    const digits = String(value || '').replace(/\D/g, '');
+    if (digits.length !== 10 || /^(?:0{6}|9{6})/.test(digits)) return '';
+
+    const day = Number(digits.slice(0, 2));
+    const month = Number(digits.slice(2, 4));
+    const shortYear = Number(digits.slice(4, 6));
+    const centuryDigit = Number(digits[6]);
+    let year;
+
+    if (centuryDigit <= 3) year = 1900 + shortYear;
+    else if (centuryDigit === 4 || centuryDigit === 9) year = (shortYear <= 36 ? 2000 : 1900) + shortYear;
+    else year = (shortYear <= 57 ? 2000 : 1800) + shortYear;
+
+    const date = new Date(Date.UTC(year, month - 1, day));
+    if (
+      date.getUTCFullYear() !== year ||
+      date.getUTCMonth() !== month - 1 ||
+      date.getUTCDate() !== day ||
+      date.getTime() > Date.now()
+    ) return '';
+
+    return [
+      String(year).padStart(4, '0'),
+      String(month).padStart(2, '0'),
+      String(day).padStart(2, '0')
+    ].join('-');
+  }
+
+  function getAuthorizationProfession(value) {
+    const profession = normalizeText(value).toLocaleLowerCase('da');
+    if (/\bssa\b/.test(profession) || profession.includes('social- og sundhedsassistent')) {
+      return { code: '5152', label: 'SSA' };
+    }
+    if (/\bspl\b/.test(profession) || profession.includes('sygeplejerske')) {
+      return { code: '5166', label: 'SPL' };
+    }
+    return null;
+  }
+
+  function formatIsoDate(date = new Date()) {
+    return [
+      String(date.getFullYear()).padStart(4, '0'),
+      String(date.getMonth() + 1).padStart(2, '0'),
+      String(date.getDate()).padStart(2, '0')
+    ].join('-');
+  }
+
+  function buildAuthorizationLookupURL(profile, referenceDate = new Date()) {
+    const birthDateFrom = new Date(profile.birthDate + 'T00:00:00Z');
+    birthDateFrom.setUTCDate(birthDateFrom.getUTCDate() - 1);
+    // The live REST endpoint currently treats the From boundary as exclusive.
+    const params = new URLSearchParams({
+      Name: profile.name,
+      BirthdayFrom: birthDateFrom.toISOString().slice(0, 10),
+      BirthdayTo: profile.birthDate,
+      AuthorizationDateFrom: '1899-12-31',
+      AuthorizationDateTo: formatIsoDate(referenceDate),
+      ProfessionGroup: profile.professionCode,
+      AuthorizationStatus: 'Valid',
+      SeventyFiveYearsRule: 'NotSpecified'
+    });
+    return AUTREG_API_URL + '?' + params.toString();
+  }
+
+  function normalizeAuthorizationName(value) {
+    return normalizeText(value)
+      .toLocaleLowerCase('da')
+      .replace(/[^a-z0-9\u00c0-\u024f]+/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function parseAuthorizationLookupResponse(payload, profile) {
+    const records = Array.isArray(payload?.GetHealthProfessionalsResult)
+      ? payload.GetHealthProfessionalsResult
+      : [];
+    const expectedName = normalizeAuthorizationName(profile.name);
+    const matches = records.filter(record => {
+      const birthDate = String(record?.BirthDate || '').slice(0, 10);
+      const professionCode = String(record?.ProfessionCode || '');
+      const returnedName = normalizeAuthorizationName([record?.FirstName, record?.LastName].filter(Boolean).join(' '));
+      const nameMatches = returnedName && (
+        returnedName === expectedName ||
+        returnedName.includes(expectedName) ||
+        expectedName.includes(returnedName)
+      );
+      const validValue = record?.AuthorizationValid;
+      const isValid = validValue == null || validValue === true || /^(?:true|valid|gyldig)$/i.test(String(validValue));
+      return birthDate === profile.birthDate && professionCode === profile.professionCode && nameMatches && isValid;
+    });
+    const uniqueMatches = new Map(matches.map(record => [
+      String(record?.AuthorizationID || JSON.stringify(record)),
+      record
+    ]));
+    return uniqueMatches.size === 1 ? 'found' : uniqueMatches.size > 1 ? 'multiple' : 'not-found';
+  }
+
+  function fetchPublicJson(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        headers: { 'Accept': 'application/json' },
+        anonymous: true,
+        timeout: FETCH_TIMEOUT_MS,
+        onload: response => {
+          if (response.status < 200 || response.status >= 300) {
+            reject(new Error('HTTP ' + response.status));
+            return;
+          }
+          try {
+            resolve(JSON.parse(response.responseText || '{}'));
+          } catch (_) {
+            reject(new Error('Ugyldigt svar'));
+          }
+        },
+        onerror: () => reject(new Error('Netvaerksfejl')),
+        ontimeout: () => reject(new Error('Timeout'))
+      });
+    });
+  }
+
+  function readAuthorizationProfile() {
+    const name = normalizeText(document.getElementById('navn')?.value);
+    const birthDate = parseCprBirthDate(document.getElementById('cpr_nr')?.value);
+    const heading = document.querySelector('#themaincontent h1')?.textContent || '';
+    const profession = getAuthorizationProfession(heading);
+    return {
+      name,
+      birthDate,
+      professionCode: profession?.code || '',
+      professionLabel: profession?.label || ''
+    };
+  }
+
+  function injectAuthorizationLookupStyles() {
+    if (document.getElementById('tpAuthorizationLookupStyles')) return;
+    const style = document.createElement('style');
+    style.id = 'tpAuthorizationLookupStyles';
+    style.textContent = `
+      #tpAuthorizationLookup {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 4px;
+        margin-top: 5px;
+        width: 152px;
+        max-width: 100%;
+      }
+      #tpAuthorizationLookupButton {
+        box-sizing: border-box;
+        width: 152px;
+        max-width: 100%;
+        height: 28px;
+        margin: 0;
+        padding: 0 9px;
+        border: 1px solid #559a25;
+        border-radius: 3px;
+        background: #69ad2f;
+        color: #ffffff;
+        font: 600 11px/26px Arial, sans-serif;
+        letter-spacing: 0;
+        text-align: center;
+        white-space: nowrap;
+        cursor: pointer;
+      }
+      #tpAuthorizationLookupButton:hover,
+      #tpAuthorizationLookupButton:focus-visible {
+        background: #589a27;
+        outline: 2px solid #287ca5;
+        outline-offset: 1px;
+      }
+      #tpAuthorizationLookupButton:disabled {
+        border-color: #9aa4a9;
+        background: #aeb6ba;
+        cursor: wait;
+      }
+      #tpAuthorizationLookupStatus {
+        box-sizing: border-box;
+        width: 152px;
+        max-width: 100%;
+        min-height: 25px;
+        padding: 5px 6px;
+        border: 1px solid #b7c0c4;
+        border-radius: 3px;
+        background: #f2f4f5;
+        color: #344047;
+        font: 600 10.5px/14px Arial, sans-serif;
+        letter-spacing: 0;
+        text-align: left;
+      }
+      #tpAuthorizationLookupStatus[hidden] { display: none; }
+      #tpAuthorizationLookupStatus[data-state="success"] {
+        border-color: #7da75f;
+        background: #e8f3df;
+        color: #315f16;
+      }
+      #tpAuthorizationLookupStatus[data-state="missing"] {
+        border-color: #bd6b6b;
+        background: #f8e7e7;
+        color: #7c2525;
+      }
+      #tpAuthorizationLookupStatus[data-state="warning"] {
+        border-color: #c29c46;
+        background: #fff4d4;
+        color: #705514;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function setAuthorizationLookupStatus(container, state, text) {
+    const status = container.querySelector('#tpAuthorizationLookupStatus');
+    if (!status) return;
+    status.dataset.state = state;
+    status.textContent = text;
+    status.hidden = false;
+  }
+
+  async function runAuthorizationLookup(container) {
+    const button = container.querySelector('#tpAuthorizationLookupButton');
+    if (!button || button.disabled) return;
+    const profile = readAuthorizationProfile();
+
+    if (!profile.name) {
+      setAuthorizationLookupStatus(container, 'warning', 'Navn mangler');
+      return;
+    }
+    if (!profile.birthDate) {
+      setAuthorizationLookupStatus(container, 'warning', 'CPR er ugyldigt');
+      return;
+    }
+    if (!profile.professionCode) {
+      setAuthorizationLookupStatus(container, 'warning', 'Kun SSA og SPL');
+      return;
+    }
+
+    button.disabled = true;
+    button.textContent = 'Kontrollerer...';
+    setAuthorizationLookupStatus(container, 'warning', 'Kontrollerer...');
+    try {
+      const payload = await fetchPublicJson(buildAuthorizationLookupURL(profile));
+      const result = parseAuthorizationLookupResponse(payload, profile);
+      if (result === 'found') setAuthorizationLookupStatus(container, 'success', 'Autorisation fundet');
+      else if (result === 'multiple') setAuthorizationLookupStatus(container, 'warning', 'Flere mulige fund');
+      else setAuthorizationLookupStatus(container, 'missing', 'Autorisation ikke fundet');
+    } catch (error) {
+      console.warn('[TP][ERR][AUTREG]', error?.message || 'Kontrol mislykkedes');
+      setAuthorizationLookupStatus(container, 'warning', 'Kontrol mislykkedes');
+    } finally {
+      button.disabled = false;
+      button.textContent = 'Tjek autorisation';
+    }
+  }
+
+  function initAuthorizationLookup() {
+    const page = new URL(globalThis.location.href).searchParams.get('page');
+    if (page !== 'showvikaroplysninger') return;
+    injectAuthorizationLookupStyles();
+
+    let attempts = 0;
+    const attach = () => {
+      if (document.getElementById('tpAuthorizationLookup')) return;
+      const select = document.getElementById('misc_text_typer-22');
+      if (!select?.parentElement) {
+        attempts += 1;
+        if (attempts < 30) setTimeout(attach, 100);
+        return;
+      }
+
+      const container = document.createElement('div');
+      container.id = 'tpAuthorizationLookup';
+
+      const button = document.createElement('button');
+      button.id = 'tpAuthorizationLookupButton';
+      button.type = 'button';
+      button.textContent = 'Tjek autorisation';
+      button.title = 'Kontroller i Autorisationsregisteret';
+      button.addEventListener('click', () => runAuthorizationLookup(container));
+
+      const status = document.createElement('div');
+      status.id = 'tpAuthorizationLookupStatus';
+      status.setAttribute('role', 'status');
+      status.setAttribute('aria-live', 'polite');
+      status.hidden = true;
+
+      container.append(button, status);
+      select.insertAdjacentElement('afterend', container);
+    };
+    attach();
   }
 
   function parseCallRegistrationTarget(onclickValue) {
@@ -3395,6 +3690,7 @@
     initOutgoingCallTracking();
     injectUI();
     initWorkerProfileDeepLinks();
+    initAuthorizationLookup();
     initWorkerProfileHover();
     initQuickNoAnswer();
     startPolling();
@@ -3466,6 +3762,11 @@
     buildWorkerProfileURL,
     initWorkerProfileHover,
     initWorkerProfileDeepLinks,
+    parseCprBirthDate,
+    getAuthorizationProfession,
+    buildAuthorizationLookupURL,
+    parseAuthorizationLookupResponse,
+    initAuthorizationLookup,
     fetchMessageSnapshot,
     refreshMessageEnrichmentIfNeeded,
     processMessageSnapshot,
