@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.13.9
+// @version      7.14.0
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, "Intet svar" og kompakt vikaroverblik.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.13.9';
+  const TP_VERSION = '7.14.0';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -39,6 +39,7 @@
   const WORKER_HOVER_CANCEL_PAGE_LIMIT = 20;
   const INCOMING_CALL_LOCK_MS = 12000;
   const INCOMING_CALL_CARD_MS = 30000;
+  const INCOMING_CALL_POLL_MS = 5000;
 
   const LEADER_KEY = 'tpLeaderV3';
   const HEARTBEAT_MS = 5000;
@@ -61,6 +62,14 @@
     pollMs: 30000
   };
 
+  const TP_CALL_QUEUE = {
+    spSite: TP_MAIL_PUSH.spSite,
+    listTitle: 'TemponizerCalls',
+    pollMs: INCOMING_CALL_POLL_MS,
+    batchSize: 20,
+    notificationMaxAgeMs: 10 * 60 * 1000
+  };
+
   const ORIGIN = globalThis.location?.origin || 'https://ajourcare.temponizer.dk';
   const MSG_COUNTER_URL = ORIGIN + '/index.php?page=get_comcenter_counters&ajax=true';
   const MSG_LIST_BASE = ORIGIN + '/index.php?page=get_comcenter_contents&ajax=true&vagt_avail_id=0&vikar_id=0&kontor_id=0&hidemsg=false&comcentertype=';
@@ -77,6 +86,7 @@
   const POS_KEY = 'tpPanelPosV4';
   const TOAST_EVT_KEY = 'tpToastEventV2';
   const INCOMING_CALL_LOCK_KEY = 'tpIncomingCallLockV1';
+  const INCOMING_CALL_QUEUE_STATE_KEY = 'tpIncomingCallQueueStateV1';
   const INCOMING_CALL_HASH_PREFIX = '#tp-call=';
   const QUICK_NO_ANSWER_TEXT = 'Intet Svar';
   const QUICK_NO_ANSWER_LINK_SELECTOR = 'a[onclick*="RingVikarOp("]';
@@ -87,6 +97,9 @@
 
   let messagePollInFlight = false;
   let interestPollInFlight = false;
+  let incomingCallPollInFlight = false;
+  let incomingCallUserEmail = '';
+  let incomingCallQueueErrorNotifiedAt = 0;
   let tpMailPushBusy = false;
   let tpMailRefreshInFlight = false;
   let tpMailRefreshGeneration = 0;
@@ -186,7 +199,8 @@
   }
 
   function normalizePhoneNumber(value) {
-    let digits = String(value || '').replace(/\D/g, '');
+    const phonePart = String(value || '').split('*', 1)[0];
+    let digits = phonePart.replace(/\D/g, '');
     if (digits.startsWith('0045') && digits.length >= 12) digits = digits.slice(4);
     else if (digits.startsWith('45') && digits.length === 10) digits = digits.slice(2);
     return digits.length === 8 ? digits : '';
@@ -1751,18 +1765,19 @@
     } catch (_) {}
   }
 
-  async function claimIncomingCall(phone) {
+  async function claimIncomingCall(phone, eventId = phone) {
     return withCrossTabProcessLock('incoming-call', () => {
       const last = loadJson(INCOMING_CALL_LOCK_KEY, null);
       const time = now();
-      if (last?.phone === phone && time - clampInteger(last.ts, 0) < INCOMING_CALL_LOCK_MS) return false;
-      saveJson(INCOMING_CALL_LOCK_KEY, { phone, ts: time });
+      const lastEventId = last?.eventId || last?.phone;
+      if (lastEventId === eventId && time - clampInteger(last.ts, 0) < INCOMING_CALL_LOCK_MS) return false;
+      saveJson(INCOMING_CALL_LOCK_KEY, { eventId, phone, ts: time });
       return true;
     });
   }
 
-  async function handleIncomingCall(phone) {
-    const claimed = await claimIncomingCall(phone);
+  async function handleIncomingCall(phone, eventId = phone) {
+    const claimed = await claimIncomingCall(phone, eventId);
     if (!claimed) return;
     showIncomingCallCard({ phone, state: 'loading' });
     try {
@@ -1783,6 +1798,108 @@
     } catch (_) {}
     handleIncomingCall(phone);
     return true;
+  }
+
+  function incomingCallQueueListBaseUrl() {
+    return TP_CALL_QUEUE.spSite.replace(/\/$/, '')
+      + "/_api/web/lists/getbytitle('" + odataQuote(TP_CALL_QUEUE.listTitle) + "')";
+  }
+
+  function ensureIncomingCallQueueState() {
+    const saved = loadJson(INCOMING_CALL_QUEUE_STATE_KEY, null);
+    if (saved && typeof saved === 'object') {
+      return {
+        lastId: clampInteger(saved.lastId, 0),
+        initializedAt: clampInteger(saved.initializedAt, now()),
+        ready: saved.ready === true
+      };
+    }
+    const state = { lastId: 0, initializedAt: now(), ready: false };
+    saveJson(INCOMING_CALL_QUEUE_STATE_KEY, state);
+    return state;
+  }
+
+  async function getIncomingCallUserEmail() {
+    if (incomingCallUserEmail) return incomingCallUserEmail;
+    const response = await gmRequest({
+      url: TP_CALL_QUEUE.spSite.replace(/\/$/, '') + '/_api/web/currentuser?$select=Email',
+      headers: { 'Accept': 'application/json;odata=nometadata' }
+    });
+    const json = JSON.parse(response.responseText || '{}');
+    const email = normalizeText(json.Email || json?.d?.Email).toLocaleLowerCase('da');
+    if (!email || !email.includes('@')) throw new Error('SharePoint-brugerens e-mail mangler');
+    incomingCallUserEmail = email;
+    return email;
+  }
+
+  async function fetchIncomingCallQueueItems(email) {
+    const filter = encodeURIComponent("RecipientEmail eq '" + odataQuote(email) + "'");
+    const url = incomingCallQueueListBaseUrl()
+      + '/items?$select=Id,CallerNumber,RecipientEmail,Created'
+      + '&$filter=' + filter
+      + '&$orderby=Id%20desc&$top=' + TP_CALL_QUEUE.batchSize;
+    const response = await gmRequest({
+      url,
+      headers: { 'Accept': 'application/json;odata=nometadata' }
+    });
+    const json = JSON.parse(response.responseText || '{}');
+    const rows = json.value || json?.d?.results;
+    if (!Array.isArray(rows)) throw new Error('SharePoint-opkaldslisten kunne ikke laeses');
+    return rows
+      .map(row => ({
+        id: clampInteger(row.Id, 0),
+        phone: normalizePhoneNumber(row.CallerNumber),
+        createdAt: Date.parse(row.Created || '') || 0
+      }))
+      .filter(row => row.id > 0 && row.phone);
+  }
+
+  function selectPendingIncomingCallRows(rows, state, referenceTime = now()) {
+    const initialCutoff = clampInteger(state?.initializedAt, 0) - 2000;
+    const recentCutoff = referenceTime - TP_CALL_QUEUE.notificationMaxAgeMs;
+    return rows
+      .filter(row => row.id > clampInteger(state?.lastId, 0))
+      .filter(row => state?.ready === true || row.createdAt >= initialCutoff)
+      .filter(row => row.createdAt >= recentCutoff)
+      .sort((a, b) => a.id - b.id);
+  }
+
+  function notifyIncomingCallQueueError(error) {
+    const time = now();
+    if (time - incomingCallQueueErrorNotifiedAt < 60 * 60 * 1000) return;
+    incomingCallQueueErrorNotifiedAt = time;
+    console.warn('[TP][CALL] SharePoint-opkald kunne ikke hentes', error);
+    showToast('IPnordic-opkald er midlertidigt afbrudt. Log ind paa SharePoint.');
+  }
+
+  async function pollIncomingCalls() {
+    if (!isLeader() || incomingCallPollInFlight) return;
+    incomingCallPollInFlight = true;
+    try {
+      const email = await getIncomingCallUserEmail();
+      const rows = await fetchIncomingCallQueueItems(email);
+      if (!isLeader()) return;
+
+      await withCrossTabProcessLock('incoming-call-queue', async () => {
+        if (!isLeader()) return;
+        const state = ensureIncomingCallQueueState();
+        const latestId = rows.reduce((highest, row) => Math.max(highest, row.id), state.lastId);
+        const pending = selectPendingIncomingCallRows(rows, state);
+
+        for (const row of pending) {
+          await handleIncomingCall(row.phone, 'sharepoint:' + row.id);
+        }
+        saveJson(INCOMING_CALL_QUEUE_STATE_KEY, {
+          lastId: latestId,
+          initializedAt: state.initializedAt,
+          ready: true
+        });
+      });
+    } catch (error) {
+      notifyIncomingCallQueueError(error);
+    } finally {
+      incomingCallPollInFlight = false;
+    }
   }
 
   function broadcastToast(type, message) {
@@ -3162,9 +3279,11 @@
   }
 
   function startPolling() {
+    ensureIncomingCallQueueState();
     heartbeatLeadership();
     pollMessages();
     pollInterest();
+    pollIncomingCalls();
 
     setInterval(() => {
       const wasLeader = isLeader();
@@ -3172,10 +3291,12 @@
       if (!wasLeader && leaderNow) {
         pollMessages();
         pollInterest();
+        pollIncomingCalls();
       }
     }, HEARTBEAT_MS);
     setInterval(pollMessages, MESSAGE_POLL_MS);
     setInterval(pollInterest, INTEREST_POLL_MS);
+    setInterval(pollIncomingCalls, TP_CALL_QUEUE.pollMs);
 
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
@@ -3185,6 +3306,7 @@
       tryBecomeLeader(true);
       pollMessages();
       pollInterest();
+      pollIncomingCalls();
       refreshMailPushSetting();
     });
 
@@ -3256,6 +3378,7 @@
     formatPhoneNumber,
     getIncomingCallNumberFromHash,
     parseIncomingCallSearchHTML,
+    selectPendingIncomingCallRows,
     showIncomingCallCard,
     parseWorkerProfileHTML,
     parseWorkerStatsHTML,
@@ -3274,6 +3397,7 @@
       SUPPRESS_MS,
       MESSAGE_POLL_MS,
       INTEREST_POLL_MS,
+      INCOMING_CALL_POLL_MS,
       HEARTBEAT_MS,
       LEASE_MS,
       WORKER_HOVER_CACHE_MS,
