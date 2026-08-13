@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.13.8
-// @description  Notifikation ved nye indgaaende vikarbeskeder, vikar og vagt ved interesse, Pushover/Toast, Mail-status, SMS, "Intet svar" og kompakt vikaroverblik ved profilbilleder.
+// @version      7.13.9
+// @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, "Intet svar" og kompakt vikaroverblik.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.13.8';
+  const TP_VERSION = '7.13.9';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -37,6 +37,8 @@
   const WORKER_HOVER_CACHE_LIMIT = 80;
   const WORKER_HOVER_HIDE_MS = 100;
   const WORKER_HOVER_CANCEL_PAGE_LIMIT = 20;
+  const INCOMING_CALL_LOCK_MS = 12000;
+  const INCOMING_CALL_CARD_MS = 30000;
 
   const LEADER_KEY = 'tpLeaderV3';
   const HEARTBEAT_MS = 5000;
@@ -74,6 +76,8 @@
   const ST_INT_KEY = 'tpInterestStateV3';
   const POS_KEY = 'tpPanelPosV4';
   const TOAST_EVT_KEY = 'tpToastEventV2';
+  const INCOMING_CALL_LOCK_KEY = 'tpIncomingCallLockV1';
+  const INCOMING_CALL_HASH_PREFIX = '#tp-call=';
   const QUICK_NO_ANSWER_TEXT = 'Intet Svar';
   const QUICK_NO_ANSWER_LINK_SELECTOR = 'a[onclick*="RingVikarOp("]';
   const WORKER_HOVER_CACHE_KEY = 'tpWorkerHoverCacheV2';
@@ -179,6 +183,52 @@
     if (!match) return null;
     const date = new Date(Number(match[3]), Number(match[2]) - 1, Number(match[1]));
     return Number.isFinite(date.getTime()) ? date : null;
+  }
+
+  function normalizePhoneNumber(value) {
+    let digits = String(value || '').replace(/\D/g, '');
+    if (digits.startsWith('0045') && digits.length >= 12) digits = digits.slice(4);
+    else if (digits.startsWith('45') && digits.length === 10) digits = digits.slice(2);
+    return digits.length === 8 ? digits : '';
+  }
+
+  function formatPhoneNumber(value) {
+    const phone = normalizePhoneNumber(value);
+    return phone ? phone.replace(/(\d{2})(?=\d)/g, '$1 ').trim() : '';
+  }
+
+  function getIncomingCallNumberFromHash(hash = globalThis.location?.hash || '') {
+    const value = String(hash || '');
+    if (!value.toLocaleLowerCase('da').startsWith(INCOMING_CALL_HASH_PREFIX)) return '';
+    try {
+      return normalizePhoneNumber(decodeURIComponent(value.slice(INCOMING_CALL_HASH_PREFIX.length)));
+    } catch (_) {
+      return normalizePhoneNumber(value.slice(INCOMING_CALL_HASH_PREFIX.length));
+    }
+  }
+
+  function parseIncomingCallSearchHTML(html, expectedPhone = '') {
+    const phone = normalizePhoneNumber(expectedPhone);
+    if (!phone) return [];
+    const doc = parseHtml(html);
+    const matches = [];
+    const seen = new Set();
+    for (const row of doc.querySelectorAll('tr')) {
+      const profileLink = row.querySelector('a[href*="page=showvikaroplysninger"][href*="vikar_id="]');
+      const phoneLink = row.querySelector('a[href^="tel:"]');
+      const href = profileLink?.getAttribute('href') || '';
+      const workerId = href.match(/[?&]vikar_id=(\d+)/)?.[1] || '';
+      const rowPhone = normalizePhoneNumber(phoneLink?.getAttribute('href') || phoneLink?.textContent || '');
+      if (!workerId || rowPhone !== phone || seen.has(workerId)) continue;
+
+      const profileLinks = Array.from(row.querySelectorAll('a[href*="page=showvikaroplysninger"][href*="vikar_id="]'));
+      const nameLink = profileLinks.find(link => !/^\d+$/.test(normalizeText(link.textContent))) || profileLink;
+      const name = normalizeText(nameLink?.textContent);
+      if (!name) continue;
+      seen.add(workerId);
+      matches.push({ workerId, name, phone: rowPhone, profileUrl: buildWorkerProfileURL(workerId) });
+    }
+    return matches;
   }
 
   function parseWorkerProfileHTML(html) {
@@ -894,6 +944,28 @@
     return (await fetchWithTimeout(url, options)).json();
   }
 
+  async function fetchIncomingCallMatches(phone) {
+    const normalized = normalizePhoneNumber(phone);
+    if (!normalized) return [];
+    const body = new URLSearchParams({
+      page: 'do_gen_search',
+      ajax: 'true',
+      term: normalized
+    }).toString();
+    const html = await fetchText(ORIGIN + '/index.php', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest'
+      },
+      body
+    });
+    if (parseHtml(html).querySelector('#login-form, form[action*="login"]')) {
+      throw new Error('TP_LOGIN_REQUIRED');
+    }
+    return parseIncomingCallSearchHTML(html, normalized);
+  }
+
   function buildWorkerProfileURL(workerId, hash = '') {
     return ORIGIN + '/index.php?page=showvikaroplysninger&vikar_id=' + encodeURIComponent(workerId) + hash;
   }
@@ -1565,6 +1637,152 @@
   function showToast(message, duration = 4500) {
     showOsNotification(message, duration);
     showDomToast(message, duration);
+  }
+
+  function removeIncomingCallCard() {
+    const card = document.getElementById('tpIncomingCallCard');
+    if (!card) return;
+    clearTimeout(card._tpTimer);
+    card.remove();
+  }
+
+  function showIncomingCallCard({ phone, matches = [], state = 'ready' }) {
+    removeIncomingCallCard();
+    const card = document.createElement('aside');
+    card.id = 'tpIncomingCallCard';
+    card.style.cssText = [
+      'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483647',
+      'width:min(320px,calc(100vw - 32px))', 'overflow:hidden',
+      'border:1px solid #aeb2b4', 'border-radius:3px', 'background:#fff', 'color:#333',
+      'box-shadow:0 8px 24px rgba(30,35,38,.28)',
+      'font:12px/1.3 sans-serif,Verdana,Arial,Helvetica,sans-serif', 'letter-spacing:0'
+    ].join(';');
+
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex;align-items:center;gap:7px;padding:7px 8px;border-bottom:1px solid #c9ccce;background:#e9eaea';
+    const icon = document.createElement('span');
+    icon.textContent = '☎';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.style.cssText = 'font-size:15px;color:#3f6f85';
+    const title = document.createElement('strong');
+    title.textContent = 'Indgående opkald';
+    title.style.cssText = 'font-size:12px;font-weight:600';
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.title = 'Luk';
+    close.setAttribute('aria-label', 'Luk');
+    close.textContent = '×';
+    close.style.cssText = 'margin-left:auto;width:22px;height:22px;padding:0;border:0;background:transparent;color:#666;font:18px/20px Arial;cursor:pointer';
+    close.addEventListener('click', removeIncomingCallCard);
+    head.append(icon, title, close);
+
+    const content = document.createElement('div');
+    content.style.cssText = 'padding:9px';
+    const formattedPhone = formatPhoneNumber(phone);
+    if (state === 'loading') {
+      content.textContent = 'Finder vikar for ' + formattedPhone + '…';
+      content.style.color = '#666';
+    } else if (state === 'login') {
+      const message = document.createElement('strong');
+      message.textContent = 'Log ind i Temponizer';
+      message.style.cssText = 'display:block;font-size:13px;font-weight:600';
+      const detail = document.createElement('span');
+      detail.textContent = 'Nummeret kan først slås op efter login.';
+      detail.style.cssText = 'display:block;margin-top:3px;color:#6a6a6a';
+      content.append(message, detail);
+    } else if (state === 'error') {
+      const message = document.createElement('strong');
+      message.textContent = 'Nummeropslag mislykkedes';
+      message.style.cssText = 'display:block;font-size:13px;font-weight:600';
+      const number = document.createElement('span');
+      number.textContent = formattedPhone;
+      number.style.cssText = 'display:block;margin-top:2px;color:#6a6a6a';
+      content.append(message, number);
+    } else if (!matches.length) {
+      const name = document.createElement('strong');
+      name.textContent = 'Nummeret blev ikke fundet';
+      name.style.cssText = 'display:block;font-size:13px;font-weight:600';
+      const number = document.createElement('span');
+      number.textContent = formattedPhone;
+      number.style.cssText = 'display:block;margin-top:2px;color:#6a6a6a';
+      content.append(name, number);
+    } else {
+      const intro = document.createElement('div');
+      intro.textContent = matches.length === 1 ? formattedPhone : matches.length + ' vikarer matcher ' + formattedPhone;
+      intro.style.cssText = 'margin-bottom:6px;color:#6a6a6a;font-size:11px';
+      content.appendChild(intro);
+      for (const match of matches) {
+        const link = document.createElement('a');
+        link.href = match.profileUrl;
+        link.style.cssText = 'display:flex;align-items:center;gap:8px;min-height:32px;padding:5px 7px;border:1px solid #c6c9ca;background:#f8f8f8;color:#333;text-decoration:none';
+        if (content.querySelector('a')) link.style.marginTop = '5px';
+        const name = document.createElement('strong');
+        name.textContent = match.name;
+        name.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:600';
+        const action = document.createElement('span');
+        action.textContent = 'Åbn profil ›';
+        action.style.cssText = 'margin-left:auto;color:#276f91;white-space:nowrap;font-size:11px';
+        link.append(name, action);
+        content.appendChild(link);
+      }
+    }
+
+    card.append(head, content);
+    document.body.appendChild(card);
+    if (state !== 'loading') {
+      const duration = matches.length ? INCOMING_CALL_CARD_MS : 8000;
+      card._tpTimer = setTimeout(removeIncomingCallCard, duration);
+    }
+    return card;
+  }
+
+  function showIncomingCallOsNotification(match, phone) {
+    try {
+      if (!match || !('Notification' in window) || Notification.permission !== 'granted') return;
+      const notification = new Notification('Indgående opkald', {
+        body: match.name + ' · ' + formatPhoneNumber(phone)
+      });
+      notification.onclick = () => {
+        try { globalThis.focus(); } catch (_) {}
+        globalThis.location.href = match.profileUrl;
+        notification.close();
+      };
+      setTimeout(() => notification.close(), Math.min(INCOMING_CALL_CARD_MS, 30000));
+    } catch (_) {}
+  }
+
+  async function claimIncomingCall(phone) {
+    return withCrossTabProcessLock('incoming-call', () => {
+      const last = loadJson(INCOMING_CALL_LOCK_KEY, null);
+      const time = now();
+      if (last?.phone === phone && time - clampInteger(last.ts, 0) < INCOMING_CALL_LOCK_MS) return false;
+      saveJson(INCOMING_CALL_LOCK_KEY, { phone, ts: time });
+      return true;
+    });
+  }
+
+  async function handleIncomingCall(phone) {
+    const claimed = await claimIncomingCall(phone);
+    if (!claimed) return;
+    showIncomingCallCard({ phone, state: 'loading' });
+    try {
+      const matches = await fetchIncomingCallMatches(phone);
+      showIncomingCallCard({ phone, matches });
+      showIncomingCallOsNotification(matches[0], phone);
+    } catch (error) {
+      console.warn('[TP][CALL] Nummeropslag fejlede', error);
+      showIncomingCallCard({ phone, state: error?.message === 'TP_LOGIN_REQUIRED' ? 'login' : 'error' });
+    }
+  }
+
+  function initIncomingCallReceiver() {
+    const phone = getIncomingCallNumberFromHash();
+    if (!phone) return false;
+    try {
+      history.replaceState(null, '', globalThis.location.pathname + globalThis.location.search);
+    } catch (_) {}
+    handleIncomingCall(phone);
+    return true;
   }
 
   function broadcastToast(type, message) {
@@ -2979,6 +3197,7 @@
   }
 
   function startRuntime() {
+    if (initIncomingCallReceiver()) return;
     migrateUserKeyToGM();
     initToastBroadcast();
     injectUI();
@@ -3033,6 +3252,11 @@
     formatDanishDate,
     getWorkerHoverDateRange,
     parseDanishDate,
+    normalizePhoneNumber,
+    formatPhoneNumber,
+    getIncomingCallNumberFromHash,
+    parseIncomingCallSearchHTML,
+    showIncomingCallCard,
     parseWorkerProfileHTML,
     parseWorkerStatsHTML,
     parseWorkerCancellationHTML,
