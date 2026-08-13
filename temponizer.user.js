@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.0
+// @version      7.14.1
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, "Intet svar" og kompakt vikaroverblik.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.0';
+  const TP_VERSION = '7.14.1';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -1622,6 +1622,13 @@
     } catch (_) {}
   }
 
+  function positionDomToast(element = document.getElementById('tpToast')) {
+    if (!element) return;
+    const callCard = document.getElementById('tpIncomingCallCard');
+    const callCardHeight = callCard ? Math.ceil(callCard.getBoundingClientRect().height) : 0;
+    element.style.bottom = (16 + (callCardHeight ? callCardHeight + 10 : 0)) + 'px';
+  }
+
   function showDomToast(message, duration = 4500) {
     const safeMessage = truncateText(message, 260);
     try {
@@ -1640,6 +1647,7 @@
         requestAnimationFrame(() => { element.style.opacity = '1'; });
       }
       element.textContent = safeMessage;
+      positionDomToast(element);
       clearTimeout(element._tpTimer);
       element._tpTimer = setTimeout(() => {
         element.style.opacity = '0';
@@ -1658,6 +1666,7 @@
     if (!card) return;
     clearTimeout(card._tpTimer);
     card.remove();
+    positionDomToast();
   }
 
   function showIncomingCallCard({ phone, matches = [], state = 'ready' }) {
@@ -1743,6 +1752,7 @@
 
     card.append(head, content);
     document.body.appendChild(card);
+    positionDomToast();
     if (state !== 'loading') {
       const duration = matches.length ? INCOMING_CALL_CARD_MS : 8000;
       card._tpTimer = setTimeout(removeIncomingCallCard, duration);
@@ -1765,6 +1775,13 @@
     } catch (_) {}
   }
 
+  function shouldShowIncomingCallOsNotification(
+    isHidden = document.hidden,
+    hasFocus = typeof document.hasFocus !== 'function' || document.hasFocus()
+  ) {
+    return isHidden || !hasFocus;
+  }
+
   async function claimIncomingCall(phone, eventId = phone) {
     return withCrossTabProcessLock('incoming-call', () => {
       const last = loadJson(INCOMING_CALL_LOCK_KEY, null);
@@ -1783,7 +1800,9 @@
     try {
       const matches = await fetchIncomingCallMatches(phone);
       showIncomingCallCard({ phone, matches });
-      showIncomingCallOsNotification(matches[0], phone);
+      if (shouldShowIncomingCallOsNotification()) {
+        showIncomingCallOsNotification(matches[0], phone);
+      }
     } catch (error) {
       console.warn('[TP][CALL] Nummeropslag fejlede', error);
       showIncomingCallCard({ phone, state: error?.message === 'TP_LOGIN_REQUIRED' ? 'login' : 'error' });
@@ -3379,6 +3398,9 @@
     getIncomingCallNumberFromHash,
     parseIncomingCallSearchHTML,
     selectPendingIncomingCallRows,
+    shouldShowIncomingCallOsNotification,
+    positionDomToast,
+    showDomToast,
     showIncomingCallCard,
     parseWorkerProfileHTML,
     parseWorkerStatsHTML,
