@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.9
+// @version      7.14.10
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -22,7 +22,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.9';
+  const TP_VERSION = '7.14.10';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -34,6 +34,8 @@
   const INTEREST_DETAIL_CONCURRENCY = 4;
   const MESSAGE_SEEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
   const MESSAGE_SEEN_LIMIT = 512;
+  const NOTIFICATION_DELIVERY_TTL_MS = 15 * 60 * 1000;
+  const NOTIFICATION_DELIVERY_LIMIT = 96;
   const WORKER_HOVER_CACHE_MS = 5 * 60 * 1000;
   const WORKER_HOVER_CACHE_LIMIT = 80;
   const WORKER_HOVER_HIDE_MS = 100;
@@ -94,6 +96,7 @@
   const ST_MSG_KEY = 'tpMessageStateV5';
   const ST_INT_KEY = 'tpInterestStateV3';
   const PANEL_COLLAPSED_KEY = 'tpPanelCollapsedV1';
+  const NOTIFICATION_DELIVERY_KEY = 'tpNotificationDeliveryV1';
   const TOAST_EVT_KEY = 'tpToastEventV2';
   const INCOMING_CALL_LOCK_KEY = 'tpIncomingCallLockV1';
   const INCOMING_CALL_QUEUE_STATE_KEY = 'tpIncomingCallQueueStateV1';
@@ -585,7 +588,6 @@
   function messageRecordSignature(record) {
     return [
       clampInteger(record.unread, 0),
-      normalizeText(record.activity),
       normalizeText(record.snippet)
     ].join('|');
   }
@@ -662,9 +664,8 @@
     for (const [key, source] of Object.entries(current)) {
       const old = previous[key];
       const sameUnread = old && clampInteger(source.unread, 0) === clampInteger(old.unread, 0);
-      const sameActivity = old && normalizeText(source.activity) === normalizeText(old.activity);
       const record = { ...source };
-      if (sameUnread && sameActivity) {
+      if (sameUnread) {
         if (!record.snippet && old.snippet) record.snippet = old.snippet;
         if ((!record.name || record.name === 'Ukendt vikar') && old.name) record.name = old.name;
         if (!record.context && old.context) record.context = old.context;
@@ -698,10 +699,9 @@
       } else if (
         clampInteger(old.unread, 0) > 0
         && signature !== (old.signature || messageRecordSignature(old))
-        && (normalizeText(record.activity) !== normalizeText(old.activity)
-          || (normalizeText(record.snippet)
-            && normalizeText(old.snippet)
-            && normalizeText(record.snippet) !== normalizeText(old.snippet)))
+        && normalizeText(record.snippet)
+        && normalizeText(old.snippet)
+        && normalizeText(record.snippet) !== normalizeText(old.snippet)
       ) {
         delta = 1;
       }
@@ -1328,7 +1328,9 @@
       id: TAB_ID,
       until: time + LEASE_MS,
       ts: time,
-      visible: !document.hidden
+      visible: !document.hidden,
+      version: TP_VERSION,
+      pushReady: !!getUserKey()
     });
   }
 
@@ -1337,7 +1339,9 @@
     const time = now();
     const expired = !leader || clampInteger(leader.until, 0) <= time;
     const visibleTakeover = preferVisible && leader && leader.id !== TAB_ID && leader.visible === false;
-    if (expired || leader?.id === TAB_ID || visibleTakeover) {
+    const newerRuntime = leader && compareVersions(TP_VERSION, leader.version || '0') > 0;
+    const pushReadyTakeover = leader && !!getUserKey() && leader.pushReady !== true;
+    if (expired || leader?.id === TAB_ID || visibleTakeover || newerRuntime || pushReadyTakeover) {
       writeLeadership(time);
     }
     return isLeader();
@@ -1450,11 +1454,42 @@
     return { initialized: false, total: 0, pairs: {}, pending: [], lastPush: 0 };
   }
 
-  function dispatchNotification(kind, enableKey, notification) {
+  function notificationDeliveryId(kind, notification, eventIds = []) {
+    const ids = Array.from(new Set((eventIds || []).map(normalizeText).filter(Boolean))).sort();
+    const source = [kind, ids.join('|'), normalizeText(notification?.title), normalizeText(notification?.body)].join('\u001f');
+    let hash = 2166136261;
+    for (let index = 0; index < source.length; index += 1) {
+      hash ^= source.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `${kind}:${(hash >>> 0).toString(36)}:${source.length}`;
+  }
+
+  function takeNotificationDeliveryLock(kind, notification, eventIds = [], time = Date.now()) {
+    const deliveryId = notificationDeliveryId(kind, notification, eventIds);
+    const oldest = time - NOTIFICATION_DELIVERY_TTL_MS;
+    const saved = loadJson(NOTIFICATION_DELIVERY_KEY, {});
+    const recent = Object.fromEntries(Object.entries(saved && typeof saved === 'object' ? saved : {})
+      .map(([id, timestamp]) => [id, clampInteger(timestamp, 0)])
+      .filter(([id, timestamp]) => !!id && timestamp >= oldest)
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, NOTIFICATION_DELIVERY_LIMIT));
+    if (recent[deliveryId]) return false;
+    recent[deliveryId] = time;
+    saveJson(NOTIFICATION_DELIVERY_KEY, recent);
+    return true;
+  }
+
+  function dispatchNotification(kind, enableKey, notification, eventIds = []) {
+    if (!takeNotificationDeliveryLock(kind, notification, eventIds)) {
+      console.info('[TP] Ignorerer en allerede leveret notifikation:', kind);
+      return false;
+    }
     const enabled = localStorage.getItem(enableKey) === 'true';
     if (enabled) sendPushover(notification.body, notification.title);
     showToast(notification.toast);
     broadcastToast(kind, notification.toast);
+    return true;
   }
 
   function processMessageSnapshot(snapshot) {
@@ -1509,7 +1544,7 @@
     let sent = [];
 
     if (pending.length && Date.now() - lastPush > SUPPRESS_MS && takeChannelLock('msg')) {
-      dispatchNotification('msg', 'tpPushEnableMsg', formatMessageNotification(pending));
+      dispatchNotification('msg', 'tpPushEnableMsg', formatMessageNotification(pending), pending.map(event => event.eventId));
       sent = pending;
       pending = [];
       lastPush = Date.now();
@@ -1552,7 +1587,7 @@
     let sent = [];
 
     if (pending.length && Date.now() - lastPush > SUPPRESS_MS && takeChannelLock('int')) {
-      dispatchNotification('int', 'tpPushEnableInt', formatInterestNotification(pending));
+      dispatchNotification('int', 'tpPushEnableInt', formatInterestNotification(pending), pending.map(event => event.eventId));
       sent = pending;
       pending = [];
       lastPush = Date.now();
@@ -4520,9 +4555,12 @@
     prunePendingInterestEvents,
     formatMessageNotification,
     formatInterestNotification,
+    notificationDeliveryId,
+    takeNotificationDeliveryLock,
     mapLimit,
     withLocalStorageMutex,
     withCrossTabProcessLock,
+    tryBecomeLeader,
     takeChannelLock,
     parseSmsStatusFromHTML,
     parseCallRegistrationTarget,
@@ -4581,9 +4619,12 @@
     constants: Object.freeze({
       ST_MSG_KEY,
       ST_INT_KEY,
+      LEADER_KEY,
       SUPPRESS_MS,
       MESSAGE_POLL_MS,
       INTEREST_POLL_MS,
+      NOTIFICATION_DELIVERY_TTL_MS,
+      NOTIFICATION_DELIVERY_KEY,
       INCOMING_CALL_POLL_MS,
       OUTGOING_CALL_SUPPRESS_MS,
       HEARTBEAT_MS,
