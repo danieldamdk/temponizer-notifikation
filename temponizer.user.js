@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
+// @name         Temponizer -> Pushover + Toast + Mail + SMS + Hurtig telefonregistrering (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.7
-// @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, "Intet svar", vikaroverblik og autorisationskontrol.
+// @version      7.14.8
+// @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -22,7 +22,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.7';
+  const TP_VERSION = '7.14.8';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -94,12 +94,18 @@
   const ST_MSG_KEY = 'tpMessageStateV5';
   const ST_INT_KEY = 'tpInterestStateV3';
   const POS_KEY = 'tpPanelPosV4';
+  const PANEL_COLLAPSED_KEY = 'tpPanelCollapsedV1';
   const TOAST_EVT_KEY = 'tpToastEventV2';
   const INCOMING_CALL_LOCK_KEY = 'tpIncomingCallLockV1';
   const INCOMING_CALL_QUEUE_STATE_KEY = 'tpIncomingCallQueueStateV1';
   const OUTGOING_CALL_RECENT_KEY = 'tpRecentOutgoingCallsV1';
   const INCOMING_CALL_HASH_PREFIX = '#tp-call=';
   const QUICK_NO_ANSWER_TEXT = 'Intet Svar';
+  const QUICK_CALL_REGISTRATION_OPTIONS = Object.freeze([
+    QUICK_NO_ANSWER_TEXT,
+    'Ja tak',
+    'Nej Tak'
+  ]);
   const QUICK_NO_ANSWER_LINK_SELECTOR = 'a[onclick*="RingVikarOp("]';
   const WORKER_HOVER_CACHE_KEY = 'tpWorkerHoverCacheV2';
   const WORKER_ROW_SELECTOR = 'tr[id^="row_"]';
@@ -2620,6 +2626,58 @@
     requestAnimationFrame(clampPanelIntoView);
   }
 
+  function setPanelCollapsed(panel, collapsed, persist = true) {
+    if (!panel) return;
+    const isCollapsed = collapsed === true;
+    const body = panel.querySelector('#tpPanelBody');
+    const button = panel.querySelector('#tpCollapseBtn');
+    const dragHint = panel.querySelector('#tpDragHint');
+    const header = panel.querySelector('#tpHeader');
+
+    panel.dataset.collapsed = isCollapsed ? 'true' : 'false';
+    if (body) body.hidden = isCollapsed;
+    if (dragHint) dragHint.hidden = isCollapsed;
+    if (header) header.style.marginBottom = isCollapsed ? '0' : '4px';
+    panel.style.minWidth = isCollapsed ? '0' : '170px';
+    panel.style.padding = isCollapsed ? '6px 7px' : '8px';
+
+    if (button) {
+      button.textContent = isCollapsed ? '+' : '\u2212';
+      button.title = isCollapsed ? '\u00c5bn TP Notifikationer' : 'Minimer TP Notifikationer';
+      button.setAttribute('aria-label', button.title);
+      button.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
+    }
+
+    if (persist) {
+      try { localStorage.setItem(PANEL_COLLAPSED_KEY, isCollapsed ? 'true' : 'false'); } catch (_) {}
+    }
+    requestAnimationFrame(clampPanelIntoView);
+  }
+
+  function initPanelCollapseControls(panel, closeMenu = () => {}) {
+    if (!panel || panel.dataset.tpCollapseReady === 'true') return;
+    const button = panel.querySelector('#tpCollapseBtn');
+    if (!button) return;
+    panel.dataset.tpCollapseReady = 'true';
+
+    let collapsed = false;
+    try { collapsed = localStorage.getItem(PANEL_COLLAPSED_KEY) === 'true'; } catch (_) {}
+    setPanelCollapsed(panel, collapsed, false);
+
+    button.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const nextCollapsed = panel.dataset.collapsed !== 'true';
+      if (nextCollapsed) closeMenu();
+      setPanelCollapsed(panel, nextCollapsed);
+    });
+
+    globalThis.addEventListener('storage', event => {
+      if (event.key !== PANEL_COLLAPSED_KEY) return;
+      setPanelCollapsed(panel, event.newValue === 'true', false);
+    });
+  }
+
   function injectUI() {
     if (document.getElementById('tpPanel')) return;
 
@@ -2639,8 +2697,10 @@
         '<div style="margin-left:auto;display:flex;align-items:center;gap:6px">' +
           '<div id="tpDragHint" style="font-size:10px;color:#888">træk</div>' +
           '<button id="tpGearBtn" type="button" title="Indstillinger" aria-label="Indstillinger" style="width:22px;height:22px;line-height:20px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:50%;box-shadow:0 4px 12px rgba(0,0,0,.18);cursor:pointer;padding:0;user-select:none">⚙</button>' +
+          '<button id="tpCollapseBtn" type="button" title="Minimer TP Notifikationer" aria-label="Minimer TP Notifikationer" aria-expanded="true" style="width:22px;height:22px;line-height:19px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:3px;cursor:pointer;padding:0;user-select:none;font-size:16px">&#8722;</button>' +
         '</div>' +
       '</div>' +
+      '<div id="tpPanelBody">' +
       '<div style="display:flex;align-items:center;gap:6px;margin:2px 0;white-space:nowrap">' +
         '<label style="display:flex;align-items:center;gap:6px;min-width:0"><input type="checkbox" id="tpEnableMsg"> <span>Besked</span></label>' +
         '<span id="tpMsgCountBadge" style="display:flex;align-items:center;justify-content:center;margin-left:auto;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span>' +
@@ -2662,6 +2722,7 @@
         '<span style="font-size:11px;color:#555">Telefon</span>' +
         '<span id="tpIPnordicStatus" style="margin-left:auto;font-size:10px;color:#9a6a0d">ikke testet</span>' +
         '<button id="tpIPnordicSetupBtn" type="button" style="padding:4px 8px;font-size:11px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer;flex:0 0 auto">Opsæt</button>' +
+      '</div>' +
       '</div>';
 
     document.body.appendChild(panel);
@@ -2812,6 +2873,8 @@
       event.stopPropagation();
       toggleMenu();
     });
+
+    initPanelCollapseControls(panel, () => toggleMenu(false));
 
     const messageCheckbox = panel.querySelector('#tpEnableMsg');
     const interestCheckbox = panel.querySelector('#tpEnableInt');
@@ -4216,14 +4279,14 @@
         overflow: visible !important;
       }
       .tp-quick-no-answer-menu {
-        position: absolute;
-        left: calc(100% - 1px);
-        top: 50%;
+        position: fixed;
+        left: 0;
+        top: 0;
         right: auto;
         bottom: auto;
         z-index: 10020;
         display: block;
-        min-width: 92px;
+        min-width: 98px;
         padding: 3px;
         background: #ffffff;
         border: 1px solid #aeb8bf;
@@ -4232,7 +4295,7 @@
         opacity: 0;
         visibility: hidden;
         pointer-events: none;
-        transform: translate(4px, -50%);
+        transform: translateX(4px);
         transition: opacity 80ms ease, transform 80ms ease, visibility 80ms ease;
       }
       .tp-quick-no-answer-cell:hover > .tp-quick-no-answer-menu,
@@ -4241,23 +4304,26 @@
         opacity: 1;
         visibility: visible;
         pointer-events: auto;
-        transform: translate(0, -50%);
+        transform: translateX(0);
       }
       .tp-quick-no-answer-button {
         display: block;
         width: 100%;
-        height: 30px;
+        height: 28px;
         margin: 0;
         padding: 0 10px;
         border: 0;
         border-radius: 3px;
         background: #ffffff;
         color: #20272b;
-        font: 600 12px/30px Arial, sans-serif;
+        font: 600 12px/28px Arial, sans-serif;
         letter-spacing: 0;
         text-align: left;
         white-space: nowrap;
         cursor: pointer;
+      }
+      .tp-quick-no-answer-button + .tp-quick-no-answer-button {
+        border-top: 1px solid #e4e8ea;
       }
       .tp-quick-no-answer-button:hover,
       .tp-quick-no-answer-button:focus-visible {
@@ -4273,8 +4339,10 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
-  function submitQuickNoAnswer(target, button) {
+  function submitQuickCallRegistration(target, button, registrationText) {
     const { vikarId, vagtId } = target;
+    const text = String(registrationText || '').trim();
+    if (!QUICK_CALL_REGISTRATION_OPTIONS.includes(text)) return;
     const formId = 'registreropkaldvagtid_' + vikarId;
     if (document.getElementById(formId)) {
       showToast('Luk den \u00e5bne telefonregistrering f\u00f8rst.');
@@ -4293,16 +4361,17 @@
     const form = document.createElement('form');
     form.id = formId;
     form.hidden = true;
-    form.dataset.tpQuickNoAnswer = 'true';
+    form.dataset.tpQuickCallRegistration = 'true';
 
     const comment = document.createElement('textarea');
     comment.id = 'phonetext_' + vikarId;
     comment.name = 'phonetext';
-    comment.value = QUICK_NO_ANSWER_TEXT;
+    comment.value = text;
     form.appendChild(comment);
     document.body.appendChild(form);
 
-    button.disabled = true;
+    const menuButtons = Array.from(button.closest('.tp-quick-no-answer-menu')?.querySelectorAll('button') || [button]);
+    for (const menuButton of menuButtons) menuButton.disabled = true;
     button.textContent = 'Gemmer...';
 
     let completed = false;
@@ -4312,8 +4381,8 @@
       completed = true;
       phoneObserver.disconnect();
       if (form.isConnected) form.remove();
-      button.disabled = false;
-      button.textContent = 'Intet svar';
+      for (const menuButton of menuButtons) menuButton.disabled = false;
+      button.textContent = text;
       if (!success) showToast('Registreringen kunne ikke bekr\u00e6ftes. Pr\u00f8v igen via telefonikonet.');
     };
 
@@ -4327,6 +4396,23 @@
     } catch (_) {
       finish(false);
     }
+  }
+
+  function positionQuickCallRegistrationMenu(cell, menu) {
+    const cellRect = cell.getBoundingClientRect();
+    const width = menu.offsetWidth || 98;
+    const height = menu.offsetHeight || 90;
+    const margin = 6;
+    let left = cellRect.right + 3;
+    let top = cellRect.top + ((cellRect.height - height) / 2);
+
+    if (left + width > globalThis.innerWidth - margin) {
+      left = cellRect.left - width - 3;
+    }
+    left = Math.max(margin, Math.min(left, globalThis.innerWidth - width - margin));
+    top = Math.max(margin, Math.min(top, globalThis.innerHeight - height - margin));
+    menu.style.left = Math.round(left) + 'px';
+    menu.style.top = Math.round(top) + 'px';
   }
 
   function decorateQuickNoAnswerLinks(root = document) {
@@ -4346,25 +4432,27 @@
       menu.setAttribute('role', 'menu');
       menu.setAttribute('aria-label', 'Hurtig telefonregistrering');
 
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'tp-quick-no-answer-button';
-      button.textContent = 'Intet svar';
-      button.setAttribute('role', 'menuitem');
-      button.addEventListener('mousedown', event => event.stopPropagation());
-      button.addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
-        submitQuickNoAnswer(target, button);
-      });
-
-      menu.appendChild(button);
+      for (const registrationText of QUICK_CALL_REGISTRATION_OPTIONS) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'tp-quick-no-answer-button';
+        button.textContent = registrationText;
+        button.setAttribute('role', 'menuitem');
+        button.addEventListener('mousedown', event => event.stopPropagation());
+        button.addEventListener('click', event => {
+          event.preventDefault();
+          event.stopPropagation();
+          submitQuickCallRegistration(target, button, registrationText);
+        });
+        menu.appendChild(button);
+      }
       cell.appendChild(menu);
 
       let hideTimer = null;
       const showMenu = () => {
         if (hideTimer) clearTimeout(hideTimer);
         hideTimer = null;
+        positionQuickCallRegistrationMenu(cell, menu);
         cell.classList.add('tp-quick-no-answer-open');
       };
       const hideMenuSoon = () => {
@@ -4493,6 +4581,12 @@
     takeChannelLock,
     parseSmsStatusFromHTML,
     parseCallRegistrationTarget,
+    injectQuickNoAnswerStyles,
+    submitQuickCallRegistration,
+    positionQuickCallRegistrationMenu,
+    decorateQuickNoAnswerLinks,
+    setPanelCollapsed,
+    initPanelCollapseControls,
     parseLabelCount,
     formatDanishDate,
     getWorkerHoverDateRange,
@@ -4550,6 +4644,8 @@
       LEASE_MS,
       WORKER_HOVER_CACHE_MS,
       QUICK_NO_ANSWER_TEXT,
+      QUICK_CALL_REGISTRATION_OPTIONS,
+      PANEL_COLLAPSED_KEY,
       MSG_GENERAL_LIST_URL: MSG_LIST_URLS.generel
     })
   });
@@ -4562,4 +4658,3 @@
   if (document.body) startRuntime();
   else window.addEventListener('DOMContentLoaded', startRuntime, { once: true });
 })();
-
