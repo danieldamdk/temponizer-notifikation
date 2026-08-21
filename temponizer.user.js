@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Temponizer -> Pushover + Toast + Mail + SMS + Hurtig telefonregistrering (AjourCare)
+// @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.8
+// @version      7.14.9
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -22,7 +22,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.8';
+  const TP_VERSION = '7.14.9';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -93,7 +93,6 @@
 
   const ST_MSG_KEY = 'tpMessageStateV5';
   const ST_INT_KEY = 'tpInterestStateV3';
-  const POS_KEY = 'tpPanelPosV4';
   const PANEL_COLLAPSED_KEY = 'tpPanelCollapsedV1';
   const TOAST_EVT_KEY = 'tpToastEventV2';
   const INCOMING_CALL_LOCK_KEY = 'tpIncomingCallLockV1';
@@ -2610,20 +2609,12 @@
     paintIPnordicSetupStatus('idle');
   }
 
-  function loadPanelPosition(element) {
-    const position = loadJson(POS_KEY, null);
-    if (!position || !Number.isFinite(Number(position.x)) || !Number.isFinite(Number(position.y))) {
-      element.style.bottom = '12px';
-      element.style.right = '8px';
-      element.style.top = 'auto';
-      element.style.left = 'auto';
-      return;
-    }
-    element.style.left = Number(position.x) + 'px';
-    element.style.top = Number(position.y) + 'px';
-    element.style.right = 'auto';
-    element.style.bottom = 'auto';
-    requestAnimationFrame(clampPanelIntoView);
+  function pinPanelBottomRight(panel) {
+    if (!panel) return;
+    panel.style.right = '8px';
+    panel.style.bottom = '12px';
+    panel.style.left = 'auto';
+    panel.style.top = 'auto';
   }
 
   function setPanelCollapsed(panel, collapsed, persist = true) {
@@ -2631,12 +2622,10 @@
     const isCollapsed = collapsed === true;
     const body = panel.querySelector('#tpPanelBody');
     const button = panel.querySelector('#tpCollapseBtn');
-    const dragHint = panel.querySelector('#tpDragHint');
     const header = panel.querySelector('#tpHeader');
 
     panel.dataset.collapsed = isCollapsed ? 'true' : 'false';
     if (body) body.hidden = isCollapsed;
-    if (dragHint) dragHint.hidden = isCollapsed;
     if (header) header.style.marginBottom = isCollapsed ? '0' : '4px';
     panel.style.minWidth = isCollapsed ? '0' : '170px';
     panel.style.padding = isCollapsed ? '6px 7px' : '8px';
@@ -2651,7 +2640,7 @@
     if (persist) {
       try { localStorage.setItem(PANEL_COLLAPSED_KEY, isCollapsed ? 'true' : 'false'); } catch (_) {}
     }
-    requestAnimationFrame(clampPanelIntoView);
+    pinPanelBottomRight(panel);
   }
 
   function initPanelCollapseControls(panel, closeMenu = () => {}) {
@@ -2684,7 +2673,8 @@
     const panel = document.createElement('div');
     panel.id = 'tpPanel';
     panel.style.cssText = [
-      'position:fixed', 'z-index:2147483645', 'background:#fff', 'border:1px solid #d7d7d7',
+      'position:fixed', 'right:8px', 'bottom:12px', 'left:auto', 'top:auto',
+      'z-index:2147483645', 'background:#fff', 'border:1px solid #d7d7d7',
       'padding:8px', 'border-radius:8px', 'font-size:12px',
       'font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif',
       'box-shadow:0 8px 24px rgba(0,0,0,.15)', 'max-width:240px', 'min-width:170px',
@@ -2692,10 +2682,9 @@
     ].join(';');
 
     panel.innerHTML =
-      '<div id="tpHeader" style="cursor:move;display:flex;align-items:center;gap:6px;margin-bottom:4px">' +
+      '<div id="tpHeader" style="display:flex;align-items:center;gap:6px;margin-bottom:4px">' +
         '<div style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">TP Notifikationer</div>' +
         '<div style="margin-left:auto;display:flex;align-items:center;gap:6px">' +
-          '<div id="tpDragHint" style="font-size:10px;color:#888">træk</div>' +
           '<button id="tpGearBtn" type="button" title="Indstillinger" aria-label="Indstillinger" style="width:22px;height:22px;line-height:20px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:50%;box-shadow:0 4px 12px rgba(0,0,0,.18);cursor:pointer;padding:0;user-select:none">⚙</button>' +
           '<button id="tpCollapseBtn" type="button" title="Minimer TP Notifikationer" aria-label="Minimer TP Notifikationer" aria-expanded="true" style="width:22px;height:22px;line-height:19px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:3px;cursor:pointer;padding:0;user-select:none;font-size:16px">&#8722;</button>' +
         '</div>' +
@@ -2888,57 +2877,13 @@
     });
 
     initMailPushControls(panel);
-    makeDraggable(panel, '#tpHeader');
-    loadPanelPosition(panel);
+    pinPanelBottomRight(panel);
     initSMSControls(panel);
 
     const messageState = loadJson(ST_MSG_KEY, getDefaultMessageState());
     const interestState = loadJson(ST_INT_KEY, getDefaultInterestState());
     setBadge(panel.querySelector('#tpMsgCountBadge'), messageState.total);
     setBadge(panel.querySelector('#tpIntCountBadge'), interestState.total);
-  }
-
-  function makeDraggable(element, handleSelector) {
-    const handle = handleSelector ? element.querySelector(handleSelector) : element;
-    if (!handle) return;
-    handle.style.cursor = 'move';
-    handle.style.userSelect = 'none';
-    let drag = null;
-
-    handle.addEventListener('mousedown', event => {
-      if (event.button !== 0) return;
-      if (event.target?.closest?.('button,input,select,textarea,a')) return;
-      const rect = element.getBoundingClientRect();
-      drag = { dx: event.clientX - rect.left, dy: event.clientY - rect.top };
-      event.preventDefault();
-    });
-    document.addEventListener('mousemove', event => {
-      if (!drag) return;
-      const x = Math.min(window.innerWidth - element.offsetWidth - 8, Math.max(8, event.clientX - drag.dx));
-      const y = Math.min(window.innerHeight - element.offsetHeight - 8, Math.max(8, event.clientY - drag.dy));
-      element.style.left = x + 'px';
-      element.style.top = y + 'px';
-      element.style.right = 'auto';
-      element.style.bottom = 'auto';
-      saveJson(POS_KEY, { x, y });
-    });
-    document.addEventListener('mouseup', () => { drag = null; });
-    window.addEventListener('resize', clampPanelIntoView);
-  }
-
-  function clampPanelIntoView() {
-    const panel = document.getElementById('tpPanel');
-    if (!panel) return;
-    const rect = panel.getBoundingClientRect();
-    const maxX = Math.max(8, window.innerWidth - panel.offsetWidth - 8);
-    const maxY = Math.max(8, window.innerHeight - panel.offsetHeight - 8);
-    const x = Math.min(maxX, Math.max(8, rect.left));
-    const y = Math.min(maxY, Math.max(8, rect.top));
-    panel.style.left = x + 'px';
-    panel.style.top = y + 'px';
-    panel.style.right = 'auto';
-    panel.style.bottom = 'auto';
-    saveJson(POS_KEY, { x, y });
   }
 
   function ensureFullyVisible(element, margin = 8) {
@@ -4585,6 +4530,7 @@
     submitQuickCallRegistration,
     positionQuickCallRegistrationMenu,
     decorateQuickNoAnswerLinks,
+    pinPanelBottomRight,
     setPanelCollapsed,
     initPanelCollapseControls,
     parseLabelCount,
