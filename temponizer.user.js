@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.10
+// @version      7.14.11
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -22,7 +22,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.10';
+  const TP_VERSION = '7.14.11';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
@@ -4241,6 +4241,62 @@
     attach();
   }
 
+  function isCprLookupAction(button) {
+    if (!(button instanceof HTMLButtonElement)) return false;
+    const action = button.getAttribute('onclick') || '';
+    return action.includes("jQuery('#navn').val(") ||
+      /^edit_google_adress\([^,]+,\s*['"]vikar['"],\s*['"](?:primary|secondary)['"]/.test(action);
+  }
+
+  function revealCprLookupActions(root = document) {
+    const popup = document.getElementById('popup_master_util_loading_content');
+    if (!popup) return 0;
+
+    const candidates = [];
+    if (root instanceof HTMLButtonElement) candidates.push(root);
+    if (root?.querySelectorAll) candidates.push(...root.querySelectorAll('button[onclick]'));
+
+    let revealed = 0;
+    for (const button of new Set(candidates)) {
+      if (!popup.contains(button) || !isCprLookupAction(button)) continue;
+      const wrapper = button.parentElement;
+      if (!wrapper || wrapper.classList.contains('tp-cpr-lookup-action')) continue;
+      wrapper.classList.add('tp-cpr-lookup-action');
+      revealed += 1;
+    }
+    return revealed;
+  }
+
+  function initCprLookupActions() {
+    const page = new URL(globalThis.location.href).searchParams.get('page');
+    if (page !== 'showvikaroplysninger') return;
+
+    if (!document.getElementById('tpCprLookupActionStyles')) {
+      const style = document.createElement('style');
+      style.id = 'tpCprLookupActionStyles';
+      style.textContent = `
+        #popup_master_util_loading_content .tp-cpr-lookup-action {
+          display: block !important;
+          margin: 6px auto 0;
+          text-align: center;
+        }
+      `;
+      document.head.appendChild(style);
+    }
+
+    const popup = document.getElementById('popup_master_util_loading_content');
+    if (!popup || popup.dataset.tpCprActionsReady === 'true') return;
+    popup.dataset.tpCprActionsReady = 'true';
+    revealCprLookupActions(popup);
+
+    const observer = new MutationObserver(records => {
+      for (const record of records) {
+        for (const node of record.addedNodes) revealCprLookupActions(node);
+      }
+    });
+    observer.observe(popup, { childList: true, subtree: true });
+  }
+
   function parseCallRegistrationTarget(onclickValue) {
     const match = String(onclickValue || '').match(
       /\bRingVikarOp\(\s*['"]?(\d+)['"]?\s*,\s*['"]?(\d+)['"]?\s*\)/
@@ -4515,6 +4571,7 @@
     injectUI();
     initWorkerProfileDeepLinks();
     initAuthorizationLookup();
+    initCprLookupActions();
     initWorkerProfileHover();
     initQuickNoAnswer();
     startPolling();
@@ -4612,6 +4669,9 @@
     getAuthorizationSpecialities,
     getAuthorizationType,
     initAuthorizationLookup,
+    isCprLookupAction,
+    revealCprLookupActions,
+    initCprLookupActions,
     fetchMessageSnapshot,
     refreshMessageEnrichmentIfNeeded,
     processMessageSnapshot,
