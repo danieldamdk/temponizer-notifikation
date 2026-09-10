@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.11
+// @version      7.14.12
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -22,10 +22,11 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.11';
+  const TP_VERSION = '7.14.12';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
-  const PUSHOVER_TOKEN = 'a27du13k8h2yf8p4wabxeukthr1fu7';
+  const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
+  const PUSHOVER_CONFIG_TITLE = 'PushoverSetup';
   const MESSAGE_POLL_MS = 15000;
   const INTEREST_POLL_MS = 30000;
   const SUPPRESS_MS = 45000;
@@ -118,12 +119,14 @@
   let interestPollInFlight = false;
   let incomingCallPollInFlight = false;
   let incomingCallUserEmail = '';
+  let incomingCallUserEmailCheckedAt = 0;
   let incomingCallQueueErrorNotifiedAt = 0;
   let ipnordicSetupConfigCache = null;
   let tpMailPushBusy = false;
   let tpMailRefreshInFlight = false;
   let tpMailRefreshGeneration = 0;
   let tpMailPushTimer = null;
+  const MAIL_STATUS_KEY = 'tpMailStatusV1';
   let tpSpDigestCache = { value: '', expires: 0 };
   let tpSpEntityTypeCache = '';
   const workerHoverRequests = new Map();
@@ -293,10 +296,11 @@
     const seen = new Set();
     for (const row of doc.querySelectorAll('tr')) {
       const profileLink = row.querySelector('a[href*="page=showvikaroplysninger"][href*="vikar_id="]');
-      const phoneLink = row.querySelector('a[href^="tel:"]');
+      const phoneLinks = Array.from(row.querySelectorAll('a[href^="tel:"], a[href^="callto:"]'));
       const href = profileLink?.getAttribute('href') || '';
       const workerId = href.match(/[?&]vikar_id=(\d+)/)?.[1] || '';
-      const rowPhone = normalizePhoneNumber(phoneLink?.getAttribute('href') || phoneLink?.textContent || '');
+      const rowPhone = phoneLinks.map(link => normalizePhoneNumber(link.getAttribute('href') || link.textContent))
+        .find(value => value === phone) || '';
       if (!workerId || rowPhone !== phone || seen.has(workerId)) continue;
 
       const profileLinks = Array.from(row.querySelectorAll('a[href*="page=showvikaroplysninger"][href*="vikar_id="]'));
@@ -373,6 +377,7 @@
 
     return {
       withdrawnShifts: inRange.filter(record => record.color === WORKER_WITHDRAWN_COLOR).length,
+      recognized: records.length > 0 || /ingen (?:annullerede )?vagter/i.test(doc.body?.textContent || ''),
       redSickMarkers: inRange.filter(record => record.color === WORKER_SICK_COLOR).length,
       recordCount: records.length,
       oldestDate: oldestTime === null ? null : new Date(oldestTime),
@@ -476,7 +481,9 @@
     return {
       records,
       unread: records.reduce((sum, record) => sum + record.unread, 0),
-      recognized: candidates.length > 0 || /Endnu ikke aktiveret|ingen beskeder/i.test(doc.body?.textContent || '')
+      recognized: records.length > 0
+        || (candidates.length === 0 && !!doc.querySelector('#vikar_sms_list'))
+        || /Endnu ikke aktiveret|ingen beskeder/i.test(doc.body?.textContent || '')
     };
   }
 
@@ -547,9 +554,9 @@
     if (!snippet) return null;
 
     return {
-      type: vagtMatch ? 'vagt' : 'generel',
+      type: Number(vagtMatch?.[1]) > 0 ? 'vagt' : 'generel',
       vikarId: vikarMatch[1],
-      vagtId: vagtMatch?.[1] || '',
+      vagtId: Number(vagtMatch?.[1]) > 0 ? vagtMatch[1] : '',
       incoming,
       snippet
     };
@@ -558,16 +565,15 @@
   function enrichMessageRecords(records, sidebarPreviews, openPreview) {
     const previews = Array.isArray(sidebarPreviews) ? sidebarPreviews : [];
     return records.map(record => {
-      const openMatches = openPreview
-        && openPreview.vikarId === record.vikarId
-        && (!openPreview.vagtId || openPreview.vagtId === record.vagtId);
-      const matchingPreviews = previews.filter(preview => preview.vikarId === record.vikarId
+      const matchesThread = preview => preview
         && preview.type === record.type
-        && (!preview.vagtId || preview.vagtId === record.vagtId));
+        && String(preview.vikarId) === String(record.vikarId)
+        && (record.type !== 'vagt' || String(preview.vagtId || '') === String(record.vagtId || ''));
+      const openMatches = matchesThread(openPreview);
+      const matchingPreviews = previews.filter(matchesThread);
       const unreadIncoming = matchingPreviews.find(preview => preview.incoming === true && preview.unread === true);
       const unreadOutgoing = matchingPreviews.find(preview => preview.incoming === false && preview.unread === true);
-      const sidebar = unreadIncoming || unreadOutgoing || matchingPreviews[0]
-        || previews.find(preview => preview.vikarId === record.vikarId);
+      const sidebar = unreadIncoming || unreadOutgoing;
       const snippet = openMatches ? openPreview.snippet : (sidebar?.snippet || '');
       const name = record.name === 'Ukendt vikar' && sidebar?.name ? sidebar.name : record.name;
       const incoming = record.type === 'vagt'
@@ -634,7 +640,13 @@
 
   function messageEventId(record) {
     if (!record?.key) return '';
-    return `${record.key}|${record.signature || messageRecordSignature(record)}`;
+    const activity = stableMessageActivity(record.activity);
+    return `${record.key}|${record.signature || messageRecordSignature(record)}${activity ? '|at:' + activity : ''}`;
+  }
+
+  function stableMessageActivity(value) {
+    const text = normalizeText(value);
+    return /^(?:\d{1,2}:\d{2}|\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?(?:\s+\d{1,2}:\d{2})?)$/.test(text) ? text : '';
   }
 
   function pruneSeenMessageEvents(value, time = Date.now()) {
@@ -663,7 +675,8 @@
     const result = {};
     for (const [key, source] of Object.entries(current)) {
       const old = previous[key];
-      const sameUnread = old && clampInteger(source.unread, 0) === clampInteger(old.unread, 0);
+      const sameUnread = old && clampInteger(source.unread, 0) === clampInteger(old.unread, 0)
+        && stableMessageActivity(source.activity) === stableMessageActivity(old.activity);
       const record = { ...source };
       if (sameUnread) {
         if (!record.snippet && old.snippet) record.snippet = old.snippet;
@@ -743,6 +756,8 @@
       if (event.kind === 'generic') return currentTotal >= clampInteger(event.targetTotal, 1);
       const record = map[event.key];
       if (!isIncomingMessageRecord(record)) return false;
+      const activity = stableMessageActivity(event.record?.activity);
+      if (activity && stableMessageActivity(record.activity) && activity !== stableMessageActivity(record.activity)) return false;
       return !event.signature || event.signature === (record.signature || messageRecordSignature(record));
     });
   }
@@ -810,10 +825,15 @@
 
       const row = box.closest('tr');
       const cells = row ? Array.from(row.children).filter(child => child.tagName === 'TD') : [];
-      const date = cleanCellText(cells[7]);
-      const time = cleanCellText(cells[8]);
-      const education = cleanCellText(cells[10]);
-      const customer = cleanCustomerName(cells[11]);
+      const header = row?.closest('table')?.querySelector('tr:has(th)');
+      const column = (label, fallback) => {
+        const index = Array.from(header?.cells || []).findIndex(cell => normalizeText(cell.textContent) === label);
+        return index >= 0 ? cells[index] : (header ? null : cells[fallback]);
+      };
+      const date = cleanCellText(column('Dato', 7));
+      const time = cleanCellText(column('Tidsrum', 8));
+      const education = cleanCellText(column('Uddannelse', 10));
+      const customer = cleanCustomerName(row?.querySelector('[id^="kunde_navn_span_"]')?.closest('td') || column('Kunde', 11));
 
       shifts.push({ id, type, count, date, time, education, customer });
     }
@@ -989,34 +1009,46 @@
     }
   }
 
-  async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS, responseType = 'text') {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let timer;
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error('TP_FETCH_TIMEOUT'));
+      }, timeoutMs);
+    });
     try {
-      const response = await fetch(url, {
-        credentials: 'same-origin',
-        cache: 'no-store',
-        ...options,
-        signal: controller.signal,
-        headers: {
-          'Cache-Control': 'no-cache',
-          'Pragma': 'no-cache',
-          ...(options.headers || {})
-        }
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return response;
+      return await Promise.race([deadline, (async () => {
+        const response = await fetch(url, {
+          credentials: 'same-origin',
+          cache: 'no-store',
+          ...options,
+          signal: controller.signal,
+          headers: {
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            ...(options.headers || {})
+          }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response[responseType]();
+      })()]);
     } finally {
       clearTimeout(timer);
     }
   }
 
   async function fetchText(url, options) {
-    return (await fetchWithTimeout(url, options)).text();
+    const html = await fetchWithTimeout(url, options);
+    if (parseHtml(html).querySelector('#login-form, form[action*="login"]')) {
+      throw new Error('TP_LOGIN_REQUIRED');
+    }
+    return html;
   }
 
   async function fetchJson(url, options) {
-    return (await fetchWithTimeout(url, options)).json();
+    return fetchWithTimeout(url, options, FETCH_TIMEOUT_MS, 'json');
   }
 
   async function fetchIncomingCallMatches(phone) {
@@ -1083,17 +1115,17 @@
       if (visitedOffsets.has(offset)) continue;
       visitedOffsets.add(offset);
       const url = ORIGIN + '/index.php?page=vagtlist_get&ajax=true&switchpage=true&vikar_id=' +
-        encodeURIComponent(workerId) + '&type=annullerede&offset=' + offset;
+        encodeURIComponent(workerId) + '&type=annullerede&field=dato&sort=desc&offset=' + offset;
       const parsed = parseWorkerCancellationHTML(await fetchText(url), range);
+      if (!parsed.recognized) throw new Error('Annullerede vagter kunne ikke kontrolleres');
       withdrawnShifts += parsed.withdrawnShifts;
 
-      if (!parsed.recordCount || (parsed.oldestDate && parsed.oldestDate.getTime() <= range.start.getTime())) break;
       for (const nextOffset of parsed.nextOffsets) {
         if (!visitedOffsets.has(nextOffset) && !pendingOffsets.includes(nextOffset)) pendingOffsets.push(nextOffset);
       }
     }
 
-    return { withdrawnShifts };
+    return { withdrawnShifts: pendingOffsets.length ? null : withdrawnShifts };
   }
 
   async function fetchWorkerHoverData(workerId) {
@@ -1165,13 +1197,16 @@
     const generalIndex = generalResult.status === 'fulfilled'
       ? parseMessageIndexHTML(generalResult.value, 'generel')
       : { records: [], unread: 0, recognized: false };
-    if (counterResult.status === 'rejected' && !vagtIndex.recognized && !generalIndex.recognized) {
-      throw new Error('Beskedsvarene lignede ikke en aktiv Temponizer-session');
+    const vagtAvailable = vagtResult.status === 'fulfilled' && (vagtIndex.recognized || counters.vagt === 0);
+    const generalAvailable = generalResult.status === 'fulfilled' && (generalIndex.recognized || counters.generel === 0);
+    if (!vagtAvailable || !generalAvailable) {
+      throw new Error('Beskedoversigten er ufuldstændig. Seneste kendte status bevares.');
     }
 
     let effectiveCounters = counters;
-    let sidebar = parseSidebarPreviews(document);
-    const openThread = parseOpenThreadPreview(document);
+    // Page DOM can lag behind another tab. Notification text comes from a fresh read-only overview.
+    let sidebar = [];
+    const openThread = null;
     const sourceRecords = [...vagtIndex.records, ...generalIndex.records].filter(record => record.unread > 0);
     const vagtTotal = counters.vagt
       ?? vagtIndex.records.filter(record => record.unread > 0).length;
@@ -1238,15 +1273,8 @@
 
   async function refreshMessageEnrichmentIfNeeded(snapshot) {
     if (snapshot.homepageEnriched) return snapshot;
-    const state = { ...getDefaultMessageState(), ...loadJson(ST_MSG_KEY, getDefaultMessageState()) };
-    const generalUnread = (snapshot.counters?.generel ?? 0) + (snapshot.counters?.brugere ?? 0);
-    const hasUndetailedGeneral = generalUnread > 0
-      && !(snapshot.sourceRecords || []).some(record => record.type === 'generel');
-    const hasUnresolvedGeneral = hasUnresolvedGeneralDirection(snapshot.records);
-    if (!state.initialized && !hasUndetailedGeneral && !hasUnresolvedGeneral) return snapshot;
-    const hasThreadChange = diffMessageThreads(state.records || {}, snapshot.records || {}).length > 0;
-    const hasCountIncrease = snapshot.total > clampInteger(state.total, 0);
-    if (!hasThreadChange && !hasCountIncrease && !hasUndetailedGeneral) return snapshot;
+    if (!(snapshot.sourceRecords || Object.values(snapshot.records || {})).some(record => record.unread > 0)
+      && !snapshot.rawTotal && !snapshot.total) return snapshot;
 
     try {
       const homepageHtml = await fetchText(ORIGIN + '/index.php?_=' + Date.now());
@@ -1255,7 +1283,7 @@
       const records = buildMessageRecordMap(
         snapshot.sourceRecords || Object.values(snapshot.records || {}),
         freshPreviews,
-        parseOpenThreadPreview(document)
+        null
       );
       const detailedTotal = countUnreadMessageThreads(records);
       const incomingTotal = countIncomingUnreadThreads(records);
@@ -1264,13 +1292,14 @@
         records,
         detailedTotal,
         incomingTotal,
+        homepageEnriched: true,
         total: incomingTotal
           + clampInteger(snapshot.vagtFallback, 0)
           + clampInteger(snapshot.userFallback, 0)
       };
     } catch (error) {
       console.warn('[TP][MSG] Kunne ikke hente frisk beskedoversigt', error);
-      return snapshot;
+      throw error;
     }
   }
 
@@ -1295,11 +1324,22 @@
     if (!overview.recognized && overview.shifts.length === 0) {
       throw new Error('Kunne ikke genkende interessetællerne på siden');
     }
-    const nested = await mapLimit(overview.shifts, INTEREST_DETAIL_CONCURRENCY, fetchInterestEntriesForShift);
+    const previous = loadJson(ST_INT_KEY, getDefaultInterestState());
+    const failedShifts = [];
+    const nested = await mapLimit(overview.shifts, INTEREST_DETAIL_CONCURRENCY, async shift => {
+      try {
+        return await fetchInterestEntriesForShift(shift);
+      } catch (error) {
+        failedShifts.push(String(shift.id));
+        console.warn('[TP][INT] Bevarer seneste status for vagt', shift.id, error?.message);
+        return Object.values(previous.pairs || {}).filter(entry => String(entry.vagtId) === String(shift.id));
+      }
+    });
     const entries = nested.flat();
     return {
       total: overview.total,
       pairs: entriesToMap(entries),
+      failedShifts,
       observedAt: Date.now()
     };
   }
@@ -1338,9 +1378,11 @@
     const leader = getLeader();
     const time = now();
     const expired = !leader || clampInteger(leader.until, 0) <= time;
-    const visibleTakeover = preferVisible && leader && leader.id !== TAB_ID && leader.visible === false;
+    const versionOrder = leader ? compareVersions(TP_VERSION, leader.version || '0') : 0;
+    const visibleTakeover = preferVisible && leader && leader.id !== TAB_ID && leader.visible === false
+      && versionOrder >= 0 && (!leader.pushReady || !!getUserKey());
     const newerRuntime = leader && compareVersions(TP_VERSION, leader.version || '0') > 0;
-    const pushReadyTakeover = leader && !!getUserKey() && leader.pushReady !== true;
+    const pushReadyTakeover = leader && !!getUserKey() && leader.pushReady !== true && versionOrder >= 0;
     if (expired || leader?.id === TAB_ID || visibleTakeover || newerRuntime || pushReadyTakeover) {
       writeLeadership(time);
     }
@@ -1364,21 +1406,28 @@
       let current = null;
       try { current = JSON.parse(localStorage.getItem(key) || 'null'); } catch (_) {}
       if (!current || clampInteger(current.until, 0) <= Date.now()) {
-        try {
-          localStorage.setItem(key, JSON.stringify({ token, until: Date.now() + MUTEX_LEASE_MS }));
-          await sleep(25 + Math.floor(Math.random() * 35));
-          const verified = JSON.parse(localStorage.getItem(key) || 'null');
-          if (verified?.token === token) {
+        localStorage.setItem(key, JSON.stringify({ token, until: Date.now() + MUTEX_LEASE_MS }));
+        await sleep(25 + Math.floor(Math.random() * 35));
+        const verified = JSON.parse(localStorage.getItem(key) || 'null');
+        if (verified?.token === token) {
+          const renewal = setInterval(() => {
             try {
-              return await task();
-            } finally {
-              try {
-                const latest = JSON.parse(localStorage.getItem(key) || 'null');
-                if (latest?.token === token) localStorage.removeItem(key);
-              } catch (_) {}
-            }
+              const latest = JSON.parse(localStorage.getItem(key) || 'null');
+              if (latest?.token === token) {
+                localStorage.setItem(key, JSON.stringify({ token, until: Date.now() + MUTEX_LEASE_MS }));
+              }
+            } catch (_) {}
+          }, MUTEX_LEASE_MS / 3);
+          try {
+            return await task();
+          } finally {
+            clearInterval(renewal);
+            try {
+              const latest = JSON.parse(localStorage.getItem(key) || 'null');
+              if (latest?.token === token) localStorage.removeItem(key);
+            } catch (_) {}
           }
-        } catch (_) {}
+        }
       }
       await sleep(40 + Math.floor(Math.random() * 60));
     }
@@ -1387,15 +1436,20 @@
   }
 
   async function withCrossTabProcessLock(name, task) {
+    let started = false;
     try {
       if (globalThis.navigator?.locks?.request) {
         return await globalThis.navigator.locks.request(
           'ajourcare-temponizer-' + name,
           { mode: 'exclusive' },
-          task
+          () => {
+            started = true;
+            return task();
+          }
         );
       }
     } catch (error) {
+      if (started) throw error;
       console.warn('[TP] Browserens flerfanelås fejlede; bruger lokal reserve.', error);
     }
     return withLocalStorageMutex(name, task);
@@ -1446,17 +1500,44 @@
     if (total > previous) badgePulse(badge);
   }
 
+  function paintPollingHealth() {
+    const indicator = document.getElementById('tpPollingHealth');
+    if (!indicator) return;
+    const entries = [['msg', 'Beskeder'], ['int', 'Interesser']].map(([kind, label]) => {
+      const state = loadJson('tpPollHealthV1_' + kind, {});
+      const checked = state.lastSuccess ? new Date(state.lastSuccess).toLocaleTimeString('da-DK') : 'ikke kontrolleret';
+      const stale = !state.lastSuccess || now() - state.lastSuccess > 120000;
+      return { warning: !!state.error || stale, text: label + ': ' + (state.error || (stale ? 'Afventer frisk kontrol' : 'OK')) + '. Seneste kontrol: ' + checked };
+    });
+    const outstanding = getNotificationOutbox().filter(job => !['sent', 'cancelled'].includes(job.status));
+    if (outstanding.length) entries.push({ warning: true, text: `Pushover: ${outstanding.length} afsendelse(r) afventer eller kræver kontrol. Klik for status.` });
+    const warning = entries.some(entry => entry.warning);
+    indicator.textContent = warning ? '!' : '\u00b7';
+    indicator.style.color = warning ? '#a33' : '#777';
+    indicator.dataset.state = warning ? 'warning' : 'ok';
+    indicator.title = entries.map(entry => entry.text).join('\n');
+    indicator.setAttribute('aria-label', indicator.title);
+  }
+
+  function setPollingHealth(kind, error = '', partial = false) {
+    const key = 'tpPollHealthV1_' + kind;
+    const previous = loadJson(key, {});
+    saveJson(key, { error, partial: !!partial, checkedAt: now(), lastSuccess: error ? previous.lastSuccess || 0 : now() });
+    paintPollingHealth();
+  }
+
   function getDefaultMessageState() {
-    return { initialized: false, total: 0, rawTotal: 0, records: {}, pending: [], seen: {}, lastPush: 0 };
+    return { initialized: false, total: 0, rawTotal: 0, records: {}, pending: [], seen: {}, lastPush: 0, genericSequence: 0 };
   }
 
   function getDefaultInterestState() {
-    return { initialized: false, total: 0, pairs: {}, pending: [], lastPush: 0 };
+    return { initialized: false, total: 0, pairs: {}, pending: [], lastPush: 0, baselinePendingShifts: [], eventSequence: 0 };
   }
 
   function notificationDeliveryId(kind, notification, eventIds = []) {
     const ids = Array.from(new Set((eventIds || []).map(normalizeText).filter(Boolean))).sort();
-    const source = [kind, ids.join('|'), normalizeText(notification?.title), normalizeText(notification?.body)].join('\u001f');
+    const source = ids.length ? [kind, ids.join('|')].join('\u001f')
+      : [kind, normalizeText(notification?.title), normalizeText(notification?.body)].join('\u001f');
     let hash = 2166136261;
     for (let index = 0; index < source.length; index += 1) {
       hash ^= source.charCodeAt(index);
@@ -1480,13 +1561,13 @@
     return true;
   }
 
-  function dispatchNotification(kind, enableKey, notification, eventIds = []) {
+  function dispatchNotification(kind, enableKey, notification, eventIds = [], events = []) {
+    const enabled = localStorage.getItem(enableKey) === 'true';
+    if (enabled) enqueueNotification(kind, enableKey, notification, eventIds, events);
     if (!takeNotificationDeliveryLock(kind, notification, eventIds)) {
       console.info('[TP] Ignorerer en allerede leveret notifikation:', kind);
       return false;
     }
-    const enabled = localStorage.getItem(enableKey) === 'true';
-    if (enabled) sendPushover(notification.body, notification.title);
     showToast(notification.toast);
     broadcastToast(kind, notification.toast);
     return true;
@@ -1512,7 +1593,8 @@
         records: snapshot.records,
         pending: [],
         seen,
-        lastPush: 0
+        lastPush: 0,
+        genericSequence: 0
       });
       updateMessageBadge(snapshot.total);
       return { baseline: true, events: [] };
@@ -1522,12 +1604,14 @@
       .filter(event => event.kind !== 'thread' || isIncomingMessageRecord(event.record));
     const detailedDelta = events.reduce((sum, event) => sum + event.delta, 0);
     const totalDelta = Math.max(0, snapshot.total - clampInteger(state.total, 0));
+    let genericSequence = clampInteger(state.genericSequence, 0);
     if (totalDelta > detailedDelta) {
       const unknownDelta = totalDelta - detailedDelta;
+      genericSequence += 1;
       events.push({
         kind: 'generic',
         key: `generic:${snapshot.total}`,
-        eventId: `generic:${snapshot.total}:${clampInteger(state.total, 0)}`,
+        eventId: `generic:${genericSequence}:${snapshot.total}:${clampInteger(state.total, 0)}`,
         delta: unknownDelta,
         targetTotal: snapshot.total,
         text: unknownDelta === 1 ? 'Ny ulæst besked' : `${unknownDelta} nye ulæste beskeder`
@@ -1541,11 +1625,11 @@
     let pending = prunePendingMessageEvents(state.pending, snapshot.records, snapshot.total);
     pending = mergePendingEvents(pending, events);
     let lastPush = clampInteger(state.lastPush, 0);
-    let sent = [];
+    let queued = [];
 
     if (pending.length && Date.now() - lastPush > SUPPRESS_MS && takeChannelLock('msg')) {
-      dispatchNotification('msg', 'tpPushEnableMsg', formatMessageNotification(pending), pending.map(event => event.eventId));
-      sent = pending;
+      dispatchNotification('msg', 'tpPushEnableMsg', formatMessageNotification(pending), pending.map(event => event.eventId), pending);
+      queued = pending;
       pending = [];
       lastPush = Date.now();
     }
@@ -1557,10 +1641,11 @@
       records: snapshot.records,
       pending,
       seen,
-      lastPush
+      lastPush,
+      genericSequence
     });
     updateMessageBadge(snapshot.total);
-    return { baseline: false, events, sent, pending };
+    return { baseline: false, events, queued, pending };
   }
 
   function processInterestSnapshot(snapshot) {
@@ -1574,21 +1659,28 @@
         total: snapshot.total,
         pairs: snapshot.pairs,
         pending: [],
+        failedShifts: snapshot.failedShifts || [],
+        baselinePendingShifts: snapshot.failedShifts || [],
+        eventSequence: 0,
         lastPush: 0
       });
       updateInterestBadge(snapshot.total);
       return { baseline: true, events: [] };
     }
 
-    const events = diffInterestPairs(state.pairs, snapshot.pairs);
+    const baselinePendingShifts = Array.isArray(state.baselinePendingShifts) ? state.baselinePendingShifts : [];
+    let eventSequence = clampInteger(state.eventSequence, 0);
+    const events = diffInterestPairs(state.pairs, snapshot.pairs)
+      .filter(event => !baselinePendingShifts.includes(String(event.entry.vagtId)))
+      .map(event => ({ ...event, eventId: `${event.key}:occurrence:${++eventSequence}` }));
     let pending = prunePendingInterestEvents(state.pending, snapshot.pairs);
     pending = mergePendingEvents(pending, events);
     let lastPush = clampInteger(state.lastPush, 0);
-    let sent = [];
+    let queued = [];
 
     if (pending.length && Date.now() - lastPush > SUPPRESS_MS && takeChannelLock('int')) {
-      dispatchNotification('int', 'tpPushEnableInt', formatInterestNotification(pending), pending.map(event => event.eventId));
-      sent = pending;
+      dispatchNotification('int', 'tpPushEnableInt', formatInterestNotification(pending), pending.map(event => event.eventId), pending);
+      queued = pending;
       pending = [];
       lastPush = Date.now();
     }
@@ -1597,11 +1689,14 @@
       initialized: true,
       total: snapshot.total,
       pairs: snapshot.pairs,
+      failedShifts: snapshot.failedShifts || [],
+      baselinePendingShifts: baselinePendingShifts.filter(id => (snapshot.failedShifts || []).includes(id)),
+      eventSequence,
       pending,
       lastPush
     });
     updateInterestBadge(snapshot.total);
-    return { baseline: false, events, sent, pending };
+    return { baseline: false, events, queued, pending };
   }
 
   async function pollMessages() {
@@ -1614,9 +1709,12 @@
       await withCrossTabProcessLock('message-state', async () => {
         if (!isLeader()) return;
         processMessageSnapshot(enriched);
+        setPollingHealth('msg', hasUnresolvedGeneralDirection(enriched.records)
+          ? 'Retningen på nogle generelle beskeder kunne ikke bekræftes' : '', true);
       });
     } catch (error) {
       console.warn('[TP][ERR][MSG]', error);
+      setPollingHealth('msg', 'Kontrol afbrudt');
     } finally {
       messagePollInFlight = false;
     }
@@ -1631,9 +1729,11 @@
       await withCrossTabProcessLock('interest-state', async () => {
         if (!isLeader()) return;
         processInterestSnapshot(snapshot);
+        setPollingHealth('int', snapshot.failedShifts?.length ? 'Nogle vagter kunne ikke kontrolleres' : '', true);
       });
     } catch (error) {
       console.warn('[TP][ERR][INT]', error);
+      setPollingHealth('int', 'Kontrol afbrudt');
     } finally {
       interestPollInFlight = false;
     }
@@ -1641,27 +1741,45 @@
 
   function gmRequest(options) {
     return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
+      let request;
+      let settled = false;
+      const timeout = options.timeout || FETCH_TIMEOUT_MS;
+      const finish = (error, response) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error); else resolve(response);
+      };
+      const timer = setTimeout(() => {
+        finish(new Error('Timeout'));
+        try { request?.abort(); } catch (_) {}
+      }, timeout);
+      try { request = GM_xmlhttpRequest({
         method: options.method || 'GET',
         url: options.url,
         headers: options.headers || {},
         data: options.data,
         anonymous: false,
         withCredentials: true,
-        timeout: options.timeout || FETCH_TIMEOUT_MS,
-        onload: response => response.status >= 200 && response.status < 300
-          ? resolve(response)
-          : reject(new Error('HTTP ' + response.status + ' - ' + (response.responseText || '').slice(0, 300))),
-        onerror: reject,
-        ontimeout: () => reject(new Error('Timeout'))
-      });
+        timeout,
+        onload: response => {
+          if (response.status >= 200 && response.status < 300) return finish(null, response);
+          const error = new Error('HTTP ' + response.status);
+          error.status = response.status;
+          finish(error);
+        },
+        onerror: error => finish(error || new Error('Netværksfejl')),
+        ontimeout: () => finish(new Error('Timeout')),
+        onabort: () => finish(new Error('Afbrudt'))
+      }); } catch (error) { finish(error); }
     });
   }
 
-  async function gmGET(url) {
+  async function gmGET(url, timeout = FETCH_TIMEOUT_MS) {
     const response = await gmRequest({
       method: 'GET',
       url,
+      timeout,
       headers: {
         'Accept': '*/*',
         'Referer': globalThis.location?.href || ORIGIN,
@@ -1680,32 +1798,304 @@
     }
   }
 
-  function sendPushover(message, title = 'Temponizer') {
+  let pushoverConfigInFlight = null;
+  let pushoverConfigRetryAt = 0;
+
+  async function getPushoverAppToken() {
+    const cached = GM_getValue(PUSHOVER_CONFIG_KEY, null);
+    const validCached = cached && /^[a-zA-Z0-9]{30}$/.test(cached.appToken || '');
+    if (validCached && now() - cached.checkedAt < 300000) return cached.appToken;
+    if (pushoverConfigRetryAt > now()) {
+      if (validCached) return cached.appToken;
+      throw new Error('Pushover-opsætning mangler. Log ind på SharePoint i samme browser.');
+    }
+    if (pushoverConfigInFlight) return pushoverConfigInFlight;
+    pushoverConfigInFlight = (async () => {
+      try {
+        const filter = encodeURIComponent("Title eq '" + odataQuote(PUSHOVER_CONFIG_TITLE) + "'");
+        const response = await gmRequest({ url: spListBaseUrl() + '/items?$select=Title,Enabled,SetupData&$filter=' + filter + '&$top=2',
+          headers: { Accept: 'application/json;odata=nometadata' } });
+        const json = JSON.parse(response.responseText || '{}');
+        const rows = json.value || json?.d?.results;
+        if (!Array.isArray(rows)) throw new Error('SharePoint-svaret kunne ikke læses');
+        let config;
+        try { config = JSON.parse(rows[0]?.SetupData || '{}'); } catch (_) {}
+        if (rows.length !== 1 || rows[0].Enabled !== true || config?.version !== 1 || !/^[a-zA-Z0-9]{30}$/.test(config?.appToken || '')) {
+          GM_setValue(PUSHOVER_CONFIG_KEY, null);
+          const error = new Error('PushoverSetup mangler, er deaktiveret eller har ugyldige data. Kontrollér SharePoint.');
+          error.invalidConfig = true;
+          throw error;
+        }
+        GM_setValue(PUSHOVER_CONFIG_KEY, { appToken: config.appToken, checkedAt: now() });
+        pushoverConfigRetryAt = 0;
+        return config.appToken;
+      } catch (error) {
+        pushoverConfigRetryAt = now() + 60000;
+        if (validCached && !error.invalidConfig) return cached.appToken;
+        throw new Error(error.invalidConfig ? error.message : 'Pushover-opsætning kunne ikke hentes. Log ind på SharePoint i samme browser.');
+      } finally { pushoverConfigInFlight = null; }
+    })();
+    return pushoverConfigInFlight;
+  }
+
+  async function sendPushover(message, title = 'Temponizer', preparedAppToken) {
     const userKey = getUserKey();
-    if (!PUSHOVER_TOKEN || !userKey) return;
+    if (!userKey) return { status: 'waiting', reason: 'Pushover-nøgle mangler' };
+    let appToken = preparedAppToken;
+    try { appToken ||= await getPushoverAppToken(); }
+    catch (error) { return { status: 'waiting', reason: error.message }; }
     const safeTitle = truncateText(title, 80);
     const safeMessage = truncateText(message, 850);
     const body = [
-      'token=' + encodeURIComponent(PUSHOVER_TOKEN),
+      'token=' + encodeURIComponent(appToken),
       'user=' + encodeURIComponent(userKey),
       'title=' + encodeURIComponent(safeTitle),
       'message=' + encodeURIComponent(safeMessage)
     ].join('&');
 
-    GM_xmlhttpRequest({
+    return new Promise(resolve => {
+      let finished = false;
+      const finish = result => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(deadline);
+        resolve(result);
+      };
+      const deadline = setTimeout(() => finish({ status: 'unknown', reason: 'Ingen kvittering. Kontrollér Pushover før ny afsendelse.' }), FETCH_TIMEOUT_MS + 1000);
+      try { GM_xmlhttpRequest({
       method: 'POST',
       url: 'https://api.pushover.net/1/messages.json',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       data: body,
       timeout: FETCH_TIMEOUT_MS,
       onload: response => {
-        if (response.status < 200 || response.status >= 300) {
-          console.warn('[TP][PUSHOVER] HTTP', response.status);
+        let payload;
+        try { payload = JSON.parse(response.responseText); } catch (_) {}
+        if (response.status === 200 && payload?.status === 1) {
+          finish({ status: 'sent', request: String(payload.request || '') });
+        } else if (payload?.status === 0) {
+          if (Array.isArray(payload.errors) && payload.errors.some(error => /application|token/i.test(String(error)))) {
+            GM_setValue(PUSHOVER_CONFIG_KEY, null);
+            pushoverConfigRetryAt = 0;
+          }
+          finish({ status: response.status >= 500 ? 'retry' : 'blocked', reason: 'Pushover afviste afsendelsen (HTTP ' + response.status + ')' });
+        } else {
+          finish({ status: 'unknown', reason: 'Uventet svar. Kontrollér Pushover før ny afsendelse.' });
         }
       },
-      onerror: error => console.warn('[TP][PUSHOVER] Netværksfejl', error),
-      ontimeout: () => console.warn('[TP][PUSHOVER] Timeout')
+      onerror: () => finish({ status: 'unknown', reason: 'Netværksfejl. Levering kunne ikke bekræftes.' }),
+      ontimeout: () => finish({ status: 'unknown', reason: 'Timeout. Levering kunne ikke bekræftes.' })
+      }); } catch (_) {
+        finish({ status: 'blocked', reason: 'Tampermonkey kunne ikke starte afsendelsen' });
+      }
     });
+  }
+
+  const OUTBOX_PREFIX = 'tpPushOutboxV1_';
+  let outboxInFlight = false;
+
+  function getNotificationOutbox() {
+    return Object.keys(localStorage).filter(key => key.startsWith(OUTBOX_PREFIX))
+      .map(key => loadJson(key, null)).filter(job => job?.id && Number.isFinite(job.createdAt))
+      .sort((left, right) => left.createdAt - right.createdAt);
+  }
+
+  function saveOutboxJob(job) {
+    const key = OUTBOX_PREFIX + job.id;
+    const value = JSON.stringify(job);
+    localStorage.setItem(key, value);
+    if (localStorage.getItem(key) !== value) throw new Error('Afsendelseskøen kunne ikke gemmes');
+  }
+
+  function pushRecipientId() {
+    const key = getUserKey();
+    return key ? notificationDeliveryId('recipient', { title: key }) : '';
+  }
+
+  function enqueueNotification(kind, enableKey, notification, eventIds, events = []) {
+    const id = notificationDeliveryId(kind, notification, eventIds);
+    if (!loadJson(OUTBOX_PREFIX + id, null)) {
+      saveOutboxJob({ id, kind, enableKey, notification, events, recipient: pushRecipientId(),
+        createdAt: now(), status: 'queued', attempts: 0, nextAttemptAt: 0 });
+    }
+    void drainNotificationOutbox();
+  }
+
+  function refreshQueuedNotification(job) {
+    if (!job.events?.length) return job;
+    const health = loadJson('tpPollHealthV1_' + job.kind, {});
+    const checkedAt = health.checkedAt || health.lastSuccess;
+    if ((health.error && !health.partial) || !checkedAt || now() - checkedAt > 60000) {
+      return { ...job, status: 'waiting', reason: 'Afventer frisk kontrol i Temponizer' };
+    }
+    const state = loadJson(job.kind === 'msg' ? ST_MSG_KEY : ST_INT_KEY, {});
+    if (!state.initialized) return { ...job, status: 'waiting', reason: 'Afventer initialisering' };
+    const uncertain = job.events.some(event => job.kind === 'int'
+      ? (state.failedShifts || []).includes(String(event.entry?.vagtId))
+      : (event.kind === 'generic' ? !!health.error : state.records?.[event.key]?.unread > 0 && state.records[event.key].incoming == null));
+    if (uncertain) return { ...job, status: 'waiting', reason: 'Afventer kontrol af denne hændelse' };
+    const events = job.kind === 'msg'
+      ? prunePendingMessageEvents(job.events, state.records, state.total)
+      : prunePendingInterestEvents(job.events, state.pairs);
+    if (!events.length) return { ...job, status: 'cancelled', reason: 'Hændelsen er ikke længere aktuel', notification: undefined, events: undefined };
+    return { ...job, events, notification: job.kind === 'msg' ? formatMessageNotification(events)
+      : formatInterestNotification(events.map(event => ({ ...event, entry: state.pairs[event.key] }))), reason: '' };
+  }
+
+  async function drainNotificationOutbox() {
+    if (!isLeader() || outboxInFlight) return;
+    outboxInFlight = true;
+    try {
+      await withCrossTabProcessLock('push-outbox', async () => {
+        for (const saved of getNotificationOutbox()) {
+          if (!isLeader()) break;
+          let job = loadJson(OUTBOX_PREFIX + saved.id, null);
+          if (!job) continue;
+          if (['sent', 'cancelled'].includes(job.status)) {
+            if (now() - job.createdAt > MESSAGE_SEEN_TTL_MS) localStorage.removeItem(OUTBOX_PREFIX + job.id);
+            continue;
+          }
+          if (now() - job.createdAt > 86400000) {
+            saveOutboxJob({ ...job, notification: undefined, events: undefined, status: 'expired', reason: 'Mere end 24 timer gammel. Ikke sendt igen automatisk.' });
+            if (now() - job.createdAt > MESSAGE_SEEN_TTL_MS) localStorage.removeItem(OUTBOX_PREFIX + job.id);
+            continue;
+          }
+          if (job.status === 'sending') {
+            saveOutboxJob({ ...job, status: 'unknown', reason: 'Browseren blev afbrudt under afsendelse. Kontrollér Pushover.' });
+            continue;
+          }
+          if (!['queued', 'retry', 'waiting'].includes(job.status) || job.nextAttemptAt > now()) continue;
+          const refreshed = refreshQueuedNotification(job);
+          if (refreshed.status === 'cancelled' || (refreshed.status === 'waiting' && refreshed.reason.startsWith('Afventer'))) {
+            saveOutboxJob(refreshed);
+            continue;
+          }
+          job = refreshed;
+          if (localStorage.getItem(job.enableKey) !== 'true') {
+            saveOutboxJob({ ...job, status: 'cancelled', notification: undefined, events: undefined });
+            continue;
+          }
+          const recipient = pushRecipientId();
+          if (!recipient) {
+            saveOutboxJob({ ...job, status: 'waiting', reason: 'Pushover-nøgle mangler' });
+            continue;
+          }
+          if (job.recipient && job.recipient !== recipient) {
+            saveOutboxJob({ ...job, status: 'blocked', reason: 'Pushover-modtageren er ændret. Ikke sendt.' });
+            continue;
+          }
+          let appToken;
+          try { appToken = await getPushoverAppToken(); }
+          catch (error) {
+            saveOutboxJob({ ...job, status: 'waiting', reason: error.message, nextAttemptAt: now() + 60000 });
+            continue;
+          }
+          if (recipient !== pushRecipientId()) {
+            saveOutboxJob({ ...job, status: 'blocked', reason: 'Pushover-modtageren blev ændret under kontrollen. Ikke sendt.' });
+            continue;
+          }
+          if (!isLeader()) break;
+          job = refreshQueuedNotification(job);
+          if (job.status === 'cancelled' || (job.status === 'waiting' && job.reason.startsWith('Afventer'))) {
+            saveOutboxJob(job);
+            continue;
+          }
+          if (localStorage.getItem(job.enableKey) !== 'true') {
+            saveOutboxJob({ ...job, status: 'cancelled', notification: undefined, events: undefined });
+            continue;
+          }
+          const sending = { ...job, recipient, status: 'sending', attempts: job.attempts + 1 };
+          saveOutboxJob(sending);
+          const result = await sendPushover(job.notification.body, job.notification.title, appToken);
+          const status = result.status === 'retry' && sending.attempts >= 5 ? 'blocked' : result.status;
+          saveOutboxJob({ ...sending, ...result, status,
+            nextAttemptAt: status === 'retry' ? now() + Math.min(300000, 5000 * 2 ** (sending.attempts - 1)) : 0,
+            notification: status === 'sent' ? undefined : job.notification,
+            events: status === 'sent' ? undefined : job.events });
+        }
+      });
+    } catch (error) {
+      console.warn('[TP][PUSHOVER] Køen kunne ikke behandles', error?.message);
+    } finally {
+      outboxInFlight = false;
+      paintPollingHealth();
+    }
+  }
+
+  function showNotificationDeliveryStatus() {
+    document.getElementById('tpDeliveryStatus')?.remove();
+    const dialog = document.createElement('dialog');
+    dialog.id = 'tpDeliveryStatus';
+    dialog.style.cssText = 'box-sizing:border-box;width:420px;max-width:calc(100vw - 24px);max-height:70vh;overflow:auto;padding:14px;border:1px solid #bcc4ca;border-radius:4px;background:#fff;color:#20272b;font:12px Arial,sans-serif';
+    const heading = document.createElement('strong');
+    heading.textContent = 'Pushover-afsendelser';
+    dialog.appendChild(heading);
+    const jobs = getNotificationOutbox().filter(job => !['sent', 'cancelled'].includes(job.status));
+    if (!jobs.length) {
+      const text = document.createElement('p');
+      text.textContent = 'Ingen afsendelser afventer.';
+      dialog.appendChild(text);
+    }
+    for (const job of jobs.slice(-20).reverse()) {
+      const row = document.createElement('div');
+      row.style.cssText = 'padding:10px 0;border-bottom:1px solid #e1e4e7;overflow-wrap:anywhere';
+      const text = document.createElement('p');
+      text.style.margin = '0 0 6px';
+      text.textContent = (job.notification?.title || 'Udløbet afsendelse') + ': ' + (job.reason || 'Afventer kvittering');
+      row.appendChild(text);
+      if (job.reason?.includes('SharePoint')) {
+        const login = document.createElement('a');
+        login.textContent = 'Log ind på SharePoint';
+        login.href = TP_MAIL_PUSH.loginUrl;
+        login.target = '_blank';
+        login.rel = 'noopener noreferrer';
+        login.style.cssText = 'display:block;margin:6px 0;color:#1769aa';
+        row.appendChild(login);
+      }
+      if (['blocked', 'unknown'].includes(job.status) && job.notification) {
+        const retry = document.createElement('button');
+        retry.textContent = '\u21bb';
+        retry.title = 'Forsøg afsendelse igen';
+        retry.setAttribute('aria-label', retry.title);
+        retry.addEventListener('click', async () => {
+          if (!confirm('Send denne notifikation igen? Hvis den allerede er modtaget, kommer den to gange.')) return;
+          await withCrossTabProcessLock('push-outbox', () => {
+            const current = loadJson(OUTBOX_PREFIX + job.id, null);
+            if (current && ['blocked', 'unknown'].includes(current.status)) {
+              saveOutboxJob({ ...current, recipient: pushRecipientId(), status: 'queued', attempts: 0, reason: '', nextAttemptAt: 0 });
+            }
+          });
+          dialog.close();
+          void drainNotificationOutbox();
+        });
+        row.appendChild(retry);
+      }
+      if (job.status !== 'sending') {
+        const dismiss = document.createElement('button');
+        dismiss.textContent = '\u00d7';
+        dismiss.title = 'Fjern fra afsendelseskøen';
+        dismiss.setAttribute('aria-label', dismiss.title);
+        dismiss.style.marginLeft = '6px';
+        dismiss.addEventListener('click', async () => {
+          await withCrossTabProcessLock('push-outbox', () => {
+            const current = loadJson(OUTBOX_PREFIX + job.id, null);
+            if (current && current.status !== 'sent') saveOutboxJob({ ...current, status: 'cancelled', notification: undefined, events: undefined });
+          });
+          showNotificationDeliveryStatus();
+          paintPollingHealth();
+        });
+        row.appendChild(dismiss);
+      }
+      dialog.appendChild(row);
+    }
+    const close = document.createElement('button');
+    close.textContent = 'Luk';
+    close.style.marginTop = '12px';
+    close.addEventListener('click', () => dialog.close());
+    dialog.appendChild(close);
+    dialog.addEventListener('close', () => dialog.remove());
+    document.body.appendChild(dialog);
+    dialog.showModal();
   }
 
   function showOsNotification(message, duration = 4500) {
@@ -1721,8 +2111,10 @@
   function positionDomToast(element = document.getElementById('tpToast')) {
     if (!element) return;
     const callCard = document.getElementById('tpIncomingCallCard');
-    const callCardHeight = callCard ? Math.ceil(callCard.getBoundingClientRect().height) : 0;
-    element.style.bottom = (16 + (callCardHeight ? callCardHeight + 10 : 0)) + 'px';
+    const panel = document.getElementById('tpPanel');
+    const occupied = callCard || panel;
+    const rect = occupied?.getBoundingClientRect();
+    element.style.bottom = (rect ? Math.max(16, window.innerHeight - rect.top + 10) : 16) + 'px';
   }
 
   function showDomToast(message, duration = 4500) {
@@ -1776,6 +2168,8 @@
       'box-shadow:0 8px 24px rgba(30,35,38,.28)',
       'font:12px/1.3 sans-serif,Verdana,Arial,Helvetica,sans-serif', 'letter-spacing:0'
     ].join(';');
+    const panelRect = document.getElementById('tpPanel')?.getBoundingClientRect();
+    if (panelRect) card.style.bottom = Math.max(16, window.innerHeight - panelRect.top + 10) + 'px';
 
     const head = document.createElement('div');
     head.style.cssText = 'display:flex;align-items:center;gap:7px;padding:7px 8px;border-bottom:1px solid #c9ccce;background:#e9eaea';
@@ -1864,7 +2258,7 @@
       });
       notification.onclick = () => {
         try { globalThis.focus(); } catch (_) {}
-        globalThis.location.href = match.profileUrl;
+        if (match.profileUrl) globalThis.location.href = match.profileUrl;
         notification.close();
       };
       setTimeout(() => notification.close(), Math.min(INCOMING_CALL_CARD_MS, 30000));
@@ -1884,7 +2278,7 @@
       const time = now();
       const lastEventId = last?.eventId || last?.phone;
       if (lastEventId === eventId && time - clampInteger(last.ts, 0) < INCOMING_CALL_LOCK_MS) return false;
-      saveJson(INCOMING_CALL_LOCK_KEY, { eventId, phone, ts: time });
+      saveJson(INCOMING_CALL_LOCK_KEY, { eventId, phone, ts: time, owner: TAB_ID });
       return true;
     });
   }
@@ -1892,20 +2286,29 @@
   async function handleIncomingCall(phone, eventId = phone, options = {}) {
     if (options.queueTagged !== true && await consumeRecentOutgoingCall(phone)) {
       console.info('[TP][CALL] Ignorerer callback fra et nyligt udgående opkald', formatPhoneNumber(phone));
-      return;
+      return { status: 'ignored' };
     }
     const claimed = await claimIncomingCall(phone, eventId);
-    if (!claimed) return;
+    if (!claimed) return { status: 'duplicate' };
     showIncomingCallCard({ phone, state: 'loading' });
     try {
       const matches = await fetchIncomingCallMatches(phone);
       showIncomingCallCard({ phone, matches });
       if (shouldShowIncomingCallOsNotification()) {
-        showIncomingCallOsNotification(matches[0], phone);
+        const match = matches.length === 1 ? matches[0] : {
+          name: matches.length ? matches.length + ' mulige vikarer' : 'Nummeret blev ikke fundet'
+        };
+        showIncomingCallOsNotification(match, phone);
       }
+      return { status: 'handled', matches: matches.length };
     } catch (error) {
       console.warn('[TP][CALL] Nummeropslag fejlede', error);
       showIncomingCallCard({ phone, state: error?.message === 'TP_LOGIN_REQUIRED' ? 'login' : 'error' });
+      await withCrossTabProcessLock('incoming-call', () => {
+        const claim = loadJson(INCOMING_CALL_LOCK_KEY, null);
+        if (claim?.eventId === eventId && claim.owner === TAB_ID) localStorage.removeItem(INCOMING_CALL_LOCK_KEY);
+      });
+      return { status: 'failed', reason: error?.message };
     }
   }
 
@@ -1924,30 +2327,36 @@
       + "/_api/web/lists/getbytitle('" + odataQuote(TP_CALL_QUEUE.listTitle) + "')";
   }
 
-  function ensureIncomingCallQueueState() {
+  function ensureIncomingCallQueueState(email = incomingCallUserEmail) {
     const saved = loadJson(INCOMING_CALL_QUEUE_STATE_KEY, null);
-    if (saved && typeof saved === 'object') {
+    const previousEmail = saved?.email || getIPnordicVerification()?.email || '';
+    if (saved && typeof saved === 'object' && (!email || !previousEmail || email === previousEmail)) {
       return {
         lastId: clampInteger(saved.lastId, 0),
         initializedAt: clampInteger(saved.initializedAt, now()),
-        ready: saved.ready === true
+        ready: saved.ready === true,
+        email: email || previousEmail
       };
     }
-    const state = { lastId: 0, initializedAt: now(), ready: false };
+    const state = { lastId: 0, initializedAt: now(), ready: false, email: email || '' };
     saveJson(INCOMING_CALL_QUEUE_STATE_KEY, state);
     return state;
   }
 
   async function getIncomingCallUserEmail() {
-    if (incomingCallUserEmail) return incomingCallUserEmail;
+    if (incomingCallUserEmail && now() - incomingCallUserEmailCheckedAt < 60000) return incomingCallUserEmail;
     const response = await gmRequest({
       url: TP_CALL_QUEUE.spSite.replace(/\/$/, '') + '/_api/web/currentuser?$select=Email',
       headers: { 'Accept': 'application/json;odata=nometadata' }
     });
+    if (/^https:\/\/(?:login\.(?:microsoftonline\.com|windows\.net)|[^/]*\.sharepoint\.com\/.*Authenticate)/i.test(response.finalUrl || '')) {
+      throw new Error('SP_LOGIN_REQUIRED');
+    }
     const json = JSON.parse(response.responseText || '{}');
     const email = normalizeText(json.Email || json?.d?.Email).toLocaleLowerCase('da');
     if (!email || !email.includes('@')) throw new Error('SharePoint-brugerens e-mail mangler');
     incomingCallUserEmail = email;
+    incomingCallUserEmailCheckedAt = now();
     return email;
   }
 
@@ -2016,7 +2425,7 @@
     const button = document.getElementById('tpIPnordicSetupBtn');
     if (!status) return;
     const verified = getIPnordicVerification();
-    if (verified && state !== 'login' && state !== 'error') {
+    if (verified && (!incomingCallUserEmail || verified.email === incomingCallUserEmail) && state !== 'login' && state !== 'error') {
       status.textContent = 'klar';
       status.style.color = '#0a7a35';
       if (button) button.textContent = 'Tjek';
@@ -2049,12 +2458,13 @@
     return verification;
   }
 
-  async function fetchIncomingCallQueueItems(email) {
-    const filter = encodeURIComponent("RecipientEmail eq '" + odataQuote(email) + "'");
+  async function fetchIncomingCallQueueItems(email, state = ensureIncomingCallQueueState(email)) {
+    const filter = encodeURIComponent("RecipientEmail eq '" + odataQuote(email) + "'"
+      + (state.ready ? ' and Id gt ' + clampInteger(state.lastId, 0) : ''));
     const url = incomingCallQueueListBaseUrl()
       + '/items?$select=Id,CallerNumber,RecipientEmail,Created'
       + '&$filter=' + filter
-      + '&$orderby=Id%20desc&$top=' + TP_CALL_QUEUE.batchSize;
+      + '&$orderby=Id%20' + (state.ready ? 'asc' : 'desc') + '&$top=' + TP_CALL_QUEUE.batchSize;
     const response = await gmRequest({
       url,
       headers: { 'Accept': 'application/json;odata=nometadata' }
@@ -2069,13 +2479,14 @@
         queueTagged: hasIncomingQueueSuffix(row.CallerNumber),
         createdAt: Date.parse(row.Created || '') || 0
       }))
-      .filter(row => row.id > 0 && row.phone);
+      .filter(row => row.id > 0);
   }
 
   function selectPendingIncomingCallRows(rows, state, referenceTime = now()) {
     const initialCutoff = clampInteger(state?.initializedAt, 0) - 2000;
     const recentCutoff = referenceTime - TP_CALL_QUEUE.notificationMaxAgeMs;
     return rows
+      .filter(row => row.phone)
       .filter(row => row.id > clampInteger(state?.lastId, 0))
       .filter(row => state?.ready === true || row.createdAt >= initialCutoff)
       .filter(row => row.createdAt >= recentCutoff)
@@ -2101,23 +2512,32 @@
 
       await withCrossTabProcessLock('incoming-call-queue', async () => {
         if (!isLeader()) return;
-        const state = ensureIncomingCallQueueState();
+        const state = ensureIncomingCallQueueState(email);
         const latestId = rows.reduce((highest, row) => Math.max(highest, row.id), state.lastId);
         const pending = selectPendingIncomingCallRows(rows, state);
 
         for (const row of pending) {
-          await handleIncomingCall(row.phone, 'sharepoint:' + row.id, { queueTagged: row.queueTagged });
-          markIPnordicVerified(email, 'sharepoint:' + row.id);
+          const result = await handleIncomingCall(row.phone, 'sharepoint:' + row.id, { queueTagged: row.queueTagged });
+          if (result?.status === 'failed') throw new Error('TP_CALL_LOOKUP_FAILED');
+          if (result?.status === 'handled') markIPnordicVerified(email, 'sharepoint:' + row.id);
+          saveJson(INCOMING_CALL_QUEUE_STATE_KEY, { ...state, lastId: row.id, ready: true });
         }
         saveJson(INCOMING_CALL_QUEUE_STATE_KEY, {
           lastId: latestId,
           initializedAt: state.initializedAt,
-          ready: true
+          ready: true,
+          email
         });
       });
     } catch (error) {
-      paintIPnordicSetupStatus('login');
-      notifyIncomingCallQueueError(error);
+      incomingCallUserEmail = '';
+      incomingCallUserEmailCheckedAt = 0;
+      if (error?.status === 401 || error?.status === 403 || error?.message === 'SP_LOGIN_REQUIRED') {
+        paintIPnordicSetupStatus('login');
+        notifyIncomingCallQueueError(error);
+      } else {
+        paintIPnordicSetupStatus('error');
+      }
     } finally {
       incomingCallPollInFlight = false;
     }
@@ -2151,6 +2571,12 @@
       if (event.key === ST_INT_KEY && event.newValue) {
         try { updateInterestBadge(JSON.parse(event.newValue).total); } catch (_) {}
       }
+      if (event.key === 'tpPushEnableMsg' || event.key === 'tpPushEnableInt') {
+        const id = event.key === 'tpPushEnableMsg' ? 'tpEnableMsg' : 'tpEnableInt';
+        const checkbox = document.getElementById(id);
+        if (checkbox) checkbox.checked = event.newValue === 'true';
+      }
+      if (event.key?.startsWith('tpPollHealthV1_') || event.key?.startsWith(OUTBOX_PREFIX)) paintPollingHealth();
     });
   }
 
@@ -2186,6 +2612,26 @@
       status.style.color = color || (enabled ? '#0a7a35' : '#a33');
     }
     if (loginLink) loginLink.style.display = showLogin ? 'inline' : 'none';
+  }
+
+  function paintSharedMailStatus() {
+    if (tpMailPushBusy) return;
+    const state = loadJson(MAIL_STATUS_KEY, null);
+    if (!state) return;
+    if (typeof state.enabled === 'boolean') setLocalMailPushEnabled(state.enabled);
+    const stale = now() - state.checkedAt > TP_MAIL_PUSH.pollMs * 3;
+    paintMailPushUI(state.enabled, stale ? 'afventer synk…' : state.statusText,
+      stale ? '#888' : state.color, state.showLogin);
+  }
+
+  function publishMailStatus(enabled, error = false, written = false) {
+    const previous = loadJson(MAIL_STATUS_KEY, {});
+    const state = { enabled: typeof enabled === 'boolean' ? enabled : previous.enabled,
+      statusText: error ? 'fejl' : enabled ? 'til' : 'fra', color: error ? '#a33' : enabled ? '#0a7a35' : '#a33',
+      showLogin: error, checkedAt: now(), writtenAt: written ? now() : previous.writtenAt || 0 };
+    saveJson(MAIL_STATUS_KEY, state);
+    if (typeof state.enabled === 'boolean') setLocalMailPushEnabled(state.enabled);
+    paintMailPushUI(state.enabled, state.statusText, state.color, state.showLogin);
   }
 
   async function getSharePointDigest() {
@@ -2231,48 +2677,64 @@
     const json = JSON.parse(response.responseText || '{}');
     const rows = json.value || json?.d?.results || [];
     if (!rows.length) throw new Error('Fandt ikke PushoverMail i TemponizerSettings');
-    return { id: rows[0].Id, enabled: !!rows[0].Enabled };
+    if (!Number.isInteger(rows[0].Id) || typeof rows[0].Enabled !== 'boolean') {
+      throw new Error('Ukendt format på SharePoint mailstatus');
+    }
+    return { id: rows[0].Id, enabled: rows[0].Enabled };
   }
 
   async function setMailPushSetting(enabled) {
-    const item = await getMailPushSetting();
-    const digest = await getSharePointDigest();
-    const entityType = await getSharePointListEntityType();
-    await gmRequest({
-      method: 'POST',
-      url: spListBaseUrl() + '/items(' + item.id + ')',
-      headers: {
-        'Accept': 'application/json;odata=verbose',
-        'Content-Type': 'application/json;odata=verbose',
-        'X-RequestDigest': digest,
-        'IF-MATCH': '*',
-        'X-HTTP-Method': 'MERGE'
-      },
-      data: JSON.stringify({
-        __metadata: { type: entityType },
-        Enabled: !!enabled
-      })
+    return withCrossTabProcessLock('mail-state', async () => {
+      const item = await getMailPushSetting();
+      const digest = await getSharePointDigest();
+      const entityType = await getSharePointListEntityType();
+      await gmRequest({
+        method: 'POST',
+        url: spListBaseUrl() + '/items(' + item.id + ')',
+        headers: {
+          'Accept': 'application/json;odata=verbose',
+          'Content-Type': 'application/json;odata=verbose',
+          'X-RequestDigest': digest,
+          'IF-MATCH': '*',
+          'X-HTTP-Method': 'MERGE'
+        },
+        data: JSON.stringify({
+          __metadata: { type: entityType },
+          Enabled: !!enabled
+        })
+      });
+      publishMailStatus(enabled, false, true);
     });
-    setLocalMailPushEnabled(enabled);
-    paintMailPushUI(enabled, enabled ? 'til' : 'fra');
   }
 
   async function refreshMailPushSetting() {
     if (tpMailPushBusy || tpMailRefreshInFlight) return;
     if (!document.getElementById('tpEnableMail')) return;
+    if (!isLeader()) { paintSharedMailStatus(); return; }
     const generation = ++tpMailRefreshGeneration;
     tpMailRefreshInFlight = true;
     try {
-      paintMailPushUI(undefined, 'synk…', '#888');
-      const setting = await getMailPushSetting();
-      if (generation !== tpMailRefreshGeneration || tpMailPushBusy) return;
-      setLocalMailPushEnabled(setting.enabled);
-      paintMailPushUI(setting.enabled, setting.enabled ? 'til' : 'fra');
+      await withCrossTabProcessLock('mail-state', async () => {
+        if (!isLeader() || generation !== tpMailRefreshGeneration || tpMailPushBusy) return;
+        if (now() - (loadJson(MAIL_STATUS_KEY, {}).writtenAt || 0) < 2000) {
+          paintSharedMailStatus();
+          return;
+        }
+        paintMailPushUI(undefined, 'synk…', '#888');
+        try {
+          const setting = await getMailPushSetting();
+          if (generation !== tpMailRefreshGeneration || tpMailPushBusy) return;
+          publishMailStatus(setting.enabled);
+        } catch (error) {
+          if (generation === tpMailRefreshGeneration && !tpMailPushBusy) {
+            console.warn('[TP][MAIL] refresh error', error);
+            publishMailStatus(undefined, true);
+          }
+        }
+      });
     } catch (error) {
-      if (generation === tpMailRefreshGeneration) {
-        console.warn('[TP][MAIL] refresh error', error);
-        paintMailPushUI(undefined, 'fejl', '#a33', true);
-      }
+      console.warn('[TP][MAIL] status lock error', error);
+      paintMailPushUI(undefined, 'afventer synk…', '#888');
     } finally {
       if (generation === tpMailRefreshGeneration) tpMailRefreshInFlight = false;
     }
@@ -2283,6 +2745,10 @@
     if (!checkbox) return;
     checkbox.checked = getLocalMailPushEnabled();
     paintMailPushUI(checkbox.checked, 'synk…', '#888');
+    paintSharedMailStatus();
+    window.addEventListener('storage', event => {
+      if (event.key === MAIL_STATUS_KEY) paintSharedMailStatus();
+    });
 
     checkbox.addEventListener('change', async () => {
       if (tpMailPushBusy) return;
@@ -2296,7 +2762,7 @@
         await setMailPushSetting(wantOn);
       } catch (error) {
         console.warn('[TP][MAIL] update error', error);
-        checkbox.checked = !wantOn;
+        checkbox.checked = loadJson(MAIL_STATUS_KEY, {}).enabled ?? getLocalMailPushEnabled();
         paintMailPushUI(checkbox.checked, 'fejl', '#a33', true);
       } finally {
         checkbox.disabled = false;
@@ -2650,6 +3116,9 @@
     panel.style.bottom = '12px';
     panel.style.left = 'auto';
     panel.style.top = 'auto';
+    const callCard = document.getElementById('tpIncomingCallCard');
+    if (callCard) callCard.style.bottom = Math.max(16, window.innerHeight - panel.getBoundingClientRect().top + 10) + 'px';
+    positionDomToast();
   }
 
   function setPanelCollapsed(panel, collapsed, persist = true) {
@@ -2719,6 +3188,7 @@
     panel.innerHTML =
       '<div id="tpHeader" style="display:flex;align-items:center;gap:6px;margin-bottom:4px">' +
         '<div style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">TP Notifikationer</div>' +
+        '<span id="tpPollingHealth" role="status" style="width:10px;flex:0 0 10px;text-align:center;font-weight:bold">!</span>' +
         '<div style="margin-left:auto;display:flex;align-items:center;gap:6px">' +
           '<button id="tpGearBtn" type="button" title="Indstillinger" aria-label="Indstillinger" style="width:22px;height:22px;line-height:20px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:50%;box-shadow:0 4px 12px rgba(0,0,0,.18);cursor:pointer;padding:0;user-select:none">⚙</button>' +
           '<button id="tpCollapseBtn" type="button" title="Minimer TP Notifikationer" aria-label="Minimer TP Notifikationer" aria-expanded="true" style="width:22px;height:22px;line-height:19px;text-align:center;background:#fff;border:1px solid #ccc;border-radius:3px;cursor:pointer;padding:0;user-select:none;font-size:16px">&#8722;</button>' +
@@ -2734,7 +3204,7 @@
         '<span id="tpIntCountBadge" style="display:flex;align-items:center;justify-content:center;margin-left:auto;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span>' +
       '</div>' +
       '<div style="display:flex;align-items:center;gap:6px;margin:2px 0 6px;white-space:nowrap">' +
-        '<label style="display:flex;align-items:center;gap:6px;min-width:0"><input type="checkbox" id="tpEnableMail"> <span>Mail</span></label>' +
+        '<label title="Fælles indstilling for mailnotifikationer" style="display:flex;align-items:center;gap:6px;min-width:0"><input type="checkbox" id="tpEnableMail"> <span>Mail (fælles)</span></label>' +
         '<span id="tpMailStatus" style="margin-left:auto;font-size:10px;color:#888">…</span>' +
         '<a id="tpMailLoginLink" href="' + TP_MAIL_PUSH.loginUrl + '" target="_blank" rel="noopener noreferrer" style="display:none;font-size:10px;color:#1769aa;text-decoration:underline">Log ind</a>' +
       '</div>' +
@@ -2899,6 +3369,8 @@
     });
 
     initPanelCollapseControls(panel, () => toggleMenu(false));
+    window.addEventListener('resize', () => pinPanelBottomRight(panel));
+    if (typeof ResizeObserver === 'function') new ResizeObserver(() => pinPanelBottomRight(panel)).observe(panel);
 
     const messageCheckbox = panel.querySelector('#tpEnableMsg');
     const interestCheckbox = panel.querySelector('#tpEnableInt');
@@ -2919,6 +3391,19 @@
     const interestState = loadJson(ST_INT_KEY, getDefaultInterestState());
     setBadge(panel.querySelector('#tpMsgCountBadge'), messageState.total);
     setBadge(panel.querySelector('#tpIntCountBadge'), interestState.total);
+    paintPollingHealth();
+    const health = panel.querySelector('#tpPollingHealth');
+    health.tabIndex = 0;
+    health.setAttribute('role', 'button');
+    health.style.cursor = 'pointer';
+    health.addEventListener('click', showNotificationDeliveryStatus);
+    health.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        showNotificationDeliveryStatus();
+      }
+    });
+    setInterval(paintPollingHealth, 30000);
   }
 
   function ensureFullyVisible(element, margin = 8) {
@@ -2979,13 +3464,13 @@
     return parseSmsStatusFromDoc(parseHtml(html));
   }
 
-  async function fetchSmsStatusHTML() {
-    return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now());
+  async function fetchSmsStatusHTML(timeoutMs = FETCH_TIMEOUT_MS) {
+    return gmGET(SMS_SETTINGS_URL + '&t=' + Date.now(), timeoutMs);
   }
 
-  async function getSmsStatus() {
+  async function getSmsStatus(timeoutMs = FETCH_TIMEOUT_MS) {
     try {
-      return parseSmsStatusFromHTML(await fetchSmsStatusHTML());
+      return parseSmsStatusFromHTML(await fetchSmsStatusHTML(timeoutMs));
     } catch (_) {
       return { state: 'unknown' };
     }
@@ -2997,8 +3482,6 @@
       const frameDocument = iframe.contentDocument;
       if (!frameWindow || !frameDocument) return;
       frameWindow.open = () => null;
-      frameWindow.alert = () => {};
-      frameWindow.confirm = () => true;
       frameDocument.addEventListener('click', event => {
         const link = event.target.closest?.('a');
         if (!link) return;
@@ -3009,7 +3492,32 @@
     } catch (_) {}
   }
 
-  async function ensureSmsFrameLoaded() {
+  function loadSmsFrame(iframe, url, timeoutMs = FETCH_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      let timer;
+      const cleanup = () => {
+        clearTimeout(timer);
+        iframe.removeEventListener('load', loaded);
+        iframe.removeEventListener('error', failed);
+      };
+      const failed = () => {
+        cleanup();
+        iframe.remove();
+        reject(new Error('SMS-indstillingerne kunne ikke indlæses. Prøv igen.'));
+      };
+      const loaded = () => {
+        cleanup();
+        hardenSmsIframe(iframe);
+        resolve(iframe);
+      };
+      iframe.addEventListener('load', loaded, { once: true });
+      iframe.addEventListener('error', failed, { once: true });
+      timer = setTimeout(failed, timeoutMs);
+      iframe.src = url;
+    });
+  }
+
+  async function ensureSmsFrameLoaded(timeoutMs = FETCH_TIMEOUT_MS) {
     let iframe = document.getElementById('tpSmsFrame');
     if (!iframe) {
       iframe = document.createElement('iframe');
@@ -3026,19 +3534,11 @@
       });
       document.body.appendChild(iframe);
     }
-    const loadOnce = () => new Promise(resolve => {
-      iframe.onload = () => {
-        hardenSmsIframe(iframe);
-        resolve();
-      };
-    });
     const wantUrl = SMS_SETTINGS_URL;
     if (iframe.src !== wantUrl) {
-      iframe.src = wantUrl;
-      await loadOnce();
+      await loadSmsFrame(iframe, wantUrl, timeoutMs);
     } else if (!iframe.contentWindow || !iframe.contentDocument || !iframe.contentDocument.body) {
-      iframe.src = wantUrl;
-      await loadOnce();
+      await loadSmsFrame(iframe, wantUrl, timeoutMs);
     } else {
       hardenSmsIframe(iframe);
     }
@@ -3056,20 +3556,18 @@
   function invokeIframeAction(iframe, wantOn) {
     const frameWindow = iframe.contentWindow;
     const frameDocument = iframe.contentDocument;
-    try {
-      if (wantOn && typeof frameWindow.activate_cell_sms_notifikationer === 'function') {
-        frameWindow.activate_cell_sms_notifikationer();
-        return true;
-      }
-      if (!wantOn && typeof frameWindow.deactivate_cell_sms_notifikationer === 'function') {
-        frameWindow.deactivate_cell_sms_notifikationer();
-        return true;
-      }
-    } catch (_) {}
+    if (wantOn && typeof frameWindow.activate_cell_sms_notifikationer === 'function') {
+      frameWindow.activate_cell_sms_notifikationer();
+      return true;
+    }
+    if (!wantOn && typeof frameWindow.deactivate_cell_sms_notifikationer === 'function') {
+      frameWindow.deactivate_cell_sms_notifikationer();
+      return true;
+    }
     try {
       const link = wantOn
-        ? (frameDocument.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]') || frameDocument.querySelector('#sms_notifikation_ikke_aktiv a'))
-        : (frameDocument.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]') || frameDocument.querySelector('#sms_notifikation_aktiv a'));
+        ? frameDocument.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]')
+        : frameDocument.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]');
       if (link) {
         link.click();
         return true;
@@ -3078,8 +3576,15 @@
     return false;
   }
 
-  async function toggleSmsInIframe(wantOn, timeoutMs = 15000, pollMs = 500) {
-    const iframe = await ensureSmsFrameLoaded();
+  async function toggleSmsInIframe(wantOn, timeoutMs = 30000, pollMs = 500) {
+    const deadline = now() + timeoutMs;
+    const remaining = () => {
+      const time = deadline - now();
+      if (time <= 0) throw new Error('SMS-kontrollen tog for lang tid. Kontrollér status før nyt forsøg.');
+      return time;
+    };
+    const iframe = await ensureSmsFrameLoaded(Math.min(FETCH_TIMEOUT_MS, remaining()));
+    remaining();
     const initialStatus = getIframeStatus(iframe);
     if ((wantOn && initialStatus.state === 'active') || (!wantOn && initialStatus.state === 'inactive')) {
       return initialStatus;
@@ -3088,30 +3593,23 @@
       throw new Error('Kan ikke udløse aktivering/deaktivering i iframe.');
     }
     const maybeReloaded = new Promise(resolve => {
-      let done = false;
-      iframe.addEventListener('load', () => {
-        if (!done) {
-          done = true;
-          resolve();
-        }
-      }, { once: true });
-      setTimeout(() => {
-        if (!done) resolve();
-      }, 1200);
+      const finish = () => {
+        iframe.removeEventListener('load', finish);
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, Math.min(1200, remaining()));
+      iframe.addEventListener('load', finish, { once: true });
     });
     await maybeReloaded;
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
+    const pollDeadline = Math.min(now() + 15000, deadline - 1200);
+    while (now() < pollDeadline) {
       const status = getIframeStatus(iframe);
       if (wantOn && status.state === 'active') return status;
       if (!wantOn && status.state === 'inactive') return status;
-      await sleep(pollMs);
+      await sleep(Math.min(pollMs, Math.max(1, pollDeadline - now())));
     }
-    const reload = () => new Promise(resolve => {
-      iframe.onload = () => resolve();
-      iframe.src = SMS_SETTINGS_URL + '&ts=' + Date.now();
-    });
-    await reload();
+    await loadSmsFrame(iframe, SMS_SETTINGS_URL + '&ts=' + Date.now(), Math.min(FETCH_TIMEOUT_MS, remaining()));
     return getIframeStatus(iframe);
   }
 
@@ -3123,17 +3621,19 @@
       this._last = status;
       if (callback) callback(status);
     },
-    async setEnabled(wantOn, uiBusy, callback) {
+    async setEnabled(wantOn, uiBusy, callback, timeoutMs = 30000) {
       if (this._busy) return;
+      const deadline = now() + timeoutMs;
       this._busy = true;
       if (uiBusy) uiBusy(true, wantOn ? 'aktiverer…' : 'deaktiverer…');
       try {
-        const status = await toggleSmsInIframe(wantOn, 15000, 500);
+        const status = await toggleSmsInIframe(wantOn, Math.max(1, deadline - now()), 500);
         this._last = status;
         if (callback) callback(status);
       } catch (error) {
         console.warn('[TP][SMS] setEnabled error', error);
-        const status = await getSmsStatus();
+        const remaining = deadline - now();
+        const status = remaining > 0 ? await getSmsStatus(Math.min(FETCH_TIMEOUT_MS, remaining)) : { state: 'unknown' };
         this._last = status;
         if (callback) callback(status);
       } finally {
@@ -3449,13 +3949,15 @@
       href: buildWorkerProfileURL(context.workerId, '#vagter')
     });
     const sick = createWorkerHoverRow({
-      label: 'Sygemeldinger',
+      label: 'Sygevagter',
+      detail: '90 dage',
       value: data.sickShifts,
       href: buildWorkerProfileURL(context.workerId, '#vagter,annullerede'),
       marker: 'sick'
     });
     const withdrawn = createWorkerHoverRow({
       label: 'Sprunget fra',
+      detail: '90 dage',
       value: data.withdrawnShifts,
       href: buildWorkerProfileURL(context.workerId, '#vagter,annullerede'),
       marker: 'withdrawn'
@@ -3465,11 +3967,13 @@
     pair.append(
       createWorkerHoverRow({
         label: 'Klager',
+        detail: 'I alt',
         value: data.complaints,
         href: buildWorkerProfileURL(context.workerId, '#klager')
       }),
       createWorkerHoverRow({
         label: 'Blokeringer',
+        detail: 'Permanente',
         value: data.blockings,
         href: buildWorkerProfileURL(context.workerId, '#blokeringer')
       })
@@ -3713,10 +4217,9 @@
       .trim();
   }
 
-  function getAuthorizationLookupMatches(payload, profile) {
-    const records = Array.isArray(payload?.GetHealthProfessionalsResult)
-      ? payload.GetHealthProfessionalsResult
-      : [];
+  function getAuthorizationLookupMatches(payload, profile, allowNameVariant = false) {
+    if (!Array.isArray(payload?.GetHealthProfessionalsResult)) throw new Error('Autorisationsregisteret returnerede et ukendt svarformat');
+    const records = payload.GetHealthProfessionalsResult;
     const expectedName = normalizeAuthorizationName(profile.name);
     const matches = records.filter(record => {
       const birthDate = String(record?.BirthDate || '').slice(0, 10);
@@ -3724,8 +4227,7 @@
       const returnedName = normalizeAuthorizationName([record?.FirstName, record?.LastName].filter(Boolean).join(' '));
       const nameMatches = returnedName && (
         returnedName === expectedName ||
-        returnedName.includes(expectedName) ||
-        expectedName.includes(returnedName)
+        (allowNameVariant && expectedName && (returnedName.includes(expectedName) || expectedName.includes(returnedName)))
       );
       const validValue = record?.AuthorizationValid;
       const isValid = validValue == null || validValue === true || /^(?:true|valid|gyldig)$/i.test(String(validValue));
@@ -3740,7 +4242,8 @@
 
   function parseAuthorizationLookupResponse(payload, profile) {
     const matches = getAuthorizationLookupMatches(payload, profile);
-    return matches.length === 1 ? 'found' : matches.length > 1 ? 'multiple' : 'not-found';
+    return matches.length === 1 ? 'found' : matches.length > 1 ? 'multiple'
+      : getAuthorizationLookupMatches(payload, profile, true).length ? 'possible' : 'not-found';
   }
 
   function isMeaningfulAuthorizationDate(value) {
@@ -4132,6 +4635,13 @@
           subtitle: 'Kontrollér resultatet manuelt i registeret',
           profile
         });
+      } else if (getAuthorizationLookupMatches(payload, profile, true).length) {
+        showAuthorizationLookupPopup(button, {
+          state: 'warning',
+          title: 'Muligt fund: navnet afviger',
+          subtitle: 'Kontrollér navnet manuelt i registeret',
+          profile
+        });
       } else {
         showAuthorizationLookupPopup(button, {
           state: 'missing',
@@ -4284,17 +4794,26 @@
       document.head.appendChild(style);
     }
 
-    const popup = document.getElementById('popup_master_util_loading_content');
-    if (!popup || popup.dataset.tpCprActionsReady === 'true') return;
-    popup.dataset.tpCprActionsReady = 'true';
-    revealCprLookupActions(popup);
-
+    if (document.documentElement.dataset.tpCprWatcherReady === 'true') return;
+    document.documentElement.dataset.tpCprWatcherReady = 'true';
+    let observedPopup = null;
     const observer = new MutationObserver(records => {
       for (const record of records) {
         for (const node of record.addedNodes) revealCprLookupActions(node);
       }
     });
-    observer.observe(popup, { childList: true, subtree: true });
+    const attach = () => {
+      const popup = document.getElementById('popup_master_util_loading_content');
+      if (popup === observedPopup) return;
+      observer.disconnect();
+      observedPopup = popup;
+      if (!popup) return;
+      popup.dataset.tpCprActionsReady = 'true';
+      revealCprLookupActions(popup);
+      observer.observe(popup, { childList: true, subtree: true });
+    };
+    attach();
+    new MutationObserver(attach).observe(document.documentElement, { childList: true, subtree: true });
   }
 
   function parseCallRegistrationTarget(onclickValue) {
@@ -4375,10 +4894,10 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
-  function submitQuickCallRegistration(target, button, registrationText) {
+  async function submitQuickCallRegistration(target, button, registrationText) {
     const { vikarId, vagtId } = target;
     const text = String(registrationText || '').trim();
-    if (!QUICK_CALL_REGISTRATION_OPTIONS.includes(text)) return;
+    if (!QUICK_CALL_REGISTRATION_OPTIONS.includes(text) || !/^\d+$/.test(vikarId) || !/^\d+$/.test(vagtId)) return;
     const formId = 'registreropkaldvagtid_' + vikarId;
     if (document.getElementById(formId)) {
       showToast('Luk den \u00e5bne telefonregistrering f\u00f8rst.');
@@ -4394,43 +4913,33 @@
     const phoneDiv = document.getElementById('phonediv_' + vikarId);
     if (!phoneDiv || button.disabled) return;
 
-    const form = document.createElement('form');
-    form.id = formId;
-    form.hidden = true;
-    form.dataset.tpQuickCallRegistration = 'true';
-
-    const comment = document.createElement('textarea');
-    comment.id = 'phonetext_' + vikarId;
-    comment.name = 'phonetext';
-    comment.value = text;
-    form.appendChild(comment);
-    document.body.appendChild(form);
-
     const menuButtons = Array.from(button.closest('.tp-quick-no-answer-menu')?.querySelectorAll('button') || [button]);
     for (const menuButton of menuButtons) menuButton.disabled = true;
     button.textContent = 'Gemmer...';
 
-    let completed = false;
-    const phoneObserver = new MutationObserver(() => finish(true));
-    const finish = success => {
-      if (completed) return;
-      completed = true;
-      phoneObserver.disconnect();
-      if (form.isConnected) form.remove();
+    try {
+      // Same form and acknowledgement as Temponizer's RegistrerOpkald, without its modal side effects.
+      const body = new URLSearchParams({ phonetext: text, page: 'registreropkald', ajax: 'true',
+        vagt_avail_id: String(vagtId), vikar_id: String(vikarId) });
+      const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content;
+      const response = await fetchText(ORIGIN + '/index.php', {
+        method: 'POST', headers: {
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest',
+          ...(csrfToken ? { 'X-CSRF-Token': csrfToken } : {})
+        }, body: body.toString()
+      });
+      const parts = response.trim().split(';;;;;;');
+      if (parts[0] !== 'succes' || parts[1]?.trim() !== String(vikarId)) throw new Error('Missing registration acknowledgement');
+      const icon = document.createElement('img');
+      icon.src = 'images/phone_accept.png';
+      icon.alt = 'Opkald registreret';
+      phoneDiv.replaceChildren(icon);
+    } catch (_) {
+      showToast('Registreringen kunne ikke bekræftes. Kontrollér via telefonikonet før du prøver igen.');
+    } finally {
       for (const menuButton of menuButtons) menuButton.disabled = false;
       button.textContent = text;
-      if (!success) showToast('Registreringen kunne ikke bekr\u00e6ftes. Pr\u00f8v igen via telefonikonet.');
-    };
-
-    phoneObserver.observe(phoneDiv, { childList: true, subtree: true });
-    try {
-      pageWindow.RegistrerOpkald(vagtId, vikarId);
-      setTimeout(() => {
-        if (form.isConnected) form.remove();
-      }, 0);
-      setTimeout(() => finish(false), 7000);
-    } catch (_) {
-      finish(false);
     }
   }
 
@@ -4529,6 +5038,8 @@
     pollMessages();
     pollInterest();
     pollIncomingCalls();
+    refreshMailPushSetting();
+    void drainNotificationOutbox();
 
     setInterval(() => {
       const wasLeader = isLeader();
@@ -4537,11 +5048,22 @@
         pollMessages();
         pollInterest();
         pollIncomingCalls();
+        refreshMailPushSetting();
       }
     }, HEARTBEAT_MS);
     setInterval(pollMessages, MESSAGE_POLL_MS);
     setInterval(pollInterest, INTEREST_POLL_MS);
     setInterval(pollIncomingCalls, TP_CALL_QUEUE.pollMs);
+    setInterval(drainNotificationOutbox, 5000);
+
+    window.addEventListener('online', () => {
+      heartbeatLeadership();
+      pollMessages();
+      pollInterest();
+      pollIncomingCalls();
+      void drainNotificationOutbox();
+      refreshMailPushSetting();
+    });
 
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
