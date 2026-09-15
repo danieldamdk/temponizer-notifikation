@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.13
+// @version      7.14.14
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.13';
+  const TP_VERSION = '7.14.14';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -141,8 +141,9 @@
     const base = 'https://api.github.com/repos/' + repository;
     const configKey = 'tpDiagnosticSharingV1';
     const stateKey = 'tpDiagnosticSharingStatusV1';
+    const intentKey = 'tpDiagnosticSharingIntentV1';
     const interval = 15 * 60 * 1000;
-    let busy = false, initialized = false;
+    let busy = false, initialized = false, configurationGeneration = 0;
     function config() {
       try {
         const value = GM_getValue(configKey, null);
@@ -252,16 +253,22 @@
       } finally {busy = false;paint();}
     }
     async function enable(token) {
+      const generation = ++configurationGeneration;
+      const intent = crypto.randomUUID();
+      localStorage.setItem(intentKey,intent);
       const prior = config();
       token = String(token || '').trim() || prior?.token || '';
       if (!/^github_pat_[A-Za-z0-9_]+$/.test(token)) throw blockedError();
       await verifyRepository(token);
+      if (generation !== configurationGeneration || localStorage.getItem(intentKey) !== intent) return false;
       GM_setValue(configKey,{enabled:true,token,id:prior?.id || crypto.randomUUID(),issue:prior?.issue || 0});
       saveStatus({...status(),state:'idle',nextAttempt:0,failures:0});
       await sync(true);
       return status().state === 'ok';
     }
     function disable() {
+      configurationGeneration += 1;
+      try {localStorage.setItem(intentKey,crypto.randomUUID());} catch (_) {}
       const current = config();
       if (current) GM_setValue(configKey,{...current,enabled:false});
       paint();
