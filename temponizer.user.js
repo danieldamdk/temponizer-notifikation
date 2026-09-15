@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.12
+// @version      7.14.13
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -9,6 +9,7 @@
 // @grant        GM_setValue
 // @grant        unsafeWindow
 // @connect      api.pushover.net
+// @connect      api.github.com
 // @connect      raw.githubusercontent.com
 // @connect      ajourcare.temponizer.dk
 // @connect      vipvikaraps.sharepoint.com
@@ -22,7 +23,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.12';
+  const TP_VERSION = '7.14.13';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -131,6 +132,371 @@
   let tpSpEntityTypeCache = '';
   const workerHoverRequests = new Map();
 
+  // Diagnostics accept only fixed event names, enums and bounded counters, never payloads.
+  const diagnostics = createDiagnostics();
+  const diagnosticSharing = createDiagnosticSharing();
+
+  function createDiagnosticSharing() {
+    const repository = 'danieldamdk/temponizer-diagnostics';
+    const base = 'https://api.github.com/repos/' + repository;
+    const configKey = 'tpDiagnosticSharingV1';
+    const stateKey = 'tpDiagnosticSharingStatusV1';
+    const interval = 15 * 60 * 1000;
+    let busy = false, initialized = false;
+    function config() {
+      try {
+        const value = GM_getValue(configKey, null);
+        return value && /^github_pat_[A-Za-z0-9_]+$/.test(value.token || '') && /^[a-f0-9-]{36}$/.test(value.id || '') ? value : null;
+      } catch (_) { return null; }
+    }
+    function status() {
+      const value = loadJson(stateKey, {}) || {};
+      return { lastSuccess:clampInteger(value.lastSuccess), nextAttempt:clampInteger(value.nextAttempt), failures:Math.min(6,clampInteger(value.failures)),
+        state:['ok','failed','blocked','sending'].includes(value.state) ? value.state : 'idle' };
+    }
+    function paint() {
+      const node = document.getElementById('tpDiagSharingStatus');
+      if (!node) return;
+      const saved = status();
+      const text = !config()?.enabled ? 'Deling slået fra' : saved.state === 'sending' ? 'Sender diagnose…'
+        : saved.state === 'blocked' ? 'Deling stoppet: kontrollér adgang'
+        : saved.state === 'failed' ? 'Deling fejlede; prøver igen senere'
+        : saved.lastSuccess ? 'Delt ' + new Date(saved.lastSuccess).toLocaleTimeString('da-DK',{hour:'2-digit',minute:'2-digit'}) : 'Afventer første rapport';
+      if (node.textContent !== text) node.textContent = text;
+    }
+    function saveStatus(value) { saveJson(stateKey,value); paint(); }
+    function blockedError() { return Object.assign(new Error('Diagnostic sharing unavailable'),{blocked:true}); }
+    function request(token, path = '', method = 'GET', payload) {
+      return new Promise((resolve,reject)=>{
+        let handle, settled = false;
+        const finish = (error, value) => {
+          if (settled) return; settled = true; clearTimeout(timer);
+          if (error) reject(error); else resolve(value);
+        };
+        const timer = setTimeout(()=>{finish(new Error('Timeout'));try {handle?.abort();} catch (_) {}},15000);
+        try {
+          handle = GM_xmlhttpRequest({method,url:base+path,anonymous:true,redirect:'error',timeout:15000,
+            headers:{'Accept':'application/vnd.github+json','Content-Type':'application/json','Authorization':'Bearer '+token,'X-GitHub-Api-Version':'2022-11-28'},
+            data:payload ? JSON.stringify(payload) : undefined,
+            onload:response=>{
+              if (response.status < 200 || response.status >= 300) {
+                return finish(Object.assign(new Error('Diagnostic upload rejected'),{status:response.status,blocked:[401,403,404].includes(response.status)}));
+              }
+              try {
+                if (response.finalUrl && new URL(response.finalUrl).origin !== 'https://api.github.com') throw blockedError();
+                finish(null,JSON.parse(response.responseText));
+              } catch (_) {finish(blockedError());}
+            },
+            onerror:()=>finish(new Error('Diagnostic network error')),
+            ontimeout:()=>finish(new Error('Timeout')),
+            onabort:()=>finish(new Error('Diagnostic request cancelled'))
+          });
+        } catch (_) {finish(new Error('Diagnostic request unavailable'));}
+      });
+    }
+    async function verifyRepository(token) {
+      const repo = await request(token);
+      if (repo?.private !== true || repo.full_name !== repository || repo.archived || repo.has_issues !== true) throw blockedError();
+    }
+    function body(id) {
+      const report = diagnostics.report();
+      const entries = report.runtimes.flatMap(runtime => runtime.entries.map(entry=>({...entry,runtime:runtime.runtime,version:runtime.version})))
+        .sort((a,b)=>b.at-a.at).slice(0,200);
+      return '<!-- tp-diagnostics-v1:' + id + ' -->\n```json\n' + JSON.stringify({
+        schema:1,version:TP_VERSION,generatedAt:report.generatedAt,detailed:report.detailed,
+        storageAvailable:report.storageAvailable,entries
+      }) + '\n```';
+    }
+    async function sync(force = false) {
+      if (busy || (!force && !isLeader()) || !config()?.enabled) return;
+      busy = true;
+      try {
+        await withCrossTabProcessLock('diagnostic-sharing',async()=>{
+          const current = config(),previous = status();
+          if (!current?.enabled || (!force && (previous.state === 'blocked' || previous.nextAttempt > now()))) return;
+          const sending = {...previous,state:'sending',nextAttempt:now()+interval};
+          // Persist the schedule before sending so a tab closing cannot create a retry storm.
+          localStorage.setItem(stateKey,JSON.stringify(sending));
+          paint();
+          try {
+            await verifyRepository(current.token);
+            const title = '[TP Diagnose] ' + current.id;
+            const marker = '<!-- tp-diagnostics-v1:' + current.id + ' -->';
+            let issue;
+            if (Number.isInteger(current.issue) && current.issue > 0) {
+              issue = await request(current.token,'/issues/'+current.issue);
+              if (issue.title !== title || !String(issue.body || '').startsWith(marker) || issue.pull_request || issue.state !== 'open') throw blockedError();
+            } else {
+              const issues = await request(current.token,'/issues?state=all&per_page=100&sort=created&direction=desc');
+              if (!Array.isArray(issues)) throw blockedError();
+              issue = issues.find(row=>row.title===title && !row.pull_request && String(row.body || '').startsWith(marker));
+              if ((!issue && issues.length===100) || (issue && issue.state !== 'open')) throw blockedError();
+            }
+            const latest = config();
+            if (!latest?.enabled || latest.id !== current.id || latest.token !== current.token) return;
+            const reportBody = body(current.id);
+            if (reportBody.length > 60000) throw blockedError();
+            const result = issue
+              ? await request(current.token,'/issues/'+issue.number,'PATCH',{body:reportBody})
+              : await request(current.token,'/issues','POST',{title,body:reportBody});
+            if (!Number.isInteger(result?.number) || result.title !== title || result.body !== reportBody || result.pull_request) throw blockedError();
+            if (config()?.id === current.id) GM_setValue(configKey,{...config(),issue:result.number});
+            saveStatus({state:'ok',lastSuccess:now(),nextAttempt:now()+interval,failures:0});
+          } catch (error) {
+            const failures = Math.min(6,previous.failures+1);
+            saveStatus({...previous,state:error.blocked ? 'blocked' : 'failed',failures,nextAttempt:now()+Math.min(3600000,interval*2**(failures-1))});
+          }
+        });
+      } catch (_) {
+        // Diagnostics must never propagate failures into the operational pollers.
+      } finally {busy = false;paint();}
+    }
+    async function enable(token) {
+      const prior = config();
+      token = String(token || '').trim() || prior?.token || '';
+      if (!/^github_pat_[A-Za-z0-9_]+$/.test(token)) throw blockedError();
+      await verifyRepository(token);
+      GM_setValue(configKey,{enabled:true,token,id:prior?.id || crypto.randomUUID(),issue:prior?.issue || 0});
+      saveStatus({...status(),state:'idle',nextAttempt:0,failures:0});
+      await sync(true);
+      return status().state === 'ok';
+    }
+    function disable() {
+      const current = config();
+      if (current) GM_setValue(configKey,{...current,enabled:false});
+      paint();
+    }
+    function show() {
+      document.getElementById('tpDiagSharingDialog')?.remove();
+      const dialog=document.createElement('dialog');dialog.id='tpDiagSharingDialog';dialog.setAttribute('aria-label','Privat diagnosedeling');
+      dialog.style.cssText='box-sizing:border-box;width:380px;max-width:calc(100vw - 24px);max-height:75vh;overflow:auto;padding:14px;border:1px solid #bcc4ca;border-radius:4px;background:#fff;color:#20272b;font:12px/1.5 Arial,sans-serif;letter-spacing:0';
+      dialog.innerHTML='<strong>Privat diagnosedeling</strong><button type="button" data-close aria-label="Luk" style="float:right;width:28px;height:28px">&times;</button>'
+        + '<div style="margin:12px 0;overflow-wrap:anywhere">'+repository+'</div>'
+        + '<label>GitHub-adgangsnøgle<input type="password" autocomplete="off" data-token style="display:block;box-sizing:border-box;width:100%;margin:4px 0 10px;padding:6px" placeholder="'+(config()?'Gemt nøgle bevares':'github_pat_…')+'"></label>'
+        + '<div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" class="tp-diagnostic-button" data-enable>Gem og test</button><button type="button" class="tp-diagnostic-button" data-disable>Slå deling fra</button></div>'
+        + '<div role="status" data-status style="margin-top:8px"></div>';
+      const output=dialog.querySelector('[data-status]');
+      output.textContent=config()?.enabled?'Deling aktiv':'Deling slået fra';
+      dialog.querySelector('[data-close]').onclick=()=>dialog.close();
+      dialog.querySelector('[data-disable]').onclick=()=>{disable();output.textContent='Deling slået fra';};
+      dialog.querySelector('[data-enable]').onclick=async event=>{
+        const button=event.target;button.disabled=true;output.textContent='Kontrollerer privat adgang…';
+        const input=dialog.querySelector('[data-token]'),token=input.value;input.value='';
+        try {output.textContent=await enable(token)?'Rapport delt':'Kunne ikke dele rapporten; kontrollér rettigheder';}
+        catch (_) {output.textContent='Adgang afvist. Brug en begrænset nøgle til det private repository.';}
+        finally {button.disabled=false;}
+      };
+      dialog.addEventListener('close',()=>dialog.remove(),{once:true});document.body.appendChild(dialog);dialog.showModal();
+    }
+    function init() {
+      if (initialized) return;initialized=true;
+      setInterval(()=>void sync(),60000);
+      window.addEventListener('storage',event=>{if(event.key===stateKey) paint();});
+      void sync();
+    }
+    return {init,sync,enable,disable,status,paint,show};
+  }
+
+  function createDiagnostics() {
+    const prefix = 'tpDiagLogV1_';
+    const controlKey = 'tpDiagDetailUntilV1';
+    const maxAge = 86400000;
+    const maxEntries = 300;
+    const maxBytes = 65536;
+    const maxLogs = 8;
+    const scopes = new Set(['runtime', 'messages', 'interest', 'phone', 'mail', 'sms', 'worker', 'authorization', 'update', 'network', 'html', 'lock', 'push']);
+    const events = new Set(['start', 'finish', 'error', 'slow', 'leader', 'visibility', 'skip', 'snapshot', 'queue', 'call', 'test', 'detail', 'lag', 'storage']);
+    const outcomes = new Set(['ok', 'failed', 'timeout', 'login', 'network', 'http', 'unknown', 'leader', 'follower', 'visible', 'hidden', 'inflight', 'duplicate', 'ignored', 'handled', 'baseline', 'pending', 'queued', 'sending', 'sent', 'retry', 'waiting', 'blocked', 'cancelled', 'expired', 'enabled', 'disabled', 'missing', 'partial', 'fallback']);
+    const numbers = ['durationMs', 'count', 'pending', 'attempt', 'httpStatus', 'operation'];
+    const labels = { runtime:'Script', messages:'Beskeder', interest:'Interesser', phone:'Telefon', mail:'Mail', sms:'SMS', worker:'Vikaroverblik', authorization:'Autorisation', update:'Opdatering', network:'Netværk', html:'HTML', lock:'Flerfanelås', push:'Pushover' };
+    const eventLabels = {start:'Start',finish:'Afsluttet',error:'Fejl',slow:'Langsomt',leader:'Faneansvar',visibility:'Synlighed',skip:'Sprunget over',snapshot:'Kontrol',queue:'Afsendelse',call:'Opkald',test:'Telefontest',detail:'Detaljelog',lag:'Forsinkelse',storage:'Lagring'};
+    const outcomeLabels = {ok:'OK',failed:'mislykket',timeout:'tidsgrænse nået',login:'login/adgang',network:'netværk',http:'serversvar',unknown:'uafklaret',leader:'ansvarlig fane',follower:'anden fane har ansvaret',visible:'synlig',hidden:'i baggrunden',inflight:'allerede i gang',duplicate:'dublet',ignored:'ignoreret',handled:'vist',baseline:'startniveau',pending:'afventer',queued:'i kø',sending:'sender',sent:'sendt',retry:'nyt forsøg',waiting:'venter',blocked:'stoppet',cancelled:'annulleret',expired:'udløbet',enabled:'slået til',disabled:'slået fra',missing:'mangler',partial:'ufuldstændig',fallback:'reserveløsning'};
+    let ready = false, entries = [], detailedUntil = 0, flushTimer = null, expiryTimer = null, lagTimer = null;
+    let dirty = false, storageFailed = false, lastLeader = null, operation = 0, lastPruneAt = 0;
+    const sampledAt = new Map();
+    const tick = () => { try { return performance.now(); } catch (_) { return Date.now(); } };
+    const active = () => ready && detailedUntil > Date.now();
+    const safeCount = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 3600000;
+    function sanitize(value) {
+      if (!value || !scopes.has(value.scope) || !events.has(value.event) || !safeCount(value.sequence)) return null;
+      if (!Number.isFinite(value.at) || value.at < Date.now() - maxAge || value.at > Date.now() + 60000) return null;
+      const clean = { at: value.at, sequence: value.sequence, scope: value.scope, event: value.event };
+      if (outcomes.has(value.outcome)) clean.outcome = value.outcome;
+      for (const key of numbers) if (safeCount(value[key])) clean[key] = Math.round(value[key]);
+      return clean;
+    }
+    function record(scope, event, data = {}, important = false) {
+      try {
+        if (!ready || (!important && !active())) return;
+        const clean = sanitize({ ...data, at:Date.now(), sequence:++operation, scope, event });
+        if (!clean) return;
+        entries = entries.filter(row => row.at >= Date.now() - maxAge).slice(-(maxEntries - 1));
+        entries.push(clean);
+        dirty = true;
+        if (!flushTimer && !storageFailed) flushTimer = setTimeout(flush, 15000);
+      } catch (_) {}
+    }
+    function readLogs() {
+      const logs = [];
+      try {
+        for (const key of Object.keys(localStorage)) {
+          if (!key.startsWith(prefix)) continue;
+          try {
+            const raw = localStorage.getItem(key) || '';
+            if (raw.length > maxBytes) continue;
+            const saved = JSON.parse(raw);
+            if (!Number.isFinite(saved.writtenAt) || saved.writtenAt < Date.now() - maxAge || saved.writtenAt > Date.now() + 60000) continue;
+            if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(saved.version) || !Array.isArray(saved.entries)) continue;
+            logs.push({ key, writtenAt:saved.writtenAt, version:saved.version, entries:saved.entries.slice(-maxEntries).map(sanitize).filter(Boolean) });
+          } catch (_) {}
+        }
+      } catch (_) { storageFailed = true; }
+      return logs.sort((a,b) => b.writtenAt - a.writtenAt).slice(0, maxLogs);
+    }
+    function flush() {
+      if (flushTimer) clearTimeout(flushTimer);
+      flushTimer = null;
+      if (!dirty || storageFailed) return;
+      try {
+        entries = entries.filter(row => row.at >= Date.now() - maxAge).slice(-maxEntries);
+        let raw = JSON.stringify({ version:TP_VERSION, writtenAt:Date.now(), entries });
+        while (raw.length * 2 > maxBytes && entries.length) {
+          entries.shift(); raw = JSON.stringify({ version:TP_VERSION, writtenAt:Date.now(), entries });
+        }
+        const key = prefix + TAB_ID;
+        localStorage.setItem(key, raw);
+        if (Date.now() - lastPruneAt >= 60000) {
+          const keep = new Set([key, ...readLogs().filter(log => log.key !== key).slice(0, maxLogs - 1).map(log => log.key)]);
+          for (const oldKey of Object.keys(localStorage)) if (oldKey.startsWith(prefix) && !keep.has(oldKey)) localStorage.removeItem(oldKey);
+          lastPruneAt = Date.now();
+        }
+        dirty = false;
+      } catch (_) { storageFailed = true; paint(); }
+    }
+    function report() {
+      flush();
+      const logs = readLogs().filter(log => log.key !== prefix + TAB_ID).slice(0, maxLogs - 1);
+      logs.unshift({ version:TP_VERSION, entries:entries.filter(row => row.at >= Date.now() - maxAge), writtenAt:Date.now() });
+      return { schema:1, version:TP_VERSION, generatedAt:new Date().toISOString(), detailed:active(), storageAvailable:!storageFailed,
+        limits:{ maxEntriesPerRuntime:maxEntries, maxRuntimes:maxLogs, retentionHours:24 },
+        runtimes:logs.map((log,index) => ({ runtime:index + 1, version:log.version, entries:log.entries.map(sanitize).filter(Boolean) })) };
+    }
+    function paint() {
+      try {
+        const checkbox = document.getElementById('tpDiagDetail');
+        if (checkbox) checkbox.checked = active();
+        const status = document.getElementById('tpDiagStatus');
+        const text = storageFailed ? 'Kun denne side: lokal lagring fejlede' : active()
+          ? 'Detaljer til ' + new Date(detailedUntil).toLocaleTimeString('da-DK', {hour:'2-digit',minute:'2-digit'}) : 'Basislog aktiv';
+        if (status && status.textContent !== text) status.textContent = text;
+      } catch (_) {}
+    }
+    function configure(until) {
+      if (expiryTimer) clearTimeout(expiryTimer);
+      if (lagTimer) clearInterval(lagTimer);
+      detailedUntil = Number.isFinite(until) && until > Date.now() ? Math.min(until, Date.now() + 900000) : 0;
+      expiryTimer = null; lagTimer = null;
+      if (active()) {
+        expiryTimer = setTimeout(() => { configure(0); record('runtime','detail',{outcome:'disabled'},true); }, detailedUntil - Date.now());
+        let previous = tick(), wasHidden = document.hidden;
+        lagTimer = setInterval(() => {
+          const current = tick();
+          if (!wasHidden && !document.hidden && current - previous > 6000) record('runtime','lag',{durationMs:current - previous - 5000},true);
+          previous = current; wasHidden = document.hidden;
+        }, 5000);
+      }
+      paint();
+    }
+    function detail(enabled) {
+      configure(enabled ? Date.now() + 900000 : 0);
+      try { localStorage.setItem(controlKey, String(detailedUntil)); } catch (_) { storageFailed = true; }
+      record('runtime','detail',{outcome:enabled ? 'enabled' : 'disabled'},true);
+      paint();
+    }
+    function errorKind(error) {
+      if (error?.status === 401 || error?.status === 403 || /^(TP_LOGIN_REQUIRED|SP_LOGIN_REQUIRED)$/.test(error?.message || '')) return 'login';
+      if (/timeout/i.test(error?.message || '')) return 'timeout';
+      if (error?.status || /^HTTP \d{3}$/.test(error?.message || '')) return 'http';
+      if (error?.name === 'TypeError') return 'network';
+      return 'failed';
+    }
+    function begin(scope, slowMs = 1000) {
+      const started = tick();
+      const id = ++operation;
+      record(scope,'start',{operation:id});
+      let finished = false;
+      return (error = null, data = {}) => {
+        if (finished) return;
+        finished = true;
+        const durationMs = tick() - started;
+        const sample = ['messages','interest','phone','mail','push'].includes(scope) && Date.now() - (sampledAt.get(scope) || 0) >= 60000;
+        if (sample) sampledAt.set(scope,Date.now());
+        record(scope,error ? 'error' : durationMs >= slowMs ? 'slow' : 'finish',
+          { ...data, operation:id, durationMs, outcome:error ? errorKind(error) : 'ok' }, !!error || durationMs >= slowMs || sample);
+      };
+    }
+    function requestScope(url) {
+      try {
+        const parsed = new URL(url, ORIGIN);
+        if (parsed.hostname === 'api.pushover.net') return 'push';
+        if (parsed.hostname === 'autregwebservice.stps.dk') return 'authorization';
+        if (parsed.hostname === 'raw.githubusercontent.com') return 'update';
+        if (parsed.hostname === 'vipvikaraps.sharepoint.com') return parsed.pathname.includes('TemponizerCalls') ? 'phone' : 'mail';
+        const page = parsed.searchParams.get('page') || '';
+        if (/^get_comcenter_/.test(page)) return 'messages';
+        if (['freevagter','update_vikar_synlighed_from_list'].includes(page)) return 'interest';
+        if (page === 'showmy_settings') return 'sms';
+        if (page === 'showvikaroplysninger') return 'worker';
+      } catch (_) {}
+      return 'network';
+    }
+    function leadership(value) {
+      if (value === lastLeader) return;
+      lastLeader = value;
+      record('runtime','leader',{outcome:value ? 'leader' : 'follower'},true);
+    }
+    function show() {
+      document.getElementById('tpDiagDialog')?.remove();
+      const dialog = document.createElement('dialog');
+      dialog.id = 'tpDiagDialog';
+      dialog.setAttribute('aria-label','Diagnose');
+      dialog.style.cssText = 'box-sizing:border-box;width:520px;max-width:calc(100vw - 24px);max-height:75vh;overflow:auto;padding:14px;border:1px solid #bcc4ca;border-radius:4px;background:#fff;color:#20272b;font:12px/1.5 Arial,sans-serif;letter-spacing:0';
+      const heading = document.createElement('strong'); heading.textContent = 'Diagnose';
+      const close = document.createElement('button'); close.textContent = '\u00d7'; close.type = 'button'; close.setAttribute('aria-label','Luk');
+      close.style.cssText = 'float:right;width:28px;height:28px'; close.addEventListener('click',()=>dialog.close());
+      dialog.append(close,heading);
+      const rows = report().runtimes.flatMap(log => log.entries.map(row => ({...row,runtime:log.runtime}))).sort((a,b)=>b.at - a.at).slice(0,30);
+      const list = document.createElement('div'); list.style.cssText = 'clear:both;margin-top:12px';
+      if (!rows.length) list.textContent = 'Ingen registrerede hændelser';
+      for (const row of rows) {
+        const line = document.createElement('div');
+        line.style.cssText = 'padding:6px 0;border-top:1px solid #ddd;overflow-wrap:anywhere';
+        line.textContent = new Date(row.at).toLocaleTimeString('da-DK') + ' · #' + row.runtime + ' · ' + labels[row.scope] + ' · ' + eventLabels[row.event] + (row.outcome ? ' / ' + outcomeLabels[row.outcome] : '') + (row.durationMs != null ? ' · ' + row.durationMs + ' ms' : '') + (row.count != null ? ' · antal: ' + row.count : '');
+        list.appendChild(line);
+      }
+      dialog.appendChild(list); document.body.appendChild(dialog); dialog.addEventListener('close',()=>dialog.remove(),{once:true}); dialog.showModal();
+    }
+    function download() {
+      const blob = new Blob([JSON.stringify(report(),null,2)],{type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a'); link.href = url; link.download = 'tp-diagnose-' + new Date().toISOString().replace(/[:.]/g,'-') + '.json';
+      document.body.appendChild(link); link.click(); link.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000);
+    }
+    function init() {
+      if (ready) return;
+      ready = true;
+      const style=document.createElement('style');
+      style.textContent='.tp-diagnostic-button{padding:6px 8px;border:1px solid #b9c0c4;border-radius:3px;background:#fff;color:#273036;font:12px Arial,sans-serif;cursor:pointer}.tp-diagnostic-button:hover:not(:disabled){background:#f0f6f8;border-color:#287ca5}.tp-diagnostic-button:disabled{opacity:.6;cursor:wait}';
+      (document.head || document.documentElement).appendChild(style);
+      try { configure(Number(localStorage.getItem(controlKey))); } catch (_) { storageFailed = true; }
+      record('runtime','start',{},true);
+      document.addEventListener('visibilitychange',()=>record('runtime','visibility',{outcome:document.hidden?'hidden':'visible'},true));
+      window.addEventListener('pagehide',flush);
+      window.addEventListener('storage',event=>{if(event.key===controlKey) configure(Number(event.newValue));});
+    }
+    return { init, record, begin, detail, active, report, show, download, paint, leadership, requestScope, errorKind, flush };
+  }
+
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -186,7 +552,11 @@
   }
 
   function parseHtml(html) {
-    return new DOMParser().parseFromString(String(html || ''), 'text/html');
+    const finish = diagnostics.begin('html', 100);
+    let parseError = null;
+    try { return new DOMParser().parseFromString(String(html || ''), 'text/html'); }
+    catch (error) {parseError=error;throw error;}
+    finally { finish(parseError); }
   }
 
   function parseLabelCount(value, zeroWhenUnnumbered = false) {
@@ -1010,6 +1380,8 @@
   }
 
   async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS, responseType = 'text') {
+    const finish = diagnostics.begin(diagnostics.requestScope(url), 3000);
+    let requestError = null;
     const controller = new AbortController();
     let timer;
     const deadline = new Promise((_, reject) => {
@@ -1034,8 +1406,12 @@
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return await response[responseType]();
       })()]);
+    } catch (error) {
+      requestError = error;
+      throw error;
     } finally {
       clearTimeout(timer);
+      finish(requestError);
     }
   }
 
@@ -1392,9 +1768,12 @@
   function heartbeatLeadership() {
     if (isLeader()) {
       writeLeadership();
+      diagnostics.leadership(true);
       return true;
     }
-    return tryBecomeLeader();
+    const leader = tryBecomeLeader();
+    diagnostics.leadership(leader);
+    return leader;
   }
 
   async function withLocalStorageMutex(name, task) {
@@ -1432,11 +1811,13 @@
       await sleep(40 + Math.floor(Math.random() * 60));
     }
     console.warn('[TP] Springer en poll over, fordi flerfanelåsen var optaget:', name);
+    diagnostics.record('lock','error',{outcome:'timeout'},true);
     return undefined;
   }
 
   async function withCrossTabProcessLock(name, task) {
     let started = false;
+    const finishWait = diagnostics.begin('lock', 1000);
     try {
       if (globalThis.navigator?.locks?.request) {
         return await globalThis.navigator.locks.request(
@@ -1444,15 +1825,17 @@
           { mode: 'exclusive' },
           () => {
             started = true;
+            finishWait();
             return task();
           }
         );
       }
     } catch (error) {
       if (started) throw error;
+      diagnostics.record('lock', 'error', { outcome:'fallback' }, true);
       console.warn('[TP] Browserens flerfanelås fejlede; bruger lokal reserve.', error);
     }
-    return withLocalStorageMutex(name, task);
+    return withLocalStorageMutex(name, () => { finishWait(); return task(); });
   }
 
   function takeChannelLock(kind) {
@@ -1565,6 +1948,7 @@
     const enabled = localStorage.getItem(enableKey) === 'true';
     if (enabled) enqueueNotification(kind, enableKey, notification, eventIds, events);
     if (!takeNotificationDeliveryLock(kind, notification, eventIds)) {
+      diagnostics.record(kind === 'msg' ? 'messages' : 'interest', 'skip', { outcome:'duplicate' });
       console.info('[TP] Ignorerer en allerede leveret notifikation:', kind);
       return false;
     }
@@ -1700,7 +2084,12 @@
   }
 
   async function pollMessages() {
-    if (!isLeader() || messagePollInFlight) return;
+    if (!isLeader() || messagePollInFlight) {
+      diagnostics.record('messages','skip',{outcome:messagePollInFlight ? 'inflight' : 'follower'});
+      return;
+    }
+    const finish = diagnostics.begin('messages', 5000);
+    let pollError = null;
     messagePollInFlight = true;
     try {
       const snapshot = await fetchMessageSnapshot();
@@ -1708,39 +2097,55 @@
       if (!isLeader()) return;
       await withCrossTabProcessLock('message-state', async () => {
         if (!isLeader()) return;
-        processMessageSnapshot(enriched);
+        const processed = diagnostics.begin('messages', 100);
+        const result = processMessageSnapshot(enriched);
+        processed(null, {count:Object.keys(enriched.records || {}).length});
+        diagnostics.record('messages','snapshot',{outcome:result.baseline ? 'baseline' : 'ok',count:result.events.length,pending:result.pending?.length || 0});
         setPollingHealth('msg', hasUnresolvedGeneralDirection(enriched.records)
           ? 'Retningen på nogle generelle beskeder kunne ikke bekræftes' : '', true);
       });
     } catch (error) {
+      pollError = error;
       console.warn('[TP][ERR][MSG]', error);
       setPollingHealth('msg', 'Kontrol afbrudt');
     } finally {
       messagePollInFlight = false;
+      finish(pollError);
     }
   }
 
   async function pollInterest() {
-    if (!isLeader() || interestPollInFlight) return;
+    if (!isLeader() || interestPollInFlight) {
+      diagnostics.record('interest','skip',{outcome:interestPollInFlight ? 'inflight' : 'follower'});
+      return;
+    }
+    const finish = diagnostics.begin('interest', 5000);
+    let pollError = null;
     interestPollInFlight = true;
     try {
       const snapshot = await fetchInterestSnapshot();
       if (!isLeader()) return;
       await withCrossTabProcessLock('interest-state', async () => {
         if (!isLeader()) return;
-        processInterestSnapshot(snapshot);
+        const processed = diagnostics.begin('interest', 100);
+        const result = processInterestSnapshot(snapshot);
+        processed(null, {count:Object.keys(snapshot.pairs || {}).length});
+        diagnostics.record('interest','snapshot',{outcome:snapshot.failedShifts?.length ? 'partial' : result.baseline ? 'baseline' : 'ok',count:result.events.length,pending:result.pending?.length || 0},!!snapshot.failedShifts?.length);
         setPollingHealth('int', snapshot.failedShifts?.length ? 'Nogle vagter kunne ikke kontrolleres' : '', true);
       });
     } catch (error) {
+      pollError = error;
       console.warn('[TP][ERR][INT]', error);
       setPollingHealth('int', 'Kontrol afbrudt');
     } finally {
       interestPollInFlight = false;
+      finish(pollError);
     }
   }
 
   function gmRequest(options) {
     return new Promise((resolve, reject) => {
+      const finishDiagnostic = diagnostics.begin(diagnostics.requestScope(options.url), 3000);
       let request;
       let settled = false;
       const timeout = options.timeout || FETCH_TIMEOUT_MS;
@@ -1748,6 +2153,7 @@
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        finishDiagnostic(error, {httpStatus:response?.status || error?.status});
         if (error) reject(error); else resolve(response);
       };
       const timer = setTimeout(() => {
@@ -1905,6 +2311,7 @@
     const value = JSON.stringify(job);
     localStorage.setItem(key, value);
     if (localStorage.getItem(key) !== value) throw new Error('Afsendelseskøen kunne ikke gemmes');
+    diagnostics.record('push','queue',{outcome:job.status,attempt:job.attempts},['unknown','blocked','retry'].includes(job.status));
   }
 
   function pushRecipientId() {
@@ -1917,6 +2324,7 @@
     if (!loadJson(OUTBOX_PREFIX + id, null)) {
       saveOutboxJob({ id, kind, enableKey, notification, events, recipient: pushRecipientId(),
         createdAt: now(), status: 'queued', attempts: 0, nextAttemptAt: 0 });
+      diagnostics.record('push','queue',{outcome:'queued',count:events?.length || 0});
     }
     void drainNotificationOutbox();
   }
@@ -2285,15 +2693,22 @@
 
   async function handleIncomingCall(phone, eventId = phone, options = {}) {
     if (options.queueTagged !== true && await consumeRecentOutgoingCall(phone)) {
+      diagnostics.record('phone','call',{outcome:'ignored'},true);
       console.info('[TP][CALL] Ignorerer callback fra et nyligt udgående opkald', formatPhoneNumber(phone));
       return { status: 'ignored' };
     }
     const claimed = await claimIncomingCall(phone, eventId);
-    if (!claimed) return { status: 'duplicate' };
+    if (!claimed) {
+      diagnostics.record('phone','call',{outcome:'duplicate'},true);
+      return { status: 'duplicate' };
+    }
+    const finishDiagnostic = diagnostics.begin('phone', 3000);
+    let lookupError = null;
     showIncomingCallCard({ phone, state: 'loading' });
     try {
       const matches = await fetchIncomingCallMatches(phone);
       showIncomingCallCard({ phone, matches });
+      diagnostics.record('phone','call',{outcome:'handled',count:matches.length},true);
       if (shouldShowIncomingCallOsNotification()) {
         const match = matches.length === 1 ? matches[0] : {
           name: matches.length ? matches.length + ' mulige vikarer' : 'Nummeret blev ikke fundet'
@@ -2302,6 +2717,7 @@
       }
       return { status: 'handled', matches: matches.length };
     } catch (error) {
+      lookupError = error;
       console.warn('[TP][CALL] Nummeropslag fejlede', error);
       showIncomingCallCard({ phone, state: error?.message === 'TP_LOGIN_REQUIRED' ? 'login' : 'error' });
       await withCrossTabProcessLock('incoming-call', () => {
@@ -2309,6 +2725,8 @@
         if (claim?.eventId === eventId && claim.owner === TAB_ID) localStorage.removeItem(INCOMING_CALL_LOCK_KEY);
       });
       return { status: 'failed', reason: error?.message };
+    } finally {
+      finishDiagnostic(lookupError);
     }
   }
 
@@ -2502,8 +2920,13 @@
   }
 
   async function pollIncomingCalls() {
-    if (!isLeader() || incomingCallPollInFlight) return;
+    if (!isLeader() || incomingCallPollInFlight) {
+      diagnostics.record('phone','skip',{outcome:incomingCallPollInFlight ? 'inflight' : 'follower'});
+      return;
+    }
     incomingCallPollInFlight = true;
+    const finishDiagnostic = diagnostics.begin('phone', 5000);
+    let pollError = null;
     try {
       const email = await getIncomingCallUserEmail();
       const rows = await fetchIncomingCallQueueItems(email);
@@ -2515,6 +2938,7 @@
         const state = ensureIncomingCallQueueState(email);
         const latestId = rows.reduce((highest, row) => Math.max(highest, row.id), state.lastId);
         const pending = selectPendingIncomingCallRows(rows, state);
+        diagnostics.record('phone','snapshot',{outcome:state.ready ? 'ok' : 'baseline',count:rows.length,pending:pending.length}, pending.length > 0);
 
         for (const row of pending) {
           const result = await handleIncomingCall(row.phone, 'sharepoint:' + row.id, { queueTagged: row.queueTagged });
@@ -2530,6 +2954,7 @@
         });
       });
     } catch (error) {
+      pollError = error;
       incomingCallUserEmail = '';
       incomingCallUserEmailCheckedAt = 0;
       if (error?.status === 401 || error?.status === 403 || error?.message === 'SP_LOGIN_REQUIRED') {
@@ -2540,6 +2965,7 @@
       }
     } finally {
       incomingCallPollInFlight = false;
+      finishDiagnostic(pollError);
     }
   }
 
@@ -2727,6 +3153,7 @@
           publishMailStatus(setting.enabled);
         } catch (error) {
           if (generation === tpMailRefreshGeneration && !tpMailPushBusy) {
+            diagnostics.record('mail','error',{outcome:diagnostics.errorKind(error)},true);
             console.warn('[TP][MAIL] refresh error', error);
             publishMailStatus(undefined, true);
           }
@@ -2734,6 +3161,7 @@
       });
     } catch (error) {
       console.warn('[TP][MAIL] status lock error', error);
+      diagnostics.record('mail','error',{outcome:diagnostics.errorKind(error)},true);
       paintMailPushUI(undefined, 'afventer synk…', '#888');
     } finally {
       if (generation === tpMailRefreshGeneration) tpMailRefreshInFlight = false;
@@ -2762,6 +3190,7 @@
         await setMailPushSetting(wantOn);
       } catch (error) {
         console.warn('[TP][MAIL] update error', error);
+        diagnostics.record('mail','error',{outcome:diagnostics.errorKind(error)},true);
         checkbox.checked = loadJson(MAIL_STATUS_KEY, {}).enabled ?? getLocalMailPushEnabled();
         paintMailPushUI(checkbox.checked, 'fejl', '#a33', true);
       } finally {
@@ -2968,6 +3397,7 @@
 
     const close = () => {
       backdrop.hidden = true;
+      if (backdrop._tpTestTimer) diagnostics.record('phone','test',{outcome:'cancelled'},true);
       if (backdrop._tpTestTimer) clearInterval(backdrop._tpTestTimer);
       backdrop._tpTestTimer = null;
     };
@@ -2991,6 +3421,7 @@
 
     const finishTest = verification => {
       if (!verification || !backdrop._tpTestStartedAt || verification.verifiedAt < backdrop._tpTestStartedAt) return;
+      if (backdrop._tpTestTimer) diagnostics.record('phone','test',{outcome:'ok',durationMs:now()-backdrop._tpTestStartedAt},true);
       if (backdrop._tpTestTimer) clearInterval(backdrop._tpTestTimer);
       backdrop._tpTestTimer = null;
       const testButton = backdrop.querySelector('#tpIPnordicStartTest');
@@ -3014,6 +3445,7 @@
       const testState = backdrop.querySelector('#tpIPnordicTestState');
       const testText = backdrop.querySelector('#tpIPnordicTestText');
       backdrop._tpTestStartedAt = now();
+      diagnostics.record('phone','test',{outcome:'pending'},true);
       const deadline = backdrop._tpTestStartedAt + TP_IPNORDIC_SETUP.testWaitMs;
       testButton.disabled = true;
       testState.dataset.state = 'warning';
@@ -3027,6 +3459,7 @@
         }
         const seconds = Math.max(0, Math.ceil((deadline - now()) / 1000));
         if (seconds <= 0) {
+          diagnostics.record('phone','test',{outcome:'timeout',durationMs:now()-backdrop._tpTestStartedAt},true);
           clearInterval(backdrop._tpTestTimer);
           backdrop._tpTestTimer = null;
           testButton.disabled = false;
@@ -3258,9 +3691,25 @@
           '<button id="tpTestPushover" type="button" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Test Pushover</button>' +
           '<button id="tpCheckUpdate" type="button" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Tjek update</button>' +
         '</div>' +
+        '<div style="border-top:1px solid #eee;margin:10px 0"></div>' +
+        '<div style="font-weight:600;margin-bottom:6px">Diagnose</div>' +
+        '<label style="display:flex;align-items:center;gap:6px;font-size:12px"><input id="tpDiagDetail" type="checkbox">Detaljeret log i 15 minutter</label>' +
+        '<div id="tpDiagStatus" role="status" style="margin:5px 0 8px;font-size:11px;color:#666"></div>' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+          '<button id="tpDiagShow" type="button" class="tp-diagnostic-button">Se log</button>' +
+          '<button id="tpDiagDownload" type="button" class="tp-diagnostic-button">Hent rapport</button>' +
+          '<button id="tpDiagSharing" type="button" class="tp-diagnostic-button">Privat deling</button>' +
+        '</div>' +
+        '<div id="tpDiagSharingStatus" style="margin-top:6px;font-size:11px;color:#666"></div>' +
         '<div style="margin-top:8px;font-size:11px;color:#666">Version: ' + TP_VERSION + '</div>';
 
       document.body.appendChild(menu);
+      menu.querySelector('#tpDiagDetail').addEventListener('change', event => diagnostics.detail(event.target.checked));
+      menu.querySelector('#tpDiagShow').addEventListener('click', () => { toggleMenu(false); diagnostics.show(); });
+      menu.querySelector('#tpDiagDownload').addEventListener('click', () => diagnostics.download());
+      menu.querySelector('#tpDiagSharing').addEventListener('click', () => {toggleMenu(false);diagnosticSharing.show();});
+      diagnostics.paint();
+      diagnosticSharing.paint();
       const input = menu.querySelector('#tpUserKeyMenu');
       input.value = getUserKey();
       menu.querySelector('#tpSaveUserKeyMenu').addEventListener('click', () => {
@@ -3342,6 +3791,8 @@
       ensureFullyVisible(element);
       const input = element.querySelector('#tpUserKeyMenu');
       if (input) input.value = getUserKey();
+      diagnostics.paint();
+      diagnosticSharing.paint();
 
       const outside = event => {
         if (element.style.display !== 'block') return cleanup();
@@ -4071,6 +4522,7 @@
         positionWorkerHover(popover, activeImage);
       } catch (error) {
         if (generation !== requestGeneration || !activeImage || !activeContext) return;
+        diagnostics.record('worker','error',{outcome:diagnostics.errorKind(error)},true);
         console.warn('[TP][VIKARHOVER] Kunne ikke hente data', error);
         renderWorkerHoverError(popover, activeContext, loadActiveWorker);
         positionWorkerHover(popover, activeImage);
@@ -4652,6 +5104,7 @@
       }
     } catch (error) {
       console.warn('[TP][ERR][AUTREG]', error?.message || 'Kontrol mislykkedes');
+      diagnostics.record('authorization','error',{outcome:diagnostics.errorKind(error)},true);
       showAuthorizationLookupPopup(button, {
         state: 'warning',
         title: 'Kontrol mislykkedes',
@@ -4961,6 +5414,7 @@
   }
 
   function decorateQuickNoAnswerLinks(root = document) {
+    const finishDiagnostic = diagnostics.begin('html', 100);
     const links = root.querySelectorAll?.(QUICK_NO_ANSWER_LINK_SELECTOR) || [];
     for (const link of links) {
       if (link.dataset.tpQuickNoAnswerReady === 'true') continue;
@@ -5014,6 +5468,7 @@
       menu.addEventListener('focusin', showMenu);
       menu.addEventListener('focusout', hideMenuSoon);
     }
+    finishDiagnostic(null,{count:links.length});
   }
 
   function initQuickNoAnswer() {
@@ -5086,6 +5541,7 @@
   }
 
   function startRuntime() {
+    diagnostics.init();
     if (initIncomingCallReceiver()) return;
     migrateUserKeyToGM();
     initToastBroadcast();
@@ -5097,9 +5553,12 @@
     initWorkerProfileHover();
     initQuickNoAnswer();
     startPolling();
+    diagnosticSharing.init();
   }
 
   const TEST_API = Object.freeze({
+    diagnostics,
+    diagnosticSharing,
     TP_VERSION,
     parseNullableCount,
     parseMessageCounters,
