@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.14
+// @version      7.14.15
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.14';
+  const TP_VERSION = '7.14.15';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -60,10 +60,10 @@
   const SCRIPT_RAW_URL = `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_BRANCH}/temponizer.user.js`;
 
   const TP_MAIL_PUSH = {
-    key: 'tpPushEnableMail',
+    key: 'tpPushEnableMailIndividualV1',
     spSite: 'https://vipvikaraps.sharepoint.com/sites/Vikarkonsulenter',
     listTitle: 'TemponizerSettings',
-    itemTitle: 'PushoverMail',
+    itemTitle: 'PushoverMailFeedV1',
     loginUrl: 'https://vipvikaraps.sharepoint.com/sites/Vikarkonsulenter/Lists/TemponizerSettings/AllItems.aspx',
     pollMs: 30000
   };
@@ -123,11 +123,12 @@
   let incomingCallUserEmailCheckedAt = 0;
   let incomingCallQueueErrorNotifiedAt = 0;
   let ipnordicSetupConfigCache = null;
-  let tpMailPushBusy = false;
   let tpMailRefreshInFlight = false;
   let tpMailRefreshGeneration = 0;
   let tpMailPushTimer = null;
-  const MAIL_STATUS_KEY = 'tpMailStatusV1';
+  const MAIL_STATUS_KEY = 'tpMailStatusV2';
+  const MAIL_FEED_STATE_KEY = 'tpMailFeedStateV1';
+  const MAIL_MAX_AGE_MS = 10 * 60 * 1000;
   let tpSpDigestCache = { value: '', expires: 0 };
   let tpSpEntityTypeCache = '';
   const workerHoverRequests = new Map();
@@ -2337,6 +2338,13 @@
   }
 
   function refreshQueuedNotification(job) {
+    if (job.kind === 'mail') {
+      const epoch = loadJson(MAIL_STATUS_KEY, {}).writtenAt || 0;
+      if (job.createdAt < epoch || now() - job.createdAt > MAIL_MAX_AGE_MS) {
+        return { ...job, status: 'cancelled', notification: undefined, events: undefined,
+          reason: 'Mailen er ikke længere aktuel' };
+      }
+    }
     if (!job.events?.length) return job;
     const health = loadJson('tpPollHealthV1_' + job.kind, {});
     const checkedAt = health.checkedAt || health.lastSuccess;
@@ -3029,10 +3037,10 @@
 
   function getLocalMailPushEnabled() {
     try {
-      const value = GM_getValue(TP_MAIL_PUSH.key, null);
-      if (value === true || value === false) return value;
-    } catch (_) {}
-    try { return localStorage.getItem(TP_MAIL_PUSH.key) === 'true'; } catch (_) { return false; }
+      const value = localStorage.getItem(TP_MAIL_PUSH.key);
+      if (value === 'true' || value === 'false') return value === 'true';
+      return GM_getValue(TP_MAIL_PUSH.key, false) === true;
+    } catch (_) { return false; }
   }
 
   function paintMailPushUI(enabled, statusText, color, showLogin = false) {
@@ -3048,23 +3056,23 @@
   }
 
   function paintSharedMailStatus() {
-    if (tpMailPushBusy) return;
-    const state = loadJson(MAIL_STATUS_KEY, null);
-    if (!state) return;
-    if (typeof state.enabled === 'boolean') setLocalMailPushEnabled(state.enabled);
-    const stale = now() - state.checkedAt > TP_MAIL_PUSH.pollMs * 3;
-    paintMailPushUI(state.enabled, stale ? 'afventer synk…' : state.statusText,
-      stale ? '#888' : state.color, state.showLogin);
+    const enabled = getLocalMailPushEnabled();
+    const state = loadJson(MAIL_STATUS_KEY, {});
+    const stale = enabled && (!state.checkedAt || now() - state.checkedAt > TP_MAIL_PUSH.pollMs * 3);
+    paintMailPushUI(enabled, !enabled ? 'fra' : stale ? 'afventer synk…' : state.statusText,
+      stale ? '#888' : state.color, enabled && state.showLogin);
   }
 
   function publishMailStatus(enabled, error = false, written = false) {
     const previous = loadJson(MAIL_STATUS_KEY, {});
-    const state = { enabled: typeof enabled === 'boolean' ? enabled : previous.enabled,
-      statusText: error ? 'fejl' : enabled ? 'til' : 'fra', color: error ? '#a33' : enabled ? '#0a7a35' : '#a33',
-      showLogin: error, checkedAt: now(), writtenAt: written ? now() : previous.writtenAt || 0 };
+    const state = {
+      statusText: error ? 'fejl' : enabled ? 'til' : 'fra',
+      color: error ? '#a33' : enabled ? '#0a7a35' : '#a33',
+      showLogin: error, checkedAt: now(),
+      writtenAt: written ? now() : previous.writtenAt || 0
+    };
     saveJson(MAIL_STATUS_KEY, state);
-    if (typeof state.enabled === 'boolean') setLocalMailPushEnabled(state.enabled);
-    paintMailPushUI(state.enabled, state.statusText, state.color, state.showLogin);
+    paintMailPushUI(enabled, state.statusText, state.color, state.showLogin);
   }
 
   async function getSharePointDigest() {
@@ -3100,117 +3108,123 @@
     return type;
   }
 
+  function parseMailFeed(data) {
+    const events = JSON.parse(data);
+    if (!Array.isArray(events) || events.length > 50) throw new Error('Ukendt mailoversigt');
+    const unique = new Map();
+    for (const event of events) {
+      if (!event || typeof event.id !== 'string' || !event.id || event.id.length > 2048
+          || typeof event.from !== 'string' || event.from.length > 256
+          || typeof event.subject !== 'string' || event.subject.length > 200
+          || !Number.isFinite(Date.parse(event.receivedAt))) {
+        throw new Error('Ukendt format på mailhændelse');
+      }
+      unique.set(event.id, { id: event.id, from: event.from, subject: event.subject,
+        receivedAt: event.receivedAt });
+    }
+    return [...unique.values()];
+  }
+
   async function getMailPushSetting() {
     const filter = encodeURIComponent("Title eq '" + odataQuote(TP_MAIL_PUSH.itemTitle) + "'");
-    const url = spListBaseUrl() + '/items?$select=Id,Title,Enabled&$filter=' + filter + '&$top=1';
     const response = await gmRequest({
-      url,
+      url: spListBaseUrl() + '/items?$select=Id,Enabled,SetupData&$filter=' + filter + '&$top=2',
       headers: { 'Accept': 'application/json;odata=nometadata' }
     });
     const json = JSON.parse(response.responseText || '{}');
     const rows = json.value || json?.d?.results || [];
-    if (!rows.length) throw new Error('Fandt ikke PushoverMail i TemponizerSettings');
-    if (!Number.isInteger(rows[0].Id) || typeof rows[0].Enabled !== 'boolean') {
-      throw new Error('Ukendt format på SharePoint mailstatus');
+    if (rows.length !== 1 || rows[0].Enabled !== true || typeof rows[0].SetupData !== 'string') {
+      throw new Error('Individuel mailoversigt er ikke klar');
     }
-    return { id: rows[0].Id, enabled: rows[0].Enabled };
+    return { events: parseMailFeed(rows[0].SetupData) };
   }
 
-  async function setMailPushSetting(enabled) {
-    return withCrossTabProcessLock('mail-state', async () => {
-      const item = await getMailPushSetting();
-      const digest = await getSharePointDigest();
-      const entityType = await getSharePointListEntityType();
-      await gmRequest({
-        method: 'POST',
-        url: spListBaseUrl() + '/items(' + item.id + ')',
-        headers: {
-          'Accept': 'application/json;odata=verbose',
-          'Content-Type': 'application/json;odata=verbose',
-          'X-RequestDigest': digest,
-          'IF-MATCH': '*',
-          'X-HTTP-Method': 'MERGE'
-        },
-        data: JSON.stringify({
-          __metadata: { type: entityType },
-          Enabled: !!enabled
-        })
-      });
-      publishMailStatus(enabled, false, true);
-    });
+  function setMailPushSetting(enabled) {
+    // This preference never changes the shared mail flow or another colleague's setting.
+    setLocalMailPushEnabled(enabled);
+    localStorage.removeItem(MAIL_FEED_STATE_KEY);
+    publishMailStatus(enabled, false, true);
+  }
+
+  function processMailFeed(events, recipient, epoch) {
+    const previous = loadJson(MAIL_FEED_STATE_KEY, {});
+    const baseline = previous.recipient !== recipient || previous.epoch !== epoch
+      || !previous.checkedAt || now() - previous.checkedAt > MAIL_MAX_AGE_MS;
+    const seen = new Set(Array.isArray(previous.ids) ? previous.ids : []);
+    for (const event of events) {
+      const age = now() - Date.parse(event.receivedAt);
+      if (!baseline && !seen.has(event.id) && age >= -60000 && age <= MAIL_MAX_AGE_MS) {
+        enqueueNotification('mail', TP_MAIL_PUSH.key, {
+          title: 'Ny mail til mail@ajourcare.dk',
+          body: 'Fra: ' + event.from + '\nEmne: ' + event.subject
+        }, [recipient + ':' + event.id]);
+      }
+      seen.add(event.id);
+    }
+    // Keep only identifiers, not sender names, subjects or message bodies.
+    localStorage.setItem(MAIL_FEED_STATE_KEY, JSON.stringify({
+      recipient, epoch, checkedAt: now(), ids: [...seen].slice(-256)
+    }));
   }
 
   async function refreshMailPushSetting() {
-    if (tpMailPushBusy || tpMailRefreshInFlight) return;
-    if (!document.getElementById('tpEnableMail')) return;
+    if (tpMailRefreshInFlight || !document.getElementById('tpEnableMail')) return;
+    if (!getLocalMailPushEnabled()) { paintSharedMailStatus(); return; }
     if (!isLeader()) { paintSharedMailStatus(); return; }
-    const generation = ++tpMailRefreshGeneration;
+    const generation = tpMailRefreshGeneration;
+    const epoch = loadJson(MAIL_STATUS_KEY, {}).writtenAt || 0;
+    const recipient = pushRecipientId();
+    if (!recipient) {
+      paintMailPushUI(true, 'mangler nøgle', '#a33');
+      return;
+    }
     tpMailRefreshInFlight = true;
     try {
       await withCrossTabProcessLock('mail-state', async () => {
-        if (!isLeader() || generation !== tpMailRefreshGeneration || tpMailPushBusy) return;
-        if (now() - (loadJson(MAIL_STATUS_KEY, {}).writtenAt || 0) < 2000) {
-          paintSharedMailStatus();
-          return;
-        }
-        paintMailPushUI(undefined, 'synk…', '#888');
+        const current = () => isLeader() && getLocalMailPushEnabled()
+          && generation === tpMailRefreshGeneration && recipient === pushRecipientId()
+          && epoch === (loadJson(MAIL_STATUS_KEY, {}).writtenAt || 0);
+        if (!current()) return;
         try {
           const setting = await getMailPushSetting();
-          if (generation !== tpMailRefreshGeneration || tpMailPushBusy) return;
-          publishMailStatus(setting.enabled);
+          if (!current()) return;
+          processMailFeed(setting.events, recipient, epoch);
+          publishMailStatus(true);
         } catch (error) {
-          if (generation === tpMailRefreshGeneration && !tpMailPushBusy) {
-            diagnostics.record('mail','error',{outcome:diagnostics.errorKind(error)},true);
-            console.warn('[TP][MAIL] refresh error', error);
-            publishMailStatus(undefined, true);
-          }
+          if (!current()) return;
+          diagnostics.record('mail','error',{outcome:diagnostics.errorKind(error)},true);
+          console.warn('[TP][MAIL] Kunne ikke læse mailoversigt');
+          publishMailStatus(true, true);
         }
       });
     } catch (error) {
-      console.warn('[TP][MAIL] status lock error', error);
       diagnostics.record('mail','error',{outcome:diagnostics.errorKind(error)},true);
-      paintMailPushUI(undefined, 'afventer synk…', '#888');
+      paintSharedMailStatus();
     } finally {
-      if (generation === tpMailRefreshGeneration) tpMailRefreshInFlight = false;
+      tpMailRefreshInFlight = false;
     }
   }
 
   function initMailPushControls(root) {
     const checkbox = root.querySelector('#tpEnableMail');
     if (!checkbox) return;
-    checkbox.checked = getLocalMailPushEnabled();
-    paintMailPushUI(checkbox.checked, 'synk…', '#888');
+    setLocalMailPushEnabled(getLocalMailPushEnabled());
+    checkbox.title = 'Mailnotifikationer til din Pushover';
     paintSharedMailStatus();
     window.addEventListener('storage', event => {
-      if (event.key === MAIL_STATUS_KEY) paintSharedMailStatus();
+      if (event.key === TP_MAIL_PUSH.key) {
+        tpMailRefreshGeneration += 1;
+        paintSharedMailStatus();
+        void refreshMailPushSetting();
+      } else if (event.key === MAIL_STATUS_KEY) paintSharedMailStatus();
     });
-
-    checkbox.addEventListener('change', async () => {
-      if (tpMailPushBusy) return;
-      const wantOn = checkbox.checked;
-      tpMailPushBusy = true;
+    checkbox.addEventListener('change', () => {
       tpMailRefreshGeneration += 1;
-      tpMailRefreshInFlight = false;
-      checkbox.disabled = true;
-      paintMailPushUI(wantOn, wantOn ? 'slår til…' : 'slår fra…', '#888');
-      try {
-        await setMailPushSetting(wantOn);
-      } catch (error) {
-        console.warn('[TP][MAIL] update error', error);
-        diagnostics.record('mail','error',{outcome:diagnostics.errorKind(error)},true);
-        checkbox.checked = loadJson(MAIL_STATUS_KEY, {}).enabled ?? getLocalMailPushEnabled();
-        paintMailPushUI(checkbox.checked, 'fejl', '#a33', true);
-      } finally {
-        checkbox.disabled = false;
-        tpMailPushBusy = false;
-        setTimeout(refreshMailPushSetting, 1200);
-      }
+      setMailPushSetting(checkbox.checked);
+      void refreshMailPushSetting();
     });
-
-    refreshMailPushSetting();
-    if (!tpMailPushTimer) {
-      tpMailPushTimer = setInterval(refreshMailPushSetting, TP_MAIL_PUSH.pollMs);
-    }
+    void refreshMailPushSetting();
+    if (!tpMailPushTimer) tpMailPushTimer = setInterval(refreshMailPushSetting, TP_MAIL_PUSH.pollMs);
   }
 
   function injectIPnordicGuideStyles() {
