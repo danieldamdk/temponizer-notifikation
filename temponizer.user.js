@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.15
+// @version      7.14.16
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.15';
+  const TP_VERSION = '7.14.16';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -132,6 +132,11 @@
   let tpSpDigestCache = { value: '', expires: 0 };
   let tpSpEntityTypeCache = '';
   const workerHoverRequests = new Map();
+  const CONTACT_SYNC = Object.freeze({
+    owner: 'ddh@ajourcare.dk', title: 'WorkerContacts-ddh-v1',
+    key: 'tpContactSyncEnabledV1', stateKey: 'tpContactSyncStateV1', interval: 60 * 60 * 1000
+  });
+  let contactSyncInFlight = false;
 
   // Diagnostics accept only fixed event names, enums and bounded counters, never payloads.
   const diagnostics = createDiagnostics();
@@ -2776,8 +2781,8 @@
     return state;
   }
 
-  async function getIncomingCallUserEmail() {
-    if (incomingCallUserEmail && now() - incomingCallUserEmailCheckedAt < 60000) return incomingCallUserEmail;
+  async function getIncomingCallUserEmail(force = false) {
+    if (!force && incomingCallUserEmail && now() - incomingCallUserEmailCheckedAt < 60000) return incomingCallUserEmail;
     const response = await gmRequest({
       url: TP_CALL_QUEUE.spSite.replace(/\/$/, '') + '/_api/web/currentuser?$select=Email',
       headers: { 'Accept': 'application/json;odata=nometadata' }
@@ -3028,6 +3033,176 @@
   function spListBaseUrl() {
     return TP_MAIL_PUSH.spSite.replace(/\/$/, '')
       + "/_api/web/lists/getbytitle('" + odataQuote(TP_MAIL_PUSH.listTitle) + "')";
+  }
+
+  function contactSyncEnabled() {
+    try { return localStorage.getItem(CONTACT_SYNC.key) === 'true'; } catch (_) { return false; }
+  }
+
+  function normalizeContactPhone(value) {
+    const text = String(value || '').trim();
+    if (!/^(?:\+|00)?[\d\s().-]+$/.test(text)) return '';
+    let phone = text.replace(/[\s().-]/g, '');
+    if (phone.startsWith('00')) phone = '+' + phone.slice(2);
+    if (/^\d{8}$/.test(phone)) phone = '+45' + phone;
+    if (phone.startsWith('+45') && !/^\+45[2-9]\d{7}$/.test(phone)) return '';
+    return /^\+[1-9]\d{7,14}$/.test(phone) ? phone : '';
+  }
+
+  function validateContactSnapshot(snapshot) {
+    if (!snapshot || snapshot.schema !== 1 || snapshot.owner !== CONTACT_SYNC.owner
+        || snapshot.complete !== true || !Number.isFinite(Date.parse(snapshot.capturedAt))
+        || !Number.isInteger(snapshot.sourceCount) || snapshot.sourceCount < 1 || snapshot.sourceCount > 2000
+        || !Array.isArray(snapshot.workers) || snapshot.workers.length !== snapshot.sourceCount) {
+      throw new Error('TP_CONTACT_INCOMPLETE');
+    }
+    const ids = new Set(), phones = new Set();
+    for (const worker of snapshot.workers) {
+      if (!worker || typeof worker.id !== 'string' || !/^[1-9]\d{0,11}$/.test(worker.id) || ids.has(worker.id)
+          || Object.keys(worker).some(key => !['id', 'name', 'phone'].includes(key))
+          || typeof worker.name !== 'string' || !worker.name.trim() || worker.name.length > 160
+          || typeof worker.phone !== 'string' || (worker.phone && normalizeContactPhone(worker.phone) !== worker.phone)
+          || (worker.phone && phones.has(worker.phone))) throw new Error('TP_CONTACT_INVALID');
+      ids.add(worker.id);
+      if (worker.phone) phones.add(worker.phone);
+    }
+    if (!phones.size || JSON.stringify(snapshot).length > 55000) throw new Error('TP_CONTACT_SIZE');
+    return { sourceCount: ids.size, phoneCount: phones.size, missingPhone: ids.size - phones.size };
+  }
+
+  function parseActiveContactListHTML(html, capturedAt = new Date().toISOString()) {
+    const doc = parseHtml(html);
+    const scriptText = Array.from(doc.scripts).map(script => script.textContent).join('\n');
+    const counts = Array.from(scriptText.matchAll(/['"]#resultatcnt['"]\s*\)\s*\.html\(\s*(\d+)\s*\)/g));
+    if (counts.length !== 1 || !/\bremaining\s*=\s*0\s*;/.test(scriptText)) throw new Error('TP_CONTACT_INCOMPLETE');
+    const boxes = Array.from(doc.querySelectorAll('input[id^="vikar_ckb_"]'));
+    const workers = boxes.map(box => {
+      const row = box.closest('tr'), cells = row?.cells;
+      const headers = Array.from(row?.closest('table')?.querySelector('tr')?.cells || []).map(c => normalizeText(c.textContent));
+      const id = box.id.slice('vikar_ckb_'.length);
+      if (!cells || cells.length !== 11 || !headers.includes('Navn') || !headers.includes('Telefon')
+          || !headers.includes('Aktiv') || normalizeText(cells[9].textContent) !== 'Ja') throw new Error('TP_CONTACT_STRUCTURE');
+      const link = cells[2].querySelector('a[href*="page=showvikaroplysninger"]');
+      if (!link || new URL(link.getAttribute('href'), ORIGIN).searchParams.get('vikar_id') !== id) throw new Error('TP_CONTACT_STRUCTURE');
+      const phones = Array.from(cells[6].querySelectorAll('a[href^="tel:"]'));
+      if (phones.length > 1) throw new Error('TP_CONTACT_STRUCTURE');
+      return { id, name: normalizeText(cells[3].textContent),
+        phone: normalizeContactPhone(phones[0]?.getAttribute('href').slice(4) || cells[6].textContent) };
+    });
+    const snapshot = { schema: 1, owner: CONTACT_SYNC.owner, complete: true, capturedAt,
+      sourceCount: Number(counts[0][1]), workers: workers.sort((a, b) => Number(a.id) - Number(b.id)) };
+    validateContactSnapshot(snapshot);
+    return snapshot;
+  }
+
+  function assertContactSnapshotChange(previous, next) {
+    const before = validateContactSnapshot(previous), after = validateContactSnapshot(next);
+    if (after.sourceCount * 10 < before.sourceCount * 8 || after.phoneCount * 10 < before.phoneCount * 8) {
+      throw new Error('TP_CONTACT_UNEXPECTED_DROP');
+    }
+  }
+
+  function paintContactSyncUI() {
+    const section = document.getElementById('tpContactSyncSection');
+    if (!section) return;
+    section.hidden = incomingCallUserEmail !== CONTACT_SYNC.owner && !contactSyncEnabled();
+    const checkbox = section.querySelector('input');
+    checkbox.checked = contactSyncEnabled();
+    const state = loadJson(CONTACT_SYNC.stateKey, {});
+    const status = section.querySelector('[role="status"]');
+    status.textContent = !checkbox.checked ? 'Datakilde slået fra'
+      : state.status === 'sending' ? 'Henter kontaktliste...'
+      : state.status === 'wrong-user' ? 'Forkert SharePoint-konto'
+      : state.status === 'error' ? 'Synkronisering stoppet ved fejl'
+      : state.uploadedAt ? (state.phoneCount || 0) + ' numre sendt kl. ' + new Date(state.uploadedAt).toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit' })
+      : 'Afventer første synkronisering';
+    section.querySelector('button').disabled = contactSyncInFlight || !checkbox.checked;
+  }
+
+  async function syncWorkerContacts(force = false) {
+    if (!contactSyncEnabled() || contactSyncInFlight || (!force && !isLeader())) return;
+    const due = () => {
+      const state = loadJson(CONTACT_SYNC.stateKey, {});
+      return force ? now() - (state.attemptAt || 0) >= 60000 : now() >= (state.nextAttempt || 0);
+    };
+    if (!due()) return;
+    contactSyncInFlight = true;
+    try {
+      await withCrossTabProcessLock('worker-contact-sync', async () => {
+        if (!contactSyncEnabled() || (!force && !isLeader()) || !due()) return;
+        const previous = loadJson(CONTACT_SYNC.stateKey, {});
+        const attemptAt = now();
+        localStorage.setItem(CONTACT_SYNC.stateKey, JSON.stringify({ ...previous, attemptAt, nextAttempt: attemptAt + 5 * 60000, status: 'sending' }));
+        paintContactSyncUI();
+        let email = '';
+        try {
+          email = await getIncomingCallUserEmail(true);
+          if (email !== CONTACT_SYNC.owner) throw new Error('TP_CONTACT_WRONG_USER');
+          const filter = encodeURIComponent("Title eq '" + odataQuote(CONTACT_SYNC.title) + "'");
+          const response = await gmRequest({ url: spListBaseUrl() + '/items?$select=Id,Enabled,SetupData&$filter=' + filter + '&$top=2',
+            headers: { Accept: 'application/json;odata=verbose' } });
+          const json = JSON.parse(response.responseText || '{}');
+          const rows = json?.d?.results || json.value || [];
+          if (rows.length !== 1 || rows[0].Enabled !== true || !Number.isInteger(rows[0].Id)) throw new Error('TP_CONTACT_NOT_READY');
+          const row = rows[0], baseline = JSON.parse(row.SetupData);
+          validateContactSnapshot(baseline);
+          const csrf = document.querySelector('meta[name="csrf-token"]')?.content;
+          if (!csrf) throw new Error('TP_LOGIN_REQUIRED');
+          // No form filters or session search selections are submitted.
+          const html = await fetchText(ORIGIN + '/index.php', { method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'X-CSRF-Token': csrf },
+            body: 'page=vikarlist_get&ajax=true&showheader=true&all=1' });
+          const snapshot = parseActiveContactListHTML(html);
+          assertContactSnapshotChange(baseline, snapshot);
+          const counts = validateContactSnapshot(snapshot);
+          const digest = await getSharePointDigest();
+          const entityType = await getSharePointListEntityType();
+          const etag = row.__metadata?.etag || row['@odata.etag'];
+          if (!etag) throw new Error('TP_CONTACT_ETAG');
+          if (await getIncomingCallUserEmail(true) !== CONTACT_SYNC.owner) throw new Error('TP_CONTACT_WRONG_USER');
+          if (!contactSyncEnabled() || (!force && !isLeader())) return;
+          await gmRequest({ method: 'POST', url: spListBaseUrl() + '/items(' + row.Id + ')',
+            headers: { Accept: 'application/json;odata=verbose', 'Content-Type': 'application/json;odata=verbose',
+              'X-RequestDigest': digest, 'X-HTTP-Method': 'MERGE', 'IF-MATCH': etag },
+            data: JSON.stringify({ __metadata: { type: entityType }, SetupData: JSON.stringify(snapshot) }) });
+          saveJson(CONTACT_SYNC.stateKey, { attemptAt, nextAttempt: now() + CONTACT_SYNC.interval,
+            uploadedAt: now(), status: 'uploaded', ...counts });
+          diagnostics.record('worker', 'snapshot', { outcome: 'ok', count: counts.phoneCount }, true);
+        } catch (error) {
+          saveJson(CONTACT_SYNC.stateKey, { ...previous, attemptAt, nextAttempt: now() + 15 * 60000,
+            status: email && email !== CONTACT_SYNC.owner ? 'wrong-user' : 'error' });
+          diagnostics.record('worker', 'error', { outcome: diagnostics.errorKind(error) }, true);
+          console.warn('[TP][CONTACTS] Kontaktlisten blev ikke opdateret', error?.message?.startsWith('TP_') ? error.message : 'NETWORK_OR_SHAREPOINT');
+        }
+      });
+    } catch (_) {
+      // A competing tab owns the job; its status is shared through localStorage.
+    } finally { contactSyncInFlight = false; paintContactSyncUI(); }
+  }
+
+  function initContactSyncMenu(menu) {
+    const section = document.createElement('div');
+    section.id = 'tpContactSyncSection';
+    section.style.cssText = 'border-top:1px solid #eee;margin-top:10px;padding-top:8px;font-size:12px';
+    section.innerHTML = '<label style="display:flex;align-items:center;gap:6px"><input type="checkbox">Outlook-kontakter (pilot)</label>'
+      + '<div role="status" style="font-size:11px;color:#666;margin:6px 0"></div>'
+      + '<button type="button" class="tp-diagnostic-button">Synkroniser nu</button>';
+    menu.insertBefore(section, menu.lastElementChild);
+    section.querySelector('input').addEventListener('change', event => {
+      localStorage.setItem(CONTACT_SYNC.key, event.target.checked ? 'true' : 'false');
+      paintContactSyncUI();
+      if (event.target.checked) void syncWorkerContacts(true);
+    });
+    section.querySelector('button').addEventListener('click', () => void syncWorkerContacts(true));
+    paintContactSyncUI();
+  }
+
+  function initWorkerContactSync() {
+    setInterval(() => { paintContactSyncUI(); void syncWorkerContacts(); }, 60000);
+    window.addEventListener('storage', event => {
+      if (event.key === CONTACT_SYNC.key || event.key === CONTACT_SYNC.stateKey) paintContactSyncUI();
+    });
+    void syncWorkerContacts();
   }
 
   function setLocalMailPushEnabled(enabled) {
@@ -3658,7 +3833,7 @@
         '<span id="tpIntCountBadge" style="display:flex;align-items:center;justify-content:center;margin-left:auto;min-width:18px;text-align:center;padding:1px 6px;border-radius:999px;background:#f0f0f0;border:1px solid #e3e3e3;font-size:11px">0</span>' +
       '</div>' +
       '<div style="display:flex;align-items:center;gap:6px;margin:2px 0 6px;white-space:nowrap">' +
-        '<label title="Fælles indstilling for mailnotifikationer" style="display:flex;align-items:center;gap:6px;min-width:0"><input type="checkbox" id="tpEnableMail"> <span>Mail (fælles)</span></label>' +
+        '<label title="Dine mailnotifikationer" style="display:flex;align-items:center;gap:6px;min-width:0"><input type="checkbox" id="tpEnableMail"> <span>Mail</span></label>' +
         '<span id="tpMailStatus" style="margin-left:auto;font-size:10px;color:#888">…</span>' +
         '<a id="tpMailLoginLink" href="' + TP_MAIL_PUSH.loginUrl + '" target="_blank" rel="noopener noreferrer" style="display:none;font-size:10px;color:#1769aa;text-decoration:underline">Log ind</a>' +
       '</div>' +
@@ -3725,6 +3900,7 @@
         '<div style="margin-top:8px;font-size:11px;color:#666">Version: ' + TP_VERSION + '</div>';
 
       document.body.appendChild(menu);
+      initContactSyncMenu(menu);
       menu.querySelector('#tpDiagDetail').addEventListener('change', event => diagnostics.detail(event.target.checked));
       menu.querySelector('#tpDiagShow').addEventListener('click', () => { toggleMenu(false); diagnostics.show(); });
       menu.querySelector('#tpDiagDownload').addEventListener('click', () => diagnostics.download());
@@ -3807,6 +3983,7 @@
       element.style.display = element.style.display === 'block' ? 'none' : 'block';
       if (element.style.display !== 'block') return;
       element.style.visibility = 'hidden';
+      paintContactSyncUI();
       positionMenu(element);
       element.style.visibility = 'visible';
       ensureFullyVisible(element);
@@ -3814,7 +3991,6 @@
       if (input) input.value = getUserKey();
       diagnostics.paint();
       diagnosticSharing.paint();
-
       const outside = event => {
         if (element.style.display !== 'block') return cleanup();
         if (element.contains(event.target) || event.target === gearButton) return;
@@ -3841,7 +4017,10 @@
     });
 
     initPanelCollapseControls(panel, () => toggleMenu(false));
-    window.addEventListener('resize', () => pinPanelBottomRight(panel));
+    window.addEventListener('resize', () => {
+      pinPanelBottomRight(panel);
+      if (menu?.style.display === 'block') positionMenu(menu);
+    });
     if (typeof ResizeObserver === 'function') new ResizeObserver(() => pinPanelBottomRight(panel)).observe(panel);
 
     const messageCheckbox = panel.querySelector('#tpEnableMsg');
@@ -5574,10 +5753,18 @@
     initWorkerProfileHover();
     initQuickNoAnswer();
     startPolling();
+    initWorkerContactSync();
     diagnosticSharing.init();
   }
 
   const TEST_API = Object.freeze({
+    normalizeContactPhone,
+    validateContactSnapshot,
+    parseActiveContactListHTML,
+    assertContactSnapshotChange,
+    syncWorkerContacts,
+    contactSyncEnabled,
+    initContactSyncMenu,
     diagnostics,
     diagnosticSharing,
     TP_VERSION,
