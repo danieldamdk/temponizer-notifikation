@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.20
+// @version      7.14.21
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -14,6 +14,7 @@
 // @connect      ajourcare.temponizer.dk
 // @connect      vipvikaraps.sharepoint.com
 // @connect      autregwebservice.stps.dk
+// @connect      default5ba2afb43ff949bbbbec063d521acc.76.environment.api.powerplatform.com
 // @run-at       document-idle
 // @noframes
 // @updateURL    https://raw.githubusercontent.com/danieldamdk/temponizer-notifikation/main/temponizer.user.js
@@ -22,7 +23,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.20';
+  const TP_VERSION = '7.14.21';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -530,11 +531,11 @@
     const maxEntries = 300;
     const maxBytes = 65536;
     const maxLogs = 8;
-    const scopes = new Set(['runtime', 'messages', 'interest', 'phone', 'mail', 'sms', 'worker', 'authorization', 'update', 'network', 'html', 'lock', 'push']);
+    const scopes = new Set(['runtime', 'messages', 'interest', 'phone', 'mail', 'sms', 'worker', 'authorization', 'update', 'network', 'html', 'lock', 'push', 'workflow']);
     const events = new Set(['start', 'finish', 'error', 'slow', 'leader', 'visibility', 'skip', 'snapshot', 'queue', 'call', 'test', 'detail', 'lag', 'storage']);
     const outcomes = new Set(['ok', 'failed', 'timeout', 'login', 'network', 'http', 'unknown', 'leader', 'follower', 'visible', 'hidden', 'inflight', 'duplicate', 'ignored', 'handled', 'baseline', 'pending', 'queued', 'sending', 'sent', 'retry', 'waiting', 'blocked', 'cancelled', 'expired', 'enabled', 'disabled', 'missing', 'partial', 'fallback']);
     const numbers = ['durationMs', 'count', 'pending', 'attempt', 'httpStatus', 'operation'];
-    const labels = { runtime:'Script', messages:'Beskeder', interest:'Interesser', phone:'Telefon', mail:'Mail', sms:'SMS', worker:'Vikaroverblik', authorization:'Autorisation', update:'Opdatering', network:'Netværk', html:'HTML', lock:'Flerfanelås', push:'Pushover' };
+    const labels = { runtime:'Script', messages:'Beskeder', interest:'Interesser', phone:'Telefon', mail:'Mail', sms:'SMS', worker:'Vikaroverblik', authorization:'Autorisation', update:'Opdatering', network:'Netværk', html:'HTML', lock:'Flerfanelås', push:'Pushover', workflow:'Hjælp til udvikling' };
     const eventLabels = {start:'Start',finish:'Afsluttet',error:'Fejl',slow:'Langsomt',leader:'Faneansvar',visibility:'Synlighed',skip:'Sprunget over',snapshot:'Kontrol',queue:'Afsendelse',call:'Opkald',test:'Telefontest',detail:'Detaljelog',lag:'Forsinkelse',storage:'Lagring'};
     const outcomeLabels = {ok:'OK',failed:'mislykket',timeout:'tidsgrænse nået',login:'login/adgang',network:'netværk',http:'serversvar',unknown:'uafklaret',leader:'ansvarlig fane',follower:'anden fane har ansvaret',visible:'synlig',hidden:'i baggrunden',inflight:'allerede i gang',duplicate:'dublet',ignored:'ignoreret',handled:'vist',baseline:'startniveau',pending:'afventer',queued:'i kø',sending:'sender',sent:'sendt',retry:'nyt forsøg',waiting:'venter',blocked:'stoppet',cancelled:'annulleret',expired:'udløbet',enabled:'slået til',disabled:'slået fra',missing:'mangler',partial:'ufuldstændig',fallback:'reserveløsning'};
     let ready = false, entries = [], detailedUntil = 0, flushTimer = null, expiryTimer = null, lagTimer = null;
@@ -669,7 +670,11 @@
         if (parsed.hostname === 'api.pushover.net') return 'push';
         if (parsed.hostname === 'autregwebservice.stps.dk') return 'authorization';
         if (parsed.hostname === 'raw.githubusercontent.com') return 'update';
-        if (parsed.hostname === 'vipvikaraps.sharepoint.com') return parsed.pathname.includes('TemponizerCalls') ? 'phone' : 'mail';
+        if (parsed.hostname === 'vipvikaraps.sharepoint.com') {
+          if (parsed.pathname.includes('TemponizerCalls')) return 'phone';
+          if (parsed.searchParams.get('$filter') === "Title eq 'WorkflowCollector'") return 'workflow';
+          return 'mail';
+        }
         const page = parsed.searchParams.get('page') || '';
         if (/^get_comcenter_/.test(page) || page === 'get_kommunikation_log') return 'messages';
         if (['freevagter','update_vikar_synlighed_from_list'].includes(page)) return 'interest';
@@ -734,7 +739,7 @@
     links:'Profilgenveje', authorization:'Autorisation', cpr:'CPR-kontrol', hover:'Vikaroverblik',
     quick:'Telefonregistrering', contacts:'Kontaktsynkronisering', sharing:'Diagnosedeling',
     storage:'Browserlager', leadership:'Faneansvar', messages:'Beskedkontrol',
-    interest:'Interessekontrol', phone:'Opkaldskontrol', mail:'Mailkontrol', push:'Pushover'
+    interest:'Interessekontrol', phone:'Opkaldskontrol', mail:'Mailkontrol', push:'Pushover', workflow:'Hjælp til udvikling'
   });
 
   // Bounded feature names and callbacks only; no DOM or personal payloads in this supervisor.
@@ -801,7 +806,6 @@
       return true;
     } finally { localStorage.removeItem(key); }
   }
-
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -3964,6 +3968,626 @@
     if (!tpMailPushTimer) tpMailPushTimer = setInterval(refreshMailPushSetting, TP_MAIL_PUSH.pollMs);
   }
 
+  // This parser returns selected categorical facts, never raw log content or identities.
+  // Raw tables and UI wrappers share the same verified read-only log format.
+  const WORKFLOW_LOG_EDUCATIONS = Object.freeze({
+    'SSA':'ssa', 'SSH':'ssh', 'Sygeplejerske':'spl', 'Plejer':'plejer',
+    'Socialp\u00e6dagog':'socialpaedagog', 'Medicinstuderende':'medicinstuderende',
+    'Sygeplejestuderende':'sygeplejestuderende', 'Afdelingschef':'afdelingschef',
+    'Direkt\u00f8r':'direktoer', 'Koordinator':'koordinator', 'Laborant':'laborant',
+    'Piccolo /piccoline':'piccolo', 'Port\u00f8r':'portoer',
+    'P\u00e6dagogisk assistent':'paedagogisk-assistent',
+    'Social- og sundhedsassistentelev':'ssa-elev', 'Sundhedshj\u00e6lper':'sundhedshjaelper'
+  });
+  const WORKFLOW_LOG_SKILLS = Object.freeze({
+    'K\u00f8rekort/Bilrute':'koerekort-bilrute', 'Ansvarshavende':'ansvarshavende',
+    'ASAP AKUT Modul':'asap-akut', 'Cura':'cura', 'KMD':'kmd', 'Nexus':'nexus',
+    'Sundhedsplatform Psyk':'sundhedsplatform-psyk', 'Blander':'blander',
+    'C-PAP':'c-pap', 'Runner':'runner', 'Vaccinat\u00f8r':'vaccinator',
+    'Fast vagt hjemmepleje':'fast-vagt-hjemmepleje', 'Nasal Sondeern\u00e6ring':'nasal-sonde',
+    'PEG sondeern\u00e6ring':'peg-sonde', 'Psyk. Erfaring':'psykiatri',
+    'Psykiatrisk akutmodtagelse':'psykiatrisk-akut', 'Sygehus Akutafsnit':'sygehus-akut',
+    'Sygehus sengeafsnit':'sygehus-sengeafsnit', 'Syghus Ambulatorium':'sygehus-ambulatorium',
+    'S\u00e5rpleje':'saarpleje', 'Anl\u00e6ggelse af Nasalsonde':'anlaeg-nasalsonde',
+    'Anl\u00e6ggelse af venflon':'anlaeg-venflon', 'Blodsukker m\u00e5ling':'blodsukker',
+    'Injektioner intramuskul\u00e6rt':'intramuskulaer', 'Insulin injektioner':'insulin',
+    'Kardiologisk erfaring':'kardiologi', 'Kathederpleje':'kathederpleje',
+    'Medicindosering':'medicindosering', 'Stomi Pleje':'stomipleje',
+    'Subkutan injektion':'subkutan', 'Subkutan Venflon':'subkutan-venflon',
+    'Tegn til tale':'tegn-til-tale', 'Tegnsprog':'tegnsprog',
+    'Ekstra till\u00e6g':'ekstra-tillaeg', 'KUN Fast vagt':'kun-fast-vagt'
+  });
+  const WORKFLOW_LOG_FIELDS = Object.freeze({
+    'Uddannelse (flere)':['education-requested', 'education'],
+    'Uddannelse (enkelt/vikar)':['education-booked', 'education'],
+    'Faktura uddannelse':['education-invoiced', 'education'],
+    'Synlige uddannelser p\u00e5 vikarlogin':['education-visible', 'education'],
+    'Kompetencer':['competencies', 'skills'],
+    'Auto booking indstillinger':['autobooking', 'autobooking'],
+    'Intern kommentar (f\u00f8r booking)':['comment-internal-before', 'presence'],
+    'Kommentar til vikar (f\u00f8r booking)':['comment-worker-before', 'presence'],
+    'Kommentar til vikar i SMS (f\u00f8r booking)':['message-worker-before', 'presence'],
+    'Kommentar til \u00f8konomi':['comment-finance', 'presence'],
+    'Tilbagemeld kommentar':['comment-feedback', 'presence'],
+    'Tilbagemeld via':['feedback-channel', 'channel']
+  });
+
+  function parseWorkflowShiftLog(root) {
+    const unknown = reason => ({status:'unavailable', reason, coverage:'selected-fields', groups:[]});
+    if (!root?.querySelectorAll) return unknown('missing-container');
+    const containers = ['popup_vagtlog', 'log_container'];
+    const wrappers = containers.includes(root.id) ? [root] : Array.from(root.querySelectorAll('#popup_vagtlog, #log_container'));
+    const candidates = [...wrappers, ...(root.matches?.('table.vagt_log_table') ? [root] : Array.from(root.querySelectorAll('table.vagt_log_table')))
+      .filter(table => !wrappers.some(wrapper => wrapper.contains(table)))];
+    const populated = candidates.filter(element => element.querySelector('.vagtlogrow'));
+    if (populated.length !== 1) return unknown(populated.length ? 'ambiguous-container' : 'missing-rows');
+    const container = populated[0], rows = Array.from(container.querySelectorAll('tr'));
+    if (rows.length > 2000 || container.textContent.length > 500000) return unknown('size-limit');
+    const text = value => String(value || '').replace(/\s+/g, ' ').trim();
+    const first = rows[0];
+    if (!first || first.cells.length !== 3 || text(first.cells[0].textContent) !== '\u00c6ndringstype'
+        || text(first.cells[1].textContent) !== 'F\u00d8R \u00e6ndring' || text(first.cells[2].textContent) !== 'EFTER \u00e6ndring') return unknown('unknown-header');
+    const own = (map, key) => Object.prototype.hasOwnProperty.call(map, key);
+    function value(code, raw) {
+      if (raw === 'Ny vagt') return ['new'];
+      if (code === 'presence') return [!raw || raw === 'Ingen kommentar angivet' ? 'empty' : 'filled'];
+      if (code === 'education' || code === 'skills') {
+        const empty = code === 'education' ? ['Ingen synlige uddannelser p\u00e5 vikarlogin'] : ['Ingen kompetencer valgt', 'Ingen kompetencer'];
+        if (empty.includes(raw)) return [];
+        const map = code === 'education' ? WORKFLOW_LOG_EDUCATIONS : WORKFLOW_LOG_SKILLS;
+        const items = raw.split(',').map(text);
+        if (!raw || items.length > 50 || items.some(item => !own(map, item))) return ['unknown'];
+        return [...new Set(items.map(item => map[item]))].sort();
+      }
+      const map = code === 'autobooking' ? {'Skjult':'hidden','Vis interesse':'interest'}
+        : {'Email':'email', 'Telefon':'phone'};
+      return own(map, raw) ? [map[raw]] : ['unknown'];
+    }
+    function validDate(raw) {
+      const match = raw.match(/^(\d{2})\.(\d{2})\.(\d{4}) kl\. (\d{2}):(\d{2}):(\d{2})$/);
+      if (!match) return false;
+      const [, d, m, y, hh, mm, ss] = match.map(Number), date = new Date(Date.UTC(y, m - 1, d, hh, mm, ss));
+      return y >= 2000 && date.getUTCFullYear() === y && date.getUTCMonth() === m - 1 && date.getUTCDate() === d
+        && hh < 24 && mm < 60 && ss < 60;
+    }
+    const groups = [];
+    let group = null, skipped = 0, uncertain = 0, selected = 0;
+    for (const row of rows.slice(1)) {
+      if (row.querySelector('table')) return unknown('nested-table');
+      if (!row.classList.contains('vagtlogrow')) {
+        if (row.cells.length !== 2 || row.cells[0].colSpan !== 2 || !validDate(text(row.cells[1].textContent))) return unknown('unknown-group');
+        const label = text(row.cells[0].textContent), match = /^(Oprettet|\u00c6ndret|Booket) af\s/.exec(label);
+        const operation = match ? {Oprettet:'created', '\u00c6ndret':'changed', Booket:'booked'}[match[1]] : 'unknown';
+        group = {operation, stage:label.endsWith('(Bestilling)') ? 'order' : 'unknown', changes:[]};
+        if (operation === 'unknown') uncertain++;
+        groups.push(group);
+        if (groups.length > 200) return unknown('size-limit');
+        continue;
+      }
+      if (!group || row.cells.length !== 3) return unknown('unknown-row');
+      const label = text(row.cells[0].textContent);
+      if (!own(WORKFLOW_LOG_FIELDS, label)) { skipped++; continue; }
+      const [field, type] = WORKFLOW_LOG_FIELDS[label];
+      // Compare content transiently to distinguish text edits, but never retain it.
+      const beforeText = text(row.cells[1].textContent), afterText = text(row.cells[2].textContent);
+      const before = value(type, beforeText), after = value(type, afterText);
+      const changed = beforeText !== afterText;
+      if (before.includes('unknown') || after.includes('unknown')) uncertain++;
+      group.changes.push({field, before, after, changed});
+      selected++;
+    }
+    if (!groups.length || !selected) return unknown('no-selected-fields');
+    // A group is a source log block, not a unique operation or click count.
+    return {status:uncertain ? 'partial' : 'recognized', coverage:'selected-fields', unit:'log-block',
+      order:'source', skipped, uncertain, groups};
+  }
+
+  function workflowShiftSource(root, href) {
+    try {
+      const url = new URL(href, ORIGIN), page = url.searchParams.get('page');
+      if (url.origin !== ORIGIN) return null;
+      let order = '';
+      if (page === 'findvikar') order = url.searchParams.get('vagt_avail_id') || '';
+      else if (page === 'vagt') {
+        const booked = url.searchParams.get('vagter_id');
+        if (!/^[1-9]\d{0,8}$/.test(booked || '')) return null;
+        const found = new Set();
+        // Read only numeric literals from the page's native log call; never execute scripts.
+        for (const script of root.querySelectorAll('script:not([src])')) {
+          for (const match of script.textContent.matchAll(/\bload_vagt_log_layer\(\s*(\d+)\s*,\s*([1-9]\d{0,8})\s*\)\s*;/g)) {
+            if (match[1] === booked) found.add(match[2]);
+          }
+        }
+        if (found.size !== 1) return null;
+        order = [...found][0];
+      }
+      if (!/^[1-9]\d{0,8}$/.test(order)) return null;
+      return {order, url:ORIGIN + '/?page=vagtlog&vagter_id=0&vagt_avail_id=' + order + '&ajax=true'};
+    } catch (_) { return null; }
+  }
+
+  function validateWorkflowSnapshot(packet) {
+    const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join(',') === keys;
+    const integer = value => Number.isInteger(value) && value >= 0 && value <= 2000;
+    if (!exact(packet, 'id,schema,snapshot,source,version') || packet.schema !== 2
+        || typeof packet.id !== 'string' || !/^[a-f0-9]{64}$/.test(packet.id)
+        || typeof packet.source !== 'string' || !/^[a-f0-9]{64}$/.test(packet.source)
+        || typeof packet.version !== 'string' || !/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(packet.version)) return false;
+    const snapshot = packet.snapshot;
+    if (!exact(snapshot, 'coverage,groups,order,skipped,status,uncertain,unit')
+        || !['recognized','partial'].includes(snapshot.status) || snapshot.coverage !== 'selected-fields'
+        || snapshot.unit !== 'log-block' || snapshot.order !== 'source' || !integer(snapshot.skipped) || !integer(snapshot.uncertain)
+        || !Array.isArray(snapshot.groups) || !snapshot.groups.length || snapshot.groups.length > 200) return false;
+    const fields = Object.fromEntries(Object.values(WORKFLOW_LOG_FIELDS));
+    const codes = {education:Object.values(WORKFLOW_LOG_EDUCATIONS), skills:Object.values(WORKFLOW_LOG_SKILLS),
+      presence:['empty','filled'], autobooking:['hidden','interest'], channel:['email','phone']};
+    let total = 0;
+    for (const group of snapshot.groups) {
+      if (!exact(group, 'changes,operation,stage') || !['created','changed','booked','unknown'].includes(group.operation)
+          || !['order','unknown'].includes(group.stage) || !Array.isArray(group.changes) || group.changes.length > 2000) return false;
+      for (const change of group.changes) {
+        if (!exact(change, 'after,before,changed,field') || !Object.hasOwn(fields, change.field) || typeof change.changed !== 'boolean') return false;
+        const allowed = [...codes[fields[change.field]], 'new', 'unknown'];
+        if (![change.before,change.after].every(values => Array.isArray(values) && values.length <= 50 && values.every(value => typeof value === 'string' && allowed.includes(value)))) return false;
+        total++;
+      }
+    }
+    return total > 0 && total <= 2000 && JSON.stringify({type:'message',workflow:packet}).length <= 60000;
+  }
+
+  async function workflowSourceKey(source, salt) {
+    if (!/^[1-9]\d{0,8}$/.test(source) || !/^[a-f0-9]{64}$/.test(salt || '')) return null;
+    const bytes = new TextEncoder(), hex = data => Array.from(new Uint8Array(data), n => n.toString(16).padStart(2,'0')).join('');
+    const key = await crypto.subtle.importKey('raw', bytes.encode(salt), {name:'HMAC',hash:'SHA-256'}, false, ['sign']);
+    return hex(await crypto.subtle.sign('HMAC', key, bytes.encode('order:' + source)));
+  }
+
+  async function makeWorkflowSnapshot(source, snapshot, salt, version) {
+    const pseudonym = await workflowSourceKey(source, salt);
+    if (!pseudonym) return null;
+    const bytes = new TextEncoder(), hex = data => Array.from(new Uint8Array(data), n => n.toString(16).padStart(2,'0')).join('');
+    // Repeated observations across coworkers have the same id. Revisions are snapshots, not extra actions.
+    const packet = {schema:2, id:'0'.repeat(64), version, source:pseudonym, snapshot};
+    packet.id = hex(await crypto.subtle.digest('SHA-256', bytes.encode(JSON.stringify(packet))));
+    return validateWorkflowSnapshot(packet) ? packet : null;
+  }
+  const WORKFLOW_ACTIONS = Object.freeze([
+    'view', 'profile-open', 'booking-open', 'overview-open', 'phone-click',
+    'registration-open', 'registration-saved', 'authorization-check',
+    'filter-change', 'profile-tab', 'panel-toggle', 'shift-create-open', 'shift-open', 'shift-log-open'
+  ]);
+  const WORKFLOW_VIEWS = Object.freeze(['overview', 'booking', 'profile', 'shift-create', 'shift', 'other']);
+  const WORKFLOW_PREF = 'tpWorkflowEnabledV1';
+  const WORKFLOW_CONFIG = 'tpWorkflowCollectorV1';
+  const WORKFLOW_SEND_MS = 3600000;
+
+  function workflowView(href) {
+    try {
+      const url = new URL(href, ORIGIN);
+      if (url.origin !== ORIGIN) return 'other';
+      return {freevagter:'overview', findvikar:'booking', showvikaroplysninger:'profile', opretvagt:'shift-create', vagt:'shift'}[url.searchParams.get('page')] || 'other';
+    } catch (_) { return 'other'; }
+  }
+
+  function workflowAction(target) {
+    const element = target?.closest?.('a,button,input,select,#log_link');
+    if (!element || element.closest('#tpWorkflowDialog')) return '';
+    if (element.id === 'tpCollapseBtn') return 'panel-toggle';
+    if (element.id === 'tpAuthorizationLookupButton') return 'authorization-check';
+    if (element.id === 'log_link' && workflowView(location.href) === 'shift') return 'shift-log-open';
+    // Classify only known function names; arguments never enter the collected data.
+    const handler = element.getAttribute('onclick') || '';
+    if (/^\s*(?:return\s+)?RingVikarOp\s*\(/.test(handler)) return 'registration-open';
+    if (/^\s*(?:return\s+)?ShowVagtLog\s*\(/.test(handler)) return 'shift-log-open';
+    const href = element.getAttribute('href');
+    if (href?.startsWith('tel:')) return 'phone-click';
+    if (href) {
+      if (href.startsWith('#') && workflowView(location.href) === 'profile'
+          && /^#(stamoplysninger|vagter|kalender|kommunikation|blokering|klager|sygedage)$/.test(href)) return 'profile-tab';
+      // Anchors and javascript actions are not navigation to another booking.
+      if (href.startsWith('#') || /^\s*javascript:/i.test(href)) return '';
+      return {profile:'profile-open', booking:'booking-open', overview:'overview-open', 'shift-create':'shift-create-open', shift:'shift-open'}[workflowView(href)] || '';
+    }
+    return '';
+  }
+
+  function validateWorkflowPacket(packet) {
+    if (packet?.schema === 2) return validateWorkflowSnapshot(packet);
+    const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+    if (!packet || typeof packet !== 'object' || Array.isArray(packet)
+        || Object.keys(packet).sort().join(',') !== 'day,id,schema,steps,version'
+        || packet.schema !== 1 || typeof packet.id !== 'string' || !uuid.test(packet.id)
+        || typeof packet.version !== 'string' || !/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(packet.version)
+        || typeof packet.day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(packet.day) || !Number.isFinite(Date.parse(packet.day))
+        || new Date(packet.day).toISOString().slice(0, 10) !== packet.day
+        || !Array.isArray(packet.steps) || packet.steps.length < 1 || packet.steps.length > 500) return false;
+    return packet.steps.every(step => step && Object.keys(step).sort().join(',') === 'a,g,n,s,v'
+      && WORKFLOW_ACTIONS.includes(step.a) && WORKFLOW_VIEWS.includes(step.v)
+      && Number.isInteger(step.g) && step.g >= 0 && step.g <= 4 && typeof step.s === 'string' && uuid.test(step.s)
+      && Number.isInteger(step.n) && step.n >= 1 && step.n <= 1000000)
+      && JSON.stringify({type:'message', workflow:packet}).length <= 60000;
+  }
+
+  function createWorkflowTracker() {
+    const databaseName = 'tpWorkflowQueueV1', maxAge = 14 * 86400000;
+    let initialized = false, dbPromise = null, broken = false, buffer = [], flushTimer = null;
+    let previousAt = 0, generation = 0, activeRequest = null, interval = null, serial = Promise.resolve();
+    let collector = null, configCheckedAt = 0, collectorExpires = 0, status = 'Afventer opsætning', dropped = 0;
+    let remoteStopped = false, logRequest = null;
+    let segment = '';
+    let sequence = 0;
+    const uuid = () => globalThis.crypto.randomUUID();
+    const enabled = () => {
+      try {
+        const local = localStorage.getItem(WORKFLOW_PREF);
+        if (local === 'false') return false;
+        return GM_getValue(WORKFLOW_PREF, true) === true;
+      } catch (_) { return false; }
+    };
+    function configured() { return collector?.enabled === true && collectorExpires > Date.now(); }
+    function paint() {
+      const checkbox = document.getElementById('tpWorkflowEnabled');
+      if (checkbox) checkbox.checked = enabled();
+      const label = document.getElementById('tpWorkflowStatus');
+      if (label) label.textContent = !enabled() ? 'Slået fra' : broken ? 'Lokalt lager utilgængeligt' : status;
+    }
+    function fail() { broken = true; buffer = []; paint(); }
+    function open() {
+      if (broken) return Promise.resolve(null);
+      if (dbPromise) return dbPromise;
+      dbPromise = new Promise(resolve => {
+        let done = false;
+        const finish = db => { if (done) { db?.close(); return; } done = true; clearTimeout(timer); if (!db) fail(); resolve(db); };
+        const timer = setTimeout(() => finish(null), 3000);
+        try {
+          const request = indexedDB.open(databaseName, 3);
+          request.onupgradeneeded = () => {
+            for (const name of ['events', 'packets', 'logs']) {
+              if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name, {keyPath:'id'}).createIndex('at', 'at');
+            }
+            const events = request.transaction.objectStore('events');
+            // UUID order is random; retain per-page order when timestamps are equal.
+            if (!events.indexNames.contains('order')) events.createIndex('order', ['at', 'segment', 'step.n']);
+          };
+          request.onerror = request.onblocked = () => finish(null);
+          request.onsuccess = () => {
+            const db = request.result;
+            db.onversionchange = () => { db.close(); dbPromise = null; };
+            finish(db);
+          };
+        } catch (_) { finish(null); }
+      });
+      return dbPromise;
+    }
+    async function transact(mode, work) {
+      const db = await open();
+      if (!db) throw new Error('Workflow storage unavailable');
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(['events', 'packets', 'logs'], mode);
+        let value, done = false;
+        const finish = error => { if (done) return; done = true; clearTimeout(timer); error ? reject(error) : resolve(value); };
+        const timer = setTimeout(() => { try { tx.abort(); } catch (_) {} finish(new Error('Workflow storage timeout')); }, 3000);
+        tx.oncomplete = () => finish();
+        tx.onerror = tx.onabort = () => finish(new Error('Workflow storage unavailable'));
+        try { work(tx, result => { value = result; }); } catch (error) { try { tx.abort(); } catch (_) {} finish(error); }
+      });
+    }
+    function prune(store, maximum) {
+      const expired = store.index('at').openCursor(IDBKeyRange.upperBound(Date.now() - maxAge));
+      expired.onsuccess = () => {
+        const row = expired.result;
+        if (row) { row.delete(); row.continue(); return; }
+        const count = store.count();
+        count.onsuccess = () => {
+          let excess = count.result - maximum;
+          if (excess <= 0) return;
+          const oldest = store.index('at').openCursor();
+          oldest.onsuccess = () => { const item = oldest.result; if (item && excess-- > 0) { dropped++; item.delete(); item.continue(); } };
+        };
+      };
+    }
+    function flush() {
+      clearTimeout(flushTimer); flushTimer = null;
+      const rows = buffer.splice(0, 100), epoch = generation;
+      serial = serial.then(async () => {
+        if (!enabled() || epoch !== generation || broken) return;
+        await transact('readwrite', tx => {
+          if (!enabled() || epoch !== generation) return;
+          const store = tx.objectStore('events');
+          for (const row of rows) store.put(row);
+          prune(store, 2000); prune(tx.objectStore('packets'), 32);
+        });
+      }).catch(fail);
+      return serial;
+    }
+    function record(action, view = workflowView(location.href)) {
+      try {
+        if (!initialized || !enabled() || !configured() || broken || document.hidden
+            || !WORKFLOW_ACTIONS.includes(action) || !WORKFLOW_VIEWS.includes(view)) return;
+        const at = Date.now(), gap = previousAt ? at - previousAt : -1;
+        previousAt = at;
+        if (buffer.length >= 100 || sequence >= 1000000) { dropped++; return; }
+        if (!segment) segment = uuid();
+        buffer.push({id:uuid(), at, segment, version:TP_VERSION,
+          step:{a:action, v:view, s:segment, n:++sequence, g:gap < 0 ? 0 : gap < 5000 ? 1 : gap < 30000 ? 2 : gap < 120000 ? 3 : 4}});
+        if (!flushTimer) flushTimer = setTimeout(() => void flush(), 250);
+      } catch (_) { fail(); }
+    }
+    async function nextPacket() {
+      await flush();
+      return transact('readwrite', (tx, set) => {
+        const packets = tx.objectStore('packets'), existing = packets.index('at').openCursor();
+        existing.onsuccess = () => {
+          const row = existing.result;
+          if (row) {
+            if (!Number.isFinite(row.value.at) || row.value.at <= Date.now() - maxAge
+                || row.value.at > Date.now() + 60000 || !validateWorkflowPacket(row.value.packet)) { row.delete(); row.continue(); return; }
+            if (row.value.attempts >= 3 || row.value.retryAt > Date.now()) { row.continue(); return; }
+            set(row.value.packet); return;
+          }
+          const events = tx.objectStore('events'), cursor = events.index('order').openCursor(), selected = [];
+          let day = '', version = '';
+          function save() {
+            if (!selected.length) return;
+            const packet = {schema:1, id:uuid(), day, version, steps:selected.map(item => item.step)};
+            if (validateWorkflowPacket(packet)) packets.put({id:packet.id, at:selected[0].at, packet});
+            for (const item of selected) events.delete(item.id);
+            if (validateWorkflowPacket(packet)) set(packet);
+          }
+          cursor.onsuccess = () => {
+            const item = cursor.result;
+            if (!item) { save(); return; }
+            const event = item.value;
+            if (!Number.isFinite(event.at) || event.at <= Date.now() - maxAge || event.at > Date.now() + 60000
+                || !validateWorkflowPacket({schema:1,id:event.id,day:'2026-01-01',version:event.version,steps:[event.step]})) {
+              item.delete(); item.continue(); return;
+            }
+            const eventDay = new Date(event.at).toISOString().slice(0, 10);
+            if (!selected.length) { day = eventDay; version = event.version; }
+            if (selected.length >= 500 || eventDay !== day || event.version !== version) { save(); return; }
+            selected.push(event); item.continue();
+          };
+        };
+      });
+    }
+    function reset() {
+      generation++; previousAt = 0; buffer = []; segment = ''; sequence = 0;
+      clearTimeout(flushTimer); flushTimer = null;
+      try { activeRequest?.abort(); } catch (_) {}
+      activeRequest = null;
+      logRequest?.abort(); logRequest = null;
+      serial = serial.then(() => transact('readwrite', tx => {
+        tx.objectStore('events').clear(); tx.objectStore('packets').clear(); tx.objectStore('logs').clear();
+      })).catch(fail);
+      paint(); return serial;
+    }
+    async function setEnabled(value) {
+      try {
+        GM_setValue(WORKFLOW_PREF, value === true);
+        localStorage.setItem(WORKFLOW_PREF, value === true ? 'true' : 'false');
+      } catch (_) { fail(); }
+      if (!value) await reset();
+      else { readConfig(); record('view'); }
+      paint();
+    }
+    // Deployment stays closed until a verified receiver configuration is available.
+    function validateConfig(value) {
+      if (!value || value.schema !== 1 || value.policy !== 'workflow-v1' || value.enabled !== true) return null;
+      try {
+        const url = new URL(value.url);
+        if (url.protocol !== 'https:' || url.username || url.password || url.hash
+            || url.hostname !== 'default5ba2afb43ff949bbbbec063d521acc.76.environment.api.powerplatform.com'
+            || url.pathname !== '/powerautomate/automations/direct/cu/29/workflows/fe2cae7e5732481daa988a5292a4fb26/triggers/manual/paths/invoke'
+            || !url.searchParams.get('sig')) return null;
+        if (value.salt !== undefined && !/^[a-f0-9]{64}$/.test(value.salt)) return null;
+        return {enabled:true, url:url.href, ...(value.salt ? {salt:value.salt} : {})};
+      } catch (_) { return null; }
+    }
+    async function refreshConfig() {
+      if (Date.now() - configCheckedAt < 900000) return;
+      configCheckedAt = Date.now();
+      const response = await gmRequest({url:spListBaseUrl() + "/items?$select=Enabled,SetupData&$filter="
+        + encodeURIComponent("Title eq 'WorkflowCollector'") + '&$top=2', headers:{Accept:'application/json;odata=nometadata'}});
+      const rows = JSON.parse(response.responseText).value;
+      if (!Array.isArray(rows)) throw new Error('Workflow configuration unavailable');
+      collector = Array.isArray(rows) && rows.length === 1 && rows[0].Enabled === true
+        ? validateConfig(JSON.parse(rows[0].SetupData)) : null;
+      collectorExpires = configCheckedAt + 1800000;
+      const disabled = rows.length === 1 && rows[0].Enabled === false;
+      GM_setValue(WORKFLOW_CONFIG, {checkedAt:configCheckedAt, value:collector, disabled});
+      if (disabled && !remoteStopped) { remoteStopped = true; await reset(); }
+      if (collector) remoteStopped = false;
+      status = disabled ? 'Deaktiveret centralt' : collector ? 'Klar' : 'Afventer opsætning'; paint();
+    }
+    function readConfig() {
+      try {
+        const saved = GM_getValue(WORKFLOW_CONFIG, null);
+        if (saved?.disabled === true) {
+          status = 'Deaktiveret centralt';
+          if (!remoteStopped) { remoteStopped = true; void reset(); }
+        }
+        if (saved?.checkedAt > Date.now() - 1800000 && saved.checkedAt <= Date.now() + 60000) {
+          collector = saved.disabled !== true && saved.value?.enabled ? validateConfig({schema:1, policy:'workflow-v1', ...saved.value}) : null;
+          if (collector) remoteStopped = false;
+          collectorExpires = saved.checkedAt + 1800000;
+        }
+        else collector = null;
+      } catch (_) { collector = null; }
+    }
+    function send(packet, epoch) {
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (error, response) => {
+          if (settled) return; settled = true; clearTimeout(timer); activeRequest = null;
+          if (error) reject(new Error('Workflow delivery unconfirmed')); else resolve(response);
+        };
+        const timer = setTimeout(() => { try { activeRequest?.abort(); } catch (_) {} finish(true); }, 15000);
+        if (!enabled() || epoch !== generation || !configured()) { finish(true); return; }
+        try {
+          activeRequest = GM_xmlhttpRequest({method:'POST', url:collector.url, anonymous:true,
+            headers:{'Content-Type':'application/json'}, data:JSON.stringify({type:'message', workflow:packet}), timeout:15000,
+            onload:response => {
+              try {
+                if (response.status === 202) { finish(null, {accepted:true}); return; }
+                const receipt = JSON.parse(response.responseText);
+                if (response.status !== 200 || receipt.stored !== true || receipt.id !== packet.id) return finish(true);
+                finish(null, receipt);
+              } catch (_) { finish(true); }
+            }, onerror:() => finish(true), ontimeout:() => finish(true), onabort:() => finish(true)});
+        } catch (_) { finish(true); }
+      });
+    }
+    async function collectShiftLog() {
+      if (!initialized || !enabled() || !configured() || !collector.salt || broken || document.hidden || !navigator.locks?.request) return;
+      const source = workflowShiftSource(document, location.href);
+      if (!source) return;
+      try {
+        await navigator.locks.request('tpWorkflowLogV1', {ifAvailable:true}, async lock => {
+          if (!lock) return;
+          const epoch = generation, salt = collector.salt, key = await workflowSourceKey(source.order, salt);
+          if (!key || !initialized || !enabled() || !configured() || epoch !== generation) return;
+          const previous = await transact('readonly', (tx, set) => {
+            const request = tx.objectStore('logs').get(key); request.onsuccess = () => set(request.result);
+          });
+          if (previous?.at > Date.now() - WORKFLOW_SEND_MS && previous.at <= Date.now()) return;
+          const last = GM_getValue('tpWorkflowLastLogAtV1', 0);
+          if (last > Date.now() - 10000 && last <= Date.now()) return;
+          GM_setValue('tpWorkflowLastLogAtV1', Date.now());
+          const controller = new AbortController(); logRequest = controller;
+          const timer = setTimeout(() => controller.abort(), 8000);
+          let snapshot;
+          try {
+            const response = await fetch(source.url, {credentials:'same-origin', cache:'no-store', signal:controller.signal});
+            if (!response.ok) throw new Error('Workflow log unavailable');
+            const html = await response.text();
+            if (html.length > 1000000) throw new Error('Workflow log size limit');
+            snapshot = parseWorkflowShiftLog(new DOMParser().parseFromString(html, 'text/html'));
+          } finally { clearTimeout(timer); if (logRequest === controller) logRequest = null; }
+          const packet = await makeWorkflowSnapshot(source.order, snapshot, salt, TP_VERSION);
+          if (!initialized || !enabled() || !configured() || epoch !== generation) return;
+          if (!packet) { status = 'Vagtlog kunne ikke genkendes; intet udtræk gemt'; paint(); return; }
+          await transact('readwrite', tx => {
+            if (!initialized || !enabled() || !configured() || epoch !== generation) return;
+            if (previous?.packetId !== packet.id) tx.objectStore('packets').put({id:packet.id, at:Date.now(), packet});
+            tx.objectStore('logs').put({id:key, at:Date.now(), packetId:packet.id});
+            prune(tx.objectStore('logs'), 200); prune(tx.objectStore('packets'), 32);
+          });
+        });
+      } catch (_) { status = 'Vagtlog afventer; øvrig registrering fortsætter'; paint(); }
+    }
+    async function tick() {
+      if (!enabled() || !initialized || broken || !navigator.locks?.request) return;
+      try {
+        await navigator.locks.request('tpWorkflowSendV1', {ifAvailable:true}, async lock => {
+          if (!lock || !enabled()) return;
+          const epoch = generation;
+          await transact('readwrite', tx => {
+            prune(tx.objectStore('events'), 2000); prune(tx.objectStore('packets'), 32); prune(tx.objectStore('logs'), 200);
+          });
+          readConfig();
+          // Only the elected tab fetches configuration. Logs are limited to visible working pages.
+          if (isLeader()) await refreshConfig();
+          if (!configured() || !enabled() || epoch !== generation) return;
+          await collectShiftLog();
+          const nextSend = GM_getValue('tpWorkflowNextSendAtV1', 0);
+          if (Number.isFinite(nextSend) && nextSend > Date.now() && nextSend <= Date.now() + WORKFLOW_SEND_MS) return;
+          const packet = await nextPacket();
+          if (!packet || !enabled() || epoch !== generation) return;
+          GM_setValue('tpWorkflowNextSendAtV1', Date.now() + WORKFLOW_SEND_MS);
+          status = 'Sender opsummering'; paint();
+          const receipt = await send(packet, epoch);
+          if (!enabled() || epoch !== generation) return;
+          await transact('readwrite', tx => {
+            const packets = tx.objectStore('packets');
+            if (receipt.stored === true) { packets.delete(packet.id); return; }
+            const request = packets.get(packet.id);
+            request.onsuccess = () => {
+              const row = request.result;
+              if (row) { row.attempts = (row.attempts || 0) + 1; row.retryAt = Date.now() + (row.attempts === 1 ? 1 : 3) * 86400000; packets.put(row); }
+            };
+          });
+          status = receipt.stored ? 'Seneste opsummering gemt' : 'Modtaget til behandling; lokal kopi beholdes'; paint();
+        });
+      } catch (_) { status = 'Indsendelse afventer; data beholdes lokalt'; paint(); }
+    }
+    function onClick(event) { if (event.isTrusted) { const action = workflowAction(event.target); if (action) record(action); } }
+    function onChange(event) {
+      if (event.isTrusted && workflowView(location.href) === 'booking'
+          && event.target?.matches?.('#kunde_type_select_input, #container_bookingfiltre input[type="checkbox"]')) record('filter-change');
+    }
+    function onStorage(event) {
+      if (event.key === WORKFLOW_PREF) {
+        if (!enabled()) void reset();
+        paint();
+      }
+    }
+    function onPageHide() { void flush(); }
+    function init() {
+      if (initialized) return;
+      initialized = true; readConfig();
+      document.addEventListener('click', onClick, true);
+      document.addEventListener('change', onChange, true);
+      window.addEventListener('storage', onStorage);
+      window.addEventListener('pagehide', onPageHide);
+      interval = setInterval(() => { readConfig(); void tick(); }, 600000);
+      if (!GM_getValue('tpWorkflowNextSendAtV1', 0)) GM_setValue('tpWorkflowNextSendAtV1', Date.now() + WORKFLOW_SEND_MS);
+      if (!enabled()) { void reset(); return; }
+      record('view');
+      void collectShiftLog();
+      if (!configured() && enabled() && isLeader()) {
+        void refreshConfig().then(() => { record('view'); void collectShiftLog(); }).catch(() => { status = 'Afventer forbindelse'; paint(); });
+      }
+    }
+    async function report() {
+      await flush();
+      return transact('readonly', (tx, set) => {
+        const events = tx.objectStore('events').getAll(), packets = tx.objectStore('packets').getAll();
+        packets.onsuccess = () => set({events:events.result, packets:packets.result, dropped});
+      });
+    }
+    function menu(parent) {
+      if (parent.querySelector('#tpWorkflowSection')) return;
+      const section = document.createElement('div'); section.id = 'tpWorkflowSection';
+      section.style.cssText = 'border-top:1px solid #eee;margin-top:10px;padding-top:8px;font-size:12px';
+      section.innerHTML = '<label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="tpWorkflowEnabled">Hjælp til udvikling</label>'
+        + '<div id="tpWorkflowStatus" role="status" style="margin-top:4px;font-size:11px;color:#666"></div>'
+        + '<button type="button" id="tpWorkflowInfo" class="tp-diagnostic-button" style="margin-top:6px">Om registreringen</button>';
+      parent.appendChild(section);
+      section.querySelector('input').addEventListener('change', event => { void setEnabled(event.target.checked); });
+      section.querySelector('button').addEventListener('click', show);
+      paint();
+    }
+    function show() {
+      document.getElementById('tpWorkflowDialog')?.remove();
+      const dialog = document.createElement('dialog'); dialog.id = 'tpWorkflowDialog';
+      dialog.style.cssText = 'box-sizing:border-box;width:360px;max-width:calc(100vw - 24px);max-height:80vh;overflow:auto;border:1px solid #bbb;border-radius:6px;padding:16px;font:13px/1.5 Arial,sans-serif;color:#333;background:#fff';
+      dialog.innerHTML = '<h3 style="font-size:15px;margin:0 0 10px">Hjælp til udvikling</h3>'
+        + '<p>Formål: færre klik og bedre arbejdsgange. Kendte handlinger og rækkefølger registreres, ikke tastetryk, navne, numre eller beskedtekst. Klik er ikke bevis for en gennemført handling.</p>'
+        + '<p>For besøgte enkeltvagter læses udvalgte ændringslogfelter: uddannelse, kendte kompetencer og om kommentarfelter er udfyldt eller ændret. Teksten gemmes ikke. Logudtræk er øjebliksbilleder, ikke en komplet optælling af handlinger.</p>'
+        + '<p>Opsummeringer sendes højst én gang i timen til Daniels private arbejdsliste i SharePoint. En accepteret indsendelse beviser ikke, at data er gemt. Data er ikke garanteret anonyme; tjenestens administratorer kan have særlig adgang.</p>'
+        + '<p>Lokalt beholdes højst 2.000 handlinger og 32 pakker i op til 14 dage. Den private liste ryddes dagligt for poster ældre end 14 dage. SharePoints papirkurv og organisationens opbevaringsregler kan bevare kopier længere. Fravalg stopper indsendelse og rydder den lokale kø; allerede afsendte data trækkes ikke tilbage.</p>'
+        + '<p id="tpWorkflowQueueCount" role="status">Kontrollerer lokal kø...</p>'
+        + '<button type="button" class="tp-diagnostic-button">Luk</button>';
+      dialog.querySelector('button').onclick = () => dialog.close();
+      dialog.addEventListener('close', () => dialog.remove());
+      document.body.appendChild(dialog); dialog.showModal();
+      void report().then(result => {
+        dialog.querySelector('#tpWorkflowQueueCount').textContent = result.events.length + ' handlinger og ' + result.packets.length + ' pakker afventer. ' + result.dropped + ' poster udeladt ved kapacitetsgrænsen.';
+      }).catch(() => { dialog.querySelector('#tpWorkflowQueueCount').textContent = 'Den lokale kø kunne ikke læses.'; });
+    }
+    return Object.freeze({init, menu, paint, show, record, enabled, setEnabled, flush, nextPacket, report, tick, validateConfig, collectShiftLog,
+      stop:() => {
+        clearInterval(interval); void flush(); initialized = false;
+        document.removeEventListener('click', onClick, true);
+        document.removeEventListener('change', onChange, true);
+        window.removeEventListener('storage', onStorage);
+        window.removeEventListener('pagehide', onPageHide);
+        try { activeRequest?.abort(); } catch (_) {}
+        logRequest?.abort();
+      }});
+  }
+
+  const workflowTracker = createWorkflowTracker();
   function injectIPnordicGuideStyles() {
     if (document.getElementById('tpIPnordicGuideStyles')) return;
     const style = document.createElement('style');
@@ -4464,6 +5088,7 @@
 
       document.body.appendChild(menu);
       initContactSyncMenu(menu);
+      workflowTracker.menu(menu);
       menu.querySelector('#tpDiagDetail').addEventListener('change', event => diagnostics.detail(event.target.checked));
       menu.querySelector('#tpDiagShow').addEventListener('click', () => { toggleMenu(false); diagnostics.show(); });
       menu.querySelector('#tpEventJournalShow').addEventListener('click', () => {toggleMenu(false);void eventJournal.show();});
@@ -4548,6 +5173,7 @@
       if (element.style.display !== 'block') return;
       element.style.visibility = 'hidden';
       paintContactSyncUI();
+      workflowTracker.paint();
       positionMenu(element);
       element.style.visibility = 'visible';
       ensureFullyVisible(element);
@@ -6133,6 +6759,7 @@
       icon.src = 'images/phone_accept.png';
       icon.alt = 'Opkald registreret';
       phoneDiv.replaceChildren(icon);
+      runtimeGuard.run('workflow', () => workflowTracker.record('registration-saved'));
     } catch (_) {
       showToast('Registreringen kunne ikke bekræftes. Kontrollér via telefonikonet før du prøver igen.');
     } finally {
@@ -6231,7 +6858,6 @@
     });
     observer.observe(document.body, { childList: true, subtree: true });
   }
-
   let pollingStarted = false, runtimeStarted = false;
   function startPolling() {
     if (pollingStarted) return;
@@ -6299,10 +6925,17 @@
     startPolling();
     runtimeGuard.run('contacts', initWorkerContactSync);
     runtimeGuard.run('sharing', () => diagnosticSharing.init());
+    runtimeGuard.run('workflow', () => workflowTracker.init());
     paintRuntimeWarning();
   }
   const TEST_API = Object.freeze({
     createRuntimeSupervisor,
+    createWorkflowTracker,
+    workflowTracker,
+    validateWorkflowPacket,
+    workflowAction,
+    workflowView,
+    parseWorkflowShiftLog,
     runtimeGuard,
     normalizeContactPhone,
     validateContactSnapshot,
