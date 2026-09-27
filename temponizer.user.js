@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.18
+// @version      7.14.19
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -22,8 +22,7 @@
 
 (() => {
   'use strict';
-
-  const TP_VERSION = '7.14.18';
+  const TP_VERSION = '7.14.19';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -141,7 +140,207 @@
     key: 'tpContactSyncEnabledV1', stateKey: 'tpContactSyncStateV1', interval: 60 * 60 * 1000
   });
   let contactSyncInFlight = false;
+  const eventJournal = createEventJournal();
 
+  function createEventJournal() {
+    const databaseName = 'tpEventJournalV1';
+    const maxAge = 7 * 86400000, maxEntries = 2000, maxEntryBytes = 768;
+    const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+    const kinds = new Set(['messages','interest','mail','phone','runtime']);
+    const stages = new Set(['detected','poll','delivery','call','start']);
+    const statuses = new Set(['ok','partial','baseline','failed','timeout','login','network','http','unknown',
+      'queued','sending','sent','retry','waiting','blocked','cancelled','expired','handled','ignored','duplicate']);
+    const causes = new Set(['source','recipient','configuration','unknown']);
+    const kindLabels = {messages:'Beskeder',interest:'Interesser',mail:'Mail',phone:'Telefon',runtime:'Script'};
+    const stageLabels = {detected:'Opdaget',poll:'Kontrol',delivery:'Afsendelse',call:'Opkald',start:'Start'};
+    const statusLabels = {ok:'OK',partial:'Ufuldstændig',baseline:'Startniveau',failed:'Fejl',timeout:'Timeout',login:'Login kræves',
+      network:'Netværksfejl',http:'Serverfejl',unknown:'Ukendt udfald',queued:'I kø',sending:'Sender',sent:'Accepteret af Pushover',
+      retry:'Nyt forsøg afventer',waiting:'Afventer',blocked:'Stoppet',cancelled:'Annulleret',expired:'Udløbet',handled:'Vist',ignored:'Ignoreret',duplicate:'Dublet'};
+    let ready = false, unavailable = false, databasePromise = null, pending = [], memory = [], timer = null, flushing = null, dropped = 0;
+    const sampled = new Map();
+    const newTrace = () => { try { return crypto.randomUUID(); } catch (_) { return ''; } };
+    const validTrace = value => typeof value === 'string' && uuid.test(value);
+    function sanitize(value) {
+      if (!value || !validTrace(value.id) || !kinds.has(value.kind) || !stages.has(value.stage) || !statuses.has(value.status)) return null;
+      if (!Number.isFinite(value.at) || value.at < Date.now()-maxAge || value.at > Date.now()+60000) return null;
+      if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(value.version)) return null;
+      const row = {id:value.id,at:value.at,version:value.version,kind:value.kind,stage:value.stage,status:value.status};
+      if (validTrace(value.trace)) row.trace = value.trace;
+      if (causes.has(value.cause)) row.cause = value.cause;
+      for (const key of ['count','attempt','durationMs']) {
+        if (Number.isFinite(value[key]) && value[key]>=0 && value[key]<=3600000) row[key]=Math.round(value[key]);
+      }
+      return JSON.stringify(row).length*2 <= maxEntryBytes ? row : null;
+    }
+    function open() {
+      if (unavailable) return Promise.resolve(null);
+      if (databasePromise) return databasePromise;
+      databasePromise = new Promise(resolve => {
+        let settled = false;
+        const finish = db => { if (settled) { db?.close(); return; } settled=true; clearTimeout(timeout); if (!db) unavailable=true; resolve(db); };
+        const timeout = setTimeout(()=>finish(null),5000);
+        try {
+          const request = indexedDB.open(databaseName,1);
+          request.onupgradeneeded = () => {
+            const db = request.result;
+            db.createObjectStore('events',{keyPath:'id'}).createIndex('at','at');
+            db.createObjectStore('meta');
+          };
+          request.onerror = request.onblocked = () => finish(null);
+          request.onsuccess = () => {
+            const db = request.result;
+            db.onversionchange = () => { db.close(); databasePromise=null; };
+            finish(db);
+          };
+        } catch (_) { finish(null); }
+      });
+      return databasePromise;
+    }
+    function transaction(db, rows) {
+      return new Promise((resolve,reject) => {
+        const tx = db.transaction(['events','meta'],'readwrite');
+        const store = tx.objectStore('events');
+        let finished = false;
+        const timer = setTimeout(()=>{try {tx.abort();} catch (_) {} if (!finished) {finished=true;reject(new Error('Journal timeout'));}},5000);
+        const done = error => {if (finished) return;finished=true;clearTimeout(timer);error?reject(error):resolve();};
+        tx.oncomplete = () => done();
+        tx.onabort = tx.onerror = () => done(new Error('Journal storage unavailable'));
+        for (const row of rows) {const clean=sanitize(row);if(clean)store.put(clean);}
+        const expired = store.index('at').openCursor(IDBKeyRange.upperBound(Date.now()-maxAge,true));
+        expired.onsuccess = () => {
+          const cursor = expired.result;
+          if (cursor) {cursor.delete();cursor.continue();return;}
+          const count = store.count();
+          count.onsuccess = () => {
+            let excess = count.result-maxEntries;
+            if (excess<=0) return;
+            tx.objectStore('meta').put(Date.now(),'overflowAt');
+            const oldest=store.index('at').openCursor();
+            oldest.onsuccess=()=>{const item=oldest.result;if(item&&excess-->0){item.delete();item.continue();}};
+          };
+        };
+      });
+    }
+    function flush() {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      if (!ready) return Promise.resolve();
+      if (flushing) return flushing;
+      flushing = (async()=>{
+        try {
+          const db=await open();
+          if(!db){pending=[];return;}
+          do {await transaction(db,pending.splice(0,100));} while(pending.length);
+        } catch (_) {unavailable=true;pending=[];}
+      })().finally(()=>{flushing=null;});
+      return flushing;
+    }
+    function record(kind,stage,status,data={}) {
+      try {
+        if(!ready)return;
+        const row=sanitize({...data,id:newTrace(),at:Date.now(),version:TP_VERSION,kind,stage,status});
+        if(!row)return;
+        memory=memory.filter(item=>item.at>=Date.now()-maxAge).slice(-199);memory.push(row);
+        if(unavailable)return;
+        if(pending.length>=1000){dropped++;return;}
+        pending.push(row);
+        if(!timer)timer=setTimeout(()=>void flush(),250);
+      } catch (_) {}
+    }
+    function observe(scope,event,data={}) {
+      try {
+        if(!ready||!kinds.has(scope))return;
+        if(scope==='runtime'){if(event==='start')record(scope,'start','ok');return;}
+        if(event==='snapshot'&&data.count>0&&['messages','interest'].includes(scope)) {
+          record(scope,'detected',data.outcome==='partial'?'partial':'ok',{count:data.count});
+        }
+        if(scope==='phone'&&['call','test'].includes(event)) {
+          record(scope,'call',statuses.has(data.outcome)?data.outcome:'unknown');return;
+        }
+        if(!['snapshot','error','finish','slow'].includes(event))return;
+        if(['messages','interest'].includes(scope)&&['finish','slow'].includes(event))return;
+        const status=event==='error'?(statuses.has(data.outcome)?data.outcome:'failed')
+          : ['partial','baseline'].includes(data.outcome)?data.outcome:'ok';
+        const sampleKey=scope+(event==='error'?':error:'+status:':poll');
+        const previous=sampled.get(sampleKey), interval=status==='ok'?3600000:300000;
+        if(previous?.status===status&&Date.now()-previous.at<interval)return;
+        sampled.set(sampleKey,{status,at:Date.now()});
+        record(scope,'poll',status,{durationMs:data.durationMs});
+      } catch (_) {}
+    }
+    function delivery(job,previous) {
+      try {
+        if(previous?.status===job.status&&previous?.attempts===job.attempts&&previous?.reason===job.reason)return;
+        const kind={msg:'messages',int:'interest',mail:'mail'}[job.kind];
+        if(!kind)return;
+        let cause;
+        if(job.status==='waiting'||job.status==='blocked')cause=/SharePoint/.test(job.reason||'')?'configuration'
+          : /modtager|Pushover-nøgle/.test(job.reason||'')?'recipient':/kontrol|initialisering/.test(job.reason||'')?'source':'unknown';
+        record(kind,'delivery',job.status,{trace:job.diagnosticTrace,attempt:job.attempts,
+          count:Array.isArray(job.events)?job.events.length:undefined,cause});
+      } catch (_) {}
+    }
+    async function report(limit=maxEntries) {
+      await flush();
+      let rows=[],overflowAt=0;
+      try {
+        const db=await open();
+        if(db) {
+          const result=await new Promise((resolve,reject)=>{
+            const tx=db.transaction(['events','meta'],'readonly');
+            const all=tx.objectStore('events').getAll(),overflow=tx.objectStore('meta').get('overflowAt');
+            const timer=setTimeout(()=>{try{tx.abort();}catch(_){}reject(new Error('Journal timeout'));},5000);
+            tx.oncomplete=()=>{clearTimeout(timer);resolve({rows:all.result,overflowAt:overflow.result});};
+            tx.onerror=tx.onabort=()=>{clearTimeout(timer);reject(new Error('Journal unavailable'));};
+          });
+          rows=result.rows;overflowAt=result.overflowAt;
+        }
+      } catch (_) {unavailable=true;}
+      if(unavailable)rows=memory;
+      const clean=rows.map(sanitize).filter(Boolean).sort((a,b)=>b.at-a.at||a.id.localeCompare(b.id)).slice(0,maxEntries);
+      const size=Number.isInteger(limit)?Math.max(0,Math.min(maxEntries,limit)):maxEntries;
+      return {schema:1,retentionDays:7,maxEntries,maxEntryBytes,storageAvailable:!unavailable,
+        truncated:dropped>0||(Number.isFinite(overflowAt)&&overflowAt>=Date.now()-maxAge),
+        count:clean.length,entries:clean.slice(0,size)};
+    }
+    async function show() {
+      document.getElementById('tpEventJournalDialog')?.remove();
+      const dialog=document.createElement('dialog');dialog.id='tpEventJournalDialog';dialog.setAttribute('aria-label','Hændelser - seneste 7 dage');
+      dialog.style.cssText='box-sizing:border-box;width:660px;max-width:calc(100vw - 24px);max-height:80vh;overflow:auto;padding:14px;border:1px solid #bcc4ca;border-radius:4px;background:#fff;color:#20272b;font:12px/1.5 Arial,sans-serif;letter-spacing:0';
+      dialog.innerHTML='<button type="button" data-close aria-label="Luk" style="float:right;width:28px;height:28px">&times;</button>'
+        +'<strong>Hændelser - seneste 7 dage</strong><div style="clear:both;display:flex;gap:8px;flex-wrap:wrap;margin:12px 0">'
+        +'<select aria-label="Dato" data-date><option value="">Alle datoer</option></select>'
+        +'<select aria-label="Område" data-kind><option value="">Alle områder</option></select></div>'
+        +'<div role="status" data-status>Indlæser…</div><div data-rows></div>';
+      dialog.querySelector('[data-close]').onclick=()=>dialog.close();
+      dialog.addEventListener('close',()=>dialog.remove(),{once:true});document.body.appendChild(dialog);dialog.showModal();
+      const data=await report();if(!dialog.isConnected)return;
+      const dateKey=at=>{const date=new Date(at);return [date.getFullYear(),String(date.getMonth()+1).padStart(2,'0'),String(date.getDate()).padStart(2,'0')].join('-');};
+      const dates=dialog.querySelector('[data-date]'),kind=dialog.querySelector('[data-kind]');
+      for(const date of [...new Set(data.entries.map(row=>dateKey(row.at)))])dates.add(new Option(date.split('-').reverse().join('.'),date));
+      for(const [value,label] of Object.entries(kindLabels))kind.add(new Option(label,value));
+      const render=()=>{
+        const rows=data.entries.filter(row=>(!dates.value||dateKey(row.at)===dates.value)&&(!kind.value||row.kind===kind.value));
+        dialog.querySelector('[data-status]').textContent=(data.storageAvailable?'':'Kun denne fane: lagring utilgængelig. ')
+          +(data.truncated?'Loggrænsen er nået. ':'')+(rows.length?Math.min(200,rows.length)+' af '+rows.length+' hændelser':'Ingen hændelser');
+        const list=dialog.querySelector('[data-rows]');list.replaceChildren();
+        for(const row of rows.slice(0,200)) {
+          const line=document.createElement('div');line.style.cssText='padding:7px 0;border-bottom:1px solid #ddd;overflow-wrap:anywhere';
+          line.textContent=new Date(row.at).toLocaleString('da-DK',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'})
+            +' · '+kindLabels[row.kind]+' · '+stageLabels[row.stage]+' · '+statusLabels[row.status]
+            +(row.count!=null?' · antal '+row.count:'')+(row.attempt!=null?' · forsøg '+row.attempt:'')+(row.trace?' · #'+row.trace.slice(0,8):'');
+          if(row.trace)line.title=row.trace;
+          list.appendChild(line);
+        }
+      };
+      dates.onchange=kind.onchange=render;render();
+    }
+    function init() {
+      if(ready)return;ready=true;void flush();
+      window.addEventListener('pagehide',()=>void flush());
+    }
+    return {init,observe,delivery,record,flush,report,show,newTrace,validTrace};
+  }
   // Diagnostics accept only fixed event names, enums and bounded counters, never payloads.
   const diagnostics = createDiagnostics();
   const diagnosticSharing = createDiagnosticSharing();
@@ -209,14 +408,22 @@
       const repo = await request(token);
       if (repo?.private !== true || repo.full_name !== repository || repo.archived || repo.has_issues !== true) throw blockedError();
     }
-    function body(id) {
+    async function body(id) {
       const report = diagnostics.report();
+      const history = await eventJournal.report(100);
       const entries = report.runtimes.flatMap(runtime => runtime.entries.map(entry=>({...entry,runtime:runtime.runtime,version:runtime.version})))
         .sort((a,b)=>b.at-a.at).slice(0,200);
-      return '<!-- tp-diagnostics-v1:' + id + ' -->\n```json\n' + JSON.stringify({
+      const payload = {
         schema:1,version:TP_VERSION,generatedAt:report.generatedAt,detailed:report.detailed,
-        storageAvailable:report.storageAvailable,entries
-      }) + '\n```';
+        storageAvailable:report.storageAvailable,entries,history
+      };
+      let json = JSON.stringify(payload);
+      while (json.length > 57000 && (entries.length || history.entries.length)) {
+        const oldLog = entries.at(-1)?.at ?? Infinity, oldHistory = history.entries.at(-1)?.at ?? Infinity;
+        if (oldLog <= oldHistory) entries.pop(); else history.entries.pop();
+        json = JSON.stringify(payload);
+      }
+      return '<!-- tp-diagnostics-v1:' + id + ' -->\n```json\n' + json + '\n```';
     }
     async function sync(force = false) {
       if (busy || (!force && !isLeader()) || !config()?.enabled) return;
@@ -245,7 +452,9 @@
             }
             const latest = config();
             if (!latest?.enabled || latest.id !== current.id || latest.token !== current.token) return;
-            const reportBody = body(current.id);
+            const reportBody = await body(current.id);
+            const afterReport = config();
+            if (!afterReport?.enabled || afterReport.id !== current.id || afterReport.token !== current.token) return;
             if (reportBody.length > 60000) throw blockedError();
             const result = issue
               ? await request(current.token,'/issues/'+issue.number,'PATCH',{body:reportBody})
@@ -344,7 +553,9 @@
     }
     function record(scope, event, data = {}, important = false) {
       try {
-        if (!ready || (!important && !active())) return;
+        if (!ready) return;
+        eventJournal.observe(scope,event,data);
+        if (!important && !active()) return;
         const clean = sanitize({ ...data, at:Date.now(), sequence:++operation, scope, event });
         if (!clean) return;
         entries = entries.filter(row => row.at >= Date.now() - maxAge).slice(-(maxEntries - 1));
@@ -493,8 +704,9 @@
       }
       dialog.appendChild(list); document.body.appendChild(dialog); dialog.addEventListener('close',()=>dialog.remove(),{once:true}); dialog.showModal();
     }
-    function download() {
-      const blob = new Blob([JSON.stringify(report(),null,2)],{type:'application/json'});
+    async function download() {
+      const history = await eventJournal.report();
+      const blob = new Blob([JSON.stringify({...report(),history},null,2)],{type:'application/json'});
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a'); link.href = url; link.download = 'tp-diagnose-' + new Date().toISOString().replace(/[:.]/g,'-') + '.json';
       document.body.appendChild(link); link.click(); link.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000);
@@ -502,6 +714,7 @@
     function init() {
       if (ready) return;
       ready = true;
+      eventJournal.init();
       const style=document.createElement('style');
       style.textContent='.tp-diagnostic-button{padding:6px 8px;border:1px solid #b9c0c4;border-radius:3px;background:#fff;color:#273036;font:12px Arial,sans-serif;cursor:pointer}.tp-diagnostic-button:hover:not(:disabled){background:#f0f6f8;border-color:#287ca5}.tp-diagnostic-button:disabled{opacity:.6;cursor:wait}';
       (document.head || document.documentElement).appendChild(style);
@@ -513,7 +726,6 @@
     }
     return { init, record, begin, detail, active, report, show, download, paint, leadership, requestScope, errorKind, flush };
   }
-
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -2522,9 +2734,13 @@
 
   function saveOutboxJob(job) {
     const key = OUTBOX_PREFIX + job.id;
+    const previous = loadJson(key,null);
+    const trace = eventJournal.validTrace(previous?.diagnosticTrace) ? previous.diagnosticTrace : eventJournal.newTrace();
+    job = { ...job, diagnosticTrace:trace };
     const value = JSON.stringify(job);
     localStorage.setItem(key, value);
     if (localStorage.getItem(key) !== value) throw new Error('Afsendelseskøen kunne ikke gemmes');
+    eventJournal.delivery(job,previous);
     diagnostics.record('push','queue',{outcome:job.status,attempt:job.attempts},['unknown','blocked','retry'].includes(job.status));
   }
 
@@ -2574,15 +2790,50 @@
       : formatInterestNotification(events.map(event => ({ ...event, entry: state.pairs[event.key] }))), reason: '' };
   }
 
+  function restoreInterestSplit(job) {
+    if (job.kind !== 'int' || job.status !== 'cancelled' || !Array.isArray(job.splitJobs)) return [];
+    const children = job.splitJobs;
+    if (children.length !== 2 || children.some((child,index) => child.id !== job.id + (index ? ':held' : ':ready'))) {
+      throw new Error('Ugyldig opdeling i interessekoeen');
+    }
+    for (const child of children) {
+      // Existing child receipts always win, including after an interrupted recovery.
+      if (!localStorage.getItem(OUTBOX_PREFIX + child.id)) saveOutboxJob(child);
+    }
+    saveOutboxJob({ ...job, splitJobs: undefined });
+    return children;
+  }
+
+  function splitUncertainInterestJob(job) {
+    if (job.kind !== 'int' || job.events?.length < 2 || !Array.isArray(job.events)) return [];
+    const health = loadJson('tpPollHealthV1_int', {}), checkedAt = health.checkedAt || health.lastSuccess;
+    if ((health.error && !health.partial) || !checkedAt || now() - checkedAt > 60000) return [];
+    const state = loadJson(ST_INT_KEY, {});
+    if (!state.initialized) return [];
+    const uncertain = event => interestBelongsToFailedShift(state.pairs?.[event.key] || event.entry, state.failedShifts || []);
+    const held = job.events.filter(uncertain);
+    const ready = prunePendingInterestEvents(job.events.filter(event => !uncertain(event)), state.pairs);
+    if (!held.length || !ready.length) return [];
+    const child = (events,suffix) => ({ ...job, id:job.id + suffix, diagnosticTrace:undefined, events,
+      status:'queued', reason:'', notification:formatInterestNotification(events.map(event => ({...event,entry:state.pairs?.[event.key] || event.entry}))) });
+    // Persist the complete plan before either child can send. A later leader can finish it.
+    const parent = { ...job, status:'cancelled', reason:'Opdelt i sikre og afventende interesser',
+      notification:undefined, events:undefined, splitJobs:[child(ready,':ready'),child(held,':held')] };
+    saveOutboxJob(parent);
+    return restoreInterestSplit(parent);
+  }
+
   async function drainNotificationOutbox() {
     if (!isLeader() || outboxInFlight) return;
     outboxInFlight = true;
     try {
       await withCrossTabProcessLock('push-outbox', async () => {
-        for (const saved of getNotificationOutbox()) {
+        const jobs = getNotificationOutbox();
+        for (const saved of jobs) {
           if (!isLeader()) break;
           let job = loadJson(OUTBOX_PREFIX + saved.id, null);
           if (!job) continue;
+          if (job.splitJobs) jobs.push(...restoreInterestSplit(job));
           if (['sent', 'cancelled'].includes(job.status)) {
             if (now() - job.createdAt > MESSAGE_SEEN_TTL_MS) localStorage.removeItem(OUTBOX_PREFIX + job.id);
             continue;
@@ -2597,6 +2848,8 @@
             continue;
           }
           if (!['queued', 'retry', 'waiting'].includes(job.status) || job.nextAttemptAt > now()) continue;
+          const split = splitUncertainInterestJob(job);
+          if (split.length) { jobs.push(...split); continue; }
           const refreshed = refreshQueuedNotification(job);
           if (refreshed.status === 'cancelled' || (refreshed.status === 'waiting' && refreshed.reason.startsWith('Afventer'))) {
             saveOutboxJob(refreshed);
@@ -2627,6 +2880,8 @@
             continue;
           }
           if (!isLeader()) break;
+          const lateSplit = splitUncertainInterestJob(job);
+          if (lateSplit.length) { jobs.push(...lateSplit); continue; }
           job = refreshQueuedNotification(job);
           if (job.status === 'cancelled' || (job.status === 'waiting' && job.reason.startsWith('Afventer'))) {
             saveOutboxJob(job);
@@ -2729,7 +2984,6 @@
     document.body.appendChild(dialog);
     dialog.showModal();
   }
-
   function showOsNotification(message, duration = 4500) {
     const safeMessage = truncateText(message, 260);
     try {
@@ -4097,6 +4351,7 @@
         '<div id="tpDiagStatus" role="status" style="margin:5px 0 8px;font-size:11px;color:#666"></div>' +
         '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
           '<button id="tpDiagShow" type="button" class="tp-diagnostic-button">Se log</button>' +
+          '<button id="tpEventJournalShow" type="button" class="tp-diagnostic-button">Hændelser (7 dage)</button>' +
           '<button id="tpDiagDownload" type="button" class="tp-diagnostic-button">Hent rapport</button>' +
           '<button id="tpDiagSharing" type="button" class="tp-diagnostic-button">Privat deling</button>' +
         '</div>' +
@@ -4107,6 +4362,7 @@
       initContactSyncMenu(menu);
       menu.querySelector('#tpDiagDetail').addEventListener('change', event => diagnostics.detail(event.target.checked));
       menu.querySelector('#tpDiagShow').addEventListener('click', () => { toggleMenu(false); diagnostics.show(); });
+      menu.querySelector('#tpEventJournalShow').addEventListener('click', () => {toggleMenu(false);void eventJournal.show();});
       menu.querySelector('#tpDiagDownload').addEventListener('click', () => diagnostics.download());
       menu.querySelector('#tpDiagSharing').addEventListener('click', () => {toggleMenu(false);diagnosticSharing.show();});
       diagnostics.paint();
@@ -4280,7 +4536,6 @@
     element.style.right = 'auto';
     element.style.bottom = 'auto';
   }
-
   // SMS-blokken er bevidst bevaret tæt på den fungerende 7.11.9-version.
   function hasDisplayBlock(element) {
     if (!element) return false;
@@ -5970,6 +6225,7 @@
     contactSyncEnabled,
     initContactSyncMenu,
     diagnostics,
+    eventJournal,
     diagnosticSharing,
     TP_VERSION,
     parseNullableCount,
@@ -6093,7 +6349,6 @@
       MSG_GENERAL_LIST_URL: MSG_LIST_URLS.generel
     })
   });
-
   if (IS_TEST) {
     globalThis.__TP_TEST_API__ = TEST_API;
     return;
