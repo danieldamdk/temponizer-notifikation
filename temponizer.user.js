@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.16
+// @version      7.14.17
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.16';
+  const TP_VERSION = '7.14.17';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -34,6 +34,8 @@
   const LOCK_MS = SUPPRESS_MS + 5000;
   const FETCH_TIMEOUT_MS = 12000;
   const INTEREST_DETAIL_CONCURRENCY = 4;
+  const GENERAL_HISTORY_BATCH_SIZE = 4;
+  const GENERAL_HISTORY_REFRESH_MS = 60000;
   const MESSAGE_SEEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
   const MESSAGE_SEEN_LIMIT = 512;
   const NOTIFICATION_DELIVERY_TTL_MS = 15 * 60 * 1000;
@@ -88,7 +90,8 @@
   const MSG_LIST_BASE = ORIGIN + '/index.php?page=get_comcenter_contents&ajax=true&vagt_avail_id=0&vikar_id=0&kontor_id=0&hidemsg=false&comcentertype=';
   const MSG_LIST_URLS = Object.freeze({
     vagt: MSG_LIST_BASE + 'vagt',
-    generel: MSG_LIST_BASE + 'gen'
+    generel: MSG_LIST_BASE + 'gen',
+    allGenerel: MSG_LIST_BASE.replace('hidemsg=false', 'hidemsg=true') + 'gen'
   });
   const AUTREG_API_URL = 'https://autregwebservice.stps.dk/api/AutReg/GetHealthProfessionals';
   const INTEREST_URL = ORIGIN + '/index.php?page=freevagter';
@@ -117,6 +120,7 @@
   const WORKER_WITHDRAWN_COLOR = '#1736e6';
 
   let messagePollInFlight = false;
+  let lastMessagePartialState = null;
   let interestPollInFlight = false;
   let incomingCallPollInFlight = false;
   let incomingCallUserEmail = '';
@@ -456,7 +460,7 @@
         if (parsed.hostname === 'raw.githubusercontent.com') return 'update';
         if (parsed.hostname === 'vipvikaraps.sharepoint.com') return parsed.pathname.includes('TemponizerCalls') ? 'phone' : 'mail';
         const page = parsed.searchParams.get('page') || '';
-        if (/^get_comcenter_/.test(page)) return 'messages';
+        if (/^get_comcenter_/.test(page) || page === 'get_kommunikation_log') return 'messages';
         if (['freevagter','update_vikar_synlighed_from_list'].includes(page)) return 'interest';
         if (page === 'showmy_settings') return 'sms';
         if (page === 'showvikaroplysninger') return 'worker';
@@ -1023,6 +1027,7 @@
 
   function messageEventId(record) {
     if (!record?.key) return '';
+    if (record.messageIdentity) return `${record.key}|history:${record.messageIdentity}`;
     const activity = stableMessageActivity(record.activity);
     return `${record.key}|${record.signature || messageRecordSignature(record)}${activity ? '|at:' + activity : ''}`;
   }
@@ -1086,7 +1091,9 @@
       const signature = record.signature || messageRecordSignature(record);
       let delta = 0;
 
-      if (!old) {
+      if (record.messageIdentity) {
+        delta = old?.messageIdentity === record.messageIdentity ? 0 : 1;
+      } else if (!old) {
         delta = record.unread;
       } else if (record.unread > clampInteger(old.unread, 0)) {
         delta = record.unread - clampInteger(old.unread, 0);
@@ -1139,10 +1146,114 @@
       if (event.kind === 'generic') return currentTotal >= clampInteger(event.targetTotal, 1);
       const record = map[event.key];
       if (!isIncomingMessageRecord(record)) return false;
+      if (event.record?.messageIdentity) return event.record.messageIdentity === record.messageIdentity;
       const activity = stableMessageActivity(event.record?.activity);
       if (activity && stableMessageActivity(record.activity) && activity !== stableMessageActivity(record.activity)) return false;
       return !event.signature || event.signature === (record.signature || messageRecordSignature(record));
     });
+  }
+
+  function parseGeneralMessageHistoryHTML(html) {
+    const doc = parseHtml(html);
+    const table = Array.from(doc.querySelectorAll('table.newlargetable')).find(candidate => {
+      const headers = Array.from(candidate.rows[0]?.cells || []).map(cell => normalizeText(cell.textContent));
+      return ['Tidspunkt','Til/fra','Type','Person','Tekst'].every((name,index) => headers[index] === name);
+    });
+    if (!table) throw new Error('Kunne ikke genkende kommunikationsloggen');
+    const messages = [];
+    for (const row of Array.from(table.rows).slice(1)) {
+      const cells = row.cells;
+      if (normalizeText(cells[2]?.querySelector('.msgtypecontainer')?.textContent) !== 'GENEREL') continue;
+      if (!cells[2].querySelector('img[src$="log_sms.png"]')) continue;
+      const direction = normalizeText(cells[1]?.textContent);
+      if (!['Vikaren','AJOUR'].includes(direction)) throw new Error('Ukendt beskedretning i loggen');
+      const match = normalizeText(cells[0]?.textContent).match(/^(\d{2})\.(\d{2})\.(\d{4})\s*kl\.\s*(\d{2}):(\d{2})$/);
+      const body = cells[4]?.querySelector('.emailcontainer_body')?.cloneNode(true);
+      if (!match || !body) throw new Error('Beskedens indhold eller tidspunkt kunne ikke bekræftes');
+      const [, day, month, year, hour, minute] = match;
+      const date = new Date(+year, +month - 1, +day, +hour, +minute);
+      if (date.getFullYear() !== +year || date.getMonth() !== +month - 1 || date.getDate() !== +day
+        || +hour > 23 || +minute > 59) throw new Error('Ugyldigt tidspunkt i beskedloggen');
+      body.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
+      messages.push({ incoming:direction === 'Vikaren', text:normalizeText(body.textContent), messageAt:date.getTime() });
+    }
+    if (!messages.length) throw new Error('Ingen generel besked fundet i logperioden');
+    messages.sort((a,b) => b.messageAt - a.messageAt);
+    const latest = messages[0];
+    // The log is newest first. Repeated identical messages within a minute still get a distinct identity.
+    const sameMinute = messages.filter(message => message.messageAt === latest.messageAt
+      && message.incoming === latest.incoming && message.text === latest.text).length;
+    const identity = notificationDeliveryId('history', {
+      title:`${latest.messageAt}|${latest.incoming}|${sameMinute}`, body:latest.text
+    });
+    return { incoming:latest.incoming, snippet:truncateText(latest.text, 220), messageIdentity:identity, messageAt:latest.messageAt };
+  }
+
+  function generalMessageIndex(records, time = Date.now()) {
+    const date = new Date(time);
+    const day = `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
+    return Object.fromEntries(records.map(record => [record.key, {
+      unread:record.unread, activity:normalizeText(record.activity), day
+    }]));
+  }
+
+  function generalIndexChanged(current, previous) {
+    return !previous || current.unread !== previous.unread
+      || (/^\d{1,2}:\d{2}$/.test(current.activity)
+        && (current.activity !== previous.activity || current.day !== previous.day));
+  }
+
+  function selectGeneralHistoryRecords(visible, all, previous, time = Date.now()) {
+    const index = generalMessageIndex([...all, ...visible], time);
+    const visibleKeys = new Set(visible.map(record => record.key));
+    const records = new Map(visible.filter(record => record.unread > 0).map(record => [record.key, record]));
+    for (const record of all) {
+      if (!record.unread || records.has(record.key)) continue;
+      const old = previous.records?.[record.key];
+      const changed = previous.generalIndex && generalIndexChanged(index[record.key], previous.generalIndex[record.key]);
+      // Hidden old conversations form a baseline, not a backlog to send after installing the update.
+      if (changed || old?.hidden) records.set(record.key, { ...record, hidden:!visibleKeys.has(record.key) });
+    }
+    return { index, records:Array.from(records.values()) };
+  }
+
+  async function enrichGeneralMessageHistories(snapshot) {
+    const previous = loadJson(ST_MSG_KEY, getDefaultMessageState());
+    const records = { ...snapshot.records };
+    const time = Date.now();
+    const candidates = [];
+    for (const source of snapshot.sourceRecords || []) {
+      if (source.type !== 'generel') continue;
+      const old = previous.records?.[source.key];
+      const changed = generalIndexChanged(snapshot.generalIndex[source.key], previous.generalIndex?.[source.key]);
+      const reusable = old?.messageIdentity && typeof old.incoming === 'boolean' && !changed;
+      if (reusable) {
+        records[source.key] = { ...old, ...source, incoming:old.incoming, snippet:old.snippet,
+          messageIdentity:old.messageIdentity, messageAt:old.messageAt, historyCheckedAt:old.historyCheckedAt };
+      } else {
+        records[source.key] = { ...source, incoming:null, snippet:'', messageIdentity:old?.messageIdentity,
+          historyRetryAt:old?.historyRetryAt || 0 };
+      }
+      const refresh = reusable && /^\d{1,2}:\d{2}$/.test(source.activity)
+        && time - (old.historyCheckedAt || 0) >= GENERAL_HISTORY_REFRESH_MS;
+      if (!reusable || refresh) candidates.push({ source, priority:changed ? 0 : reusable ? 2 : 1,
+        lastAttempt:old?.historyRetryAt || old?.historyCheckedAt || 0 });
+    }
+    candidates.sort((a,b) => a.priority - b.priority || a.lastAttempt - b.lastAttempt);
+    await mapLimit(candidates.slice(0, GENERAL_HISTORY_BATCH_SIZE), 2, async ({source}) => {
+      try {
+        const html = await fetchText(ORIGIN + '/index.php?page=get_kommunikation_log&ajax=true&vikar_id='
+          + encodeURIComponent(source.vikarId) + '&log_offset=30&_=' + time);
+        const detail = parseGeneralMessageHistoryHTML(html);
+        records[source.key] = { ...source, ...detail, historyCheckedAt:time };
+      } catch (_) {
+        records[source.key] = { ...records[source.key], incoming:null, snippet:'', historyRetryAt:time };
+      }
+    });
+    for (const record of Object.values(records)) record.signature = messageRecordSignature(record);
+    const incomingTotal = countIncomingUnreadThreads(records);
+    return { ...snapshot, records, incomingTotal, total:incomingTotal
+      + clampInteger(snapshot.vagtFallback, 0) + clampInteger(snapshot.userFallback, 0) };
   }
 
   function parseTopMenuMessageCount(doc = document) {
@@ -1567,10 +1678,11 @@
 
   async function fetchMessageSnapshot() {
     const stamp = Date.now();
-    const [counterResult, vagtResult, generalResult] = await Promise.allSettled([
+    const [counterResult, vagtResult, generalResult, allGeneralResult] = await Promise.allSettled([
       fetchJson(MSG_COUNTER_URL + '&_=' + stamp),
       fetchText(MSG_LIST_URLS.vagt + '&_=' + stamp),
-      fetchText(MSG_LIST_URLS.generel + '&_=' + stamp)
+      fetchText(MSG_LIST_URLS.generel + '&_=' + stamp),
+      fetchText(MSG_LIST_URLS.allGenerel + '&_=' + stamp)
     ]);
 
     if (counterResult.status === 'rejected' && vagtResult.status === 'rejected' && generalResult.status === 'rejected') {
@@ -1586,9 +1698,14 @@
     const generalIndex = generalResult.status === 'fulfilled'
       ? parseMessageIndexHTML(generalResult.value, 'generel')
       : { records: [], unread: 0, recognized: false };
+    const allGeneralIndex = allGeneralResult.status === 'fulfilled'
+      ? parseMessageIndexHTML(allGeneralResult.value, 'generel')
+      : { records: [], unread: 0, recognized:false };
     const vagtAvailable = vagtResult.status === 'fulfilled' && (vagtIndex.recognized || counters.vagt === 0);
     const generalAvailable = generalResult.status === 'fulfilled' && (generalIndex.recognized || counters.generel === 0);
-    if (!vagtAvailable || !generalAvailable) {
+    const allGeneralAvailable = allGeneralResult.status === 'fulfilled'
+      && (allGeneralIndex.recognized || (counters.generel === 0 && !generalIndex.records.length));
+    if (!vagtAvailable || !generalAvailable || !allGeneralAvailable) {
       throw new Error('Beskedoversigten er ufuldstændig. Seneste kendte status bevares.');
     }
 
@@ -1596,11 +1713,12 @@
     // Page DOM can lag behind another tab. Notification text comes from a fresh read-only overview.
     let sidebar = [];
     const openThread = null;
-    const sourceRecords = [...vagtIndex.records, ...generalIndex.records].filter(record => record.unread > 0);
+    const previousState = loadJson(ST_MSG_KEY, getDefaultMessageState());
+    const selectedGeneral = selectGeneralHistoryRecords(generalIndex.records, allGeneralIndex.records, previousState, stamp);
+    const sourceRecords = [...vagtIndex.records, ...selectedGeneral.records].filter(record => record.unread > 0);
     const vagtTotal = counters.vagt
       ?? vagtIndex.records.filter(record => record.unread > 0).length;
     const counterTotal = resolveMessageCounterTotal(counters, vagtIndex.records, generalIndex.records);
-    const previousState = loadJson(ST_MSG_KEY, getDefaultMessageState());
     let recordMap = carryForwardMessageDetails(
       buildMessageRecordMap(sourceRecords, sidebar, openThread),
       previousState.records || {}
@@ -1656,11 +1774,21 @@
       userFallback,
       topMenuTotal,
       homepageEnriched,
+      generalIndex:selectedGeneral.index,
+      generalHistorySince:previousState.generalHistorySince || stamp,
       observedAt: Date.now()
     };
   }
 
   async function refreshMessageEnrichmentIfNeeded(snapshot) {
+    if (snapshot.generalIndex) {
+      // General-message direction comes from the read-only history, never from a truncated homepage preview.
+      const legacy = { ...snapshot };
+      delete legacy.generalIndex;
+      const hasShiftMessages = snapshot.sourceRecords?.some(record => record.type === 'vagt');
+      const enriched = hasShiftMessages ? await refreshMessageEnrichmentIfNeeded(legacy) : snapshot;
+      return enrichGeneralMessageHistories({ ...enriched, generalIndex:snapshot.generalIndex });
+    }
     if (snapshot.homepageEnriched) return snapshot;
     if (!(snapshot.sourceRecords || Object.values(snapshot.records || {})).some(record => record.unread > 0)
       && !snapshot.rawTotal && !snapshot.total) return snapshot;
@@ -1901,8 +2029,9 @@
     if (!indicator) return;
     const entries = [['msg', 'Beskeder'], ['int', 'Interesser']].map(([kind, label]) => {
       const state = loadJson('tpPollHealthV1_' + kind, {});
-      const checked = state.lastSuccess ? new Date(state.lastSuccess).toLocaleTimeString('da-DK') : 'ikke kontrolleret';
-      const stale = !state.lastSuccess || now() - state.lastSuccess > 120000;
+      const checkedAt = state.checkedAt || state.lastSuccess;
+      const checked = checkedAt ? new Date(checkedAt).toLocaleTimeString('da-DK') : 'ikke kontrolleret';
+      const stale = !checkedAt || now() - checkedAt > 120000;
       return { warning: !!state.error || stale, text: label + ': ' + (state.error || (stale ? 'Afventer frisk kontrol' : 'OK')) + '. Seneste kontrol: ' + checked };
     });
     const outstanding = getNotificationOutbox().filter(job => !['sent', 'cancelled'].includes(job.status));
@@ -1991,7 +2120,8 @@
         pending: [],
         seen,
         lastPush: 0,
-        genericSequence: 0
+        genericSequence: 0,
+        generalIndex:snapshot.generalIndex, generalHistorySince:snapshot.generalHistorySince
       });
       updateMessageBadge(snapshot.total);
       return { baseline: true, events: [] };
@@ -2015,7 +2145,8 @@
       });
     }
 
-    events = events.filter(event => !seen[event.eventId]);
+    events = events.filter(event => !seen[event.eventId]
+      && !(event.record?.messageIdentity && event.record.messageAt <= (snapshot.generalHistorySince || 0)));
     for (const event of events) seen[event.eventId] = observedAt;
     seen = rememberMessageRecords(seen, snapshot.records, observedAt);
 
@@ -2039,7 +2170,8 @@
       pending,
       seen,
       lastPush,
-      genericSequence
+      genericSequence,
+      generalIndex:snapshot.generalIndex, generalHistorySince:snapshot.generalHistorySince
     });
     updateMessageBadge(snapshot.total);
     return { baseline: false, events, queued, pending };
@@ -2113,8 +2245,11 @@
         const processed = diagnostics.begin('messages', 100);
         const result = processMessageSnapshot(enriched);
         processed(null, {count:Object.keys(enriched.records || {}).length});
-        diagnostics.record('messages','snapshot',{outcome:result.baseline ? 'baseline' : 'ok',count:result.events.length,pending:result.pending?.length || 0});
-        setPollingHealth('msg', hasUnresolvedGeneralDirection(enriched.records)
+        const unresolved = hasUnresolvedGeneralDirection(enriched.records);
+        diagnostics.record('messages','snapshot',{outcome:unresolved ? 'partial' : result.baseline ? 'baseline' : 'ok',count:result.events.length,pending:result.pending?.length || 0},
+          lastMessagePartialState !== unresolved || result.events.length > 0);
+        lastMessagePartialState = unresolved;
+        setPollingHealth('msg', unresolved
           ? 'Retningen på nogle generelle beskeder kunne ikke bekræftes' : '', true);
       });
     } catch (error) {
@@ -2358,13 +2493,16 @@
     }
     const state = loadJson(job.kind === 'msg' ? ST_MSG_KEY : ST_INT_KEY, {});
     if (!state.initialized) return { ...job, status: 'waiting', reason: 'Afventer initialisering' };
-    const uncertain = job.events.some(event => job.kind === 'int'
+    const relevant = job.kind === 'msg' ? job.events.filter(event => event.kind !== 'generic'
+      || Math.max(state.total || 0, state.rawTotal || 0) >= clampInteger(event.targetTotal, 1)) : job.events;
+    if (!relevant.length) return { ...job, status:'cancelled', reason:'Hændelsen er ikke længere aktuel', notification:undefined, events:undefined };
+    const uncertain = relevant.some(event => job.kind === 'int'
       ? (state.failedShifts || []).includes(String(event.entry?.vagtId))
       : (event.kind === 'generic' ? !!health.error : state.records?.[event.key]?.unread > 0 && state.records[event.key].incoming == null));
     if (uncertain) return { ...job, status: 'waiting', reason: 'Afventer kontrol af denne hændelse' };
     const events = job.kind === 'msg'
-      ? prunePendingMessageEvents(job.events, state.records, state.total)
-      : prunePendingInterestEvents(job.events, state.pairs);
+      ? prunePendingMessageEvents(relevant, state.records, state.total)
+      : prunePendingInterestEvents(relevant, state.pairs);
     if (!events.length) return { ...job, status: 'cancelled', reason: 'Hændelsen er ikke længere aktuel', notification: undefined, events: undefined };
     return { ...job, events, notification: job.kind === 'msg' ? formatMessageNotification(events)
       : formatInterestNotification(events.map(event => ({ ...event, entry: state.pairs[event.key] }))), reason: '' };
@@ -5774,6 +5912,10 @@
     normalizeText,
     truncateText,
     parseMessageIndexHTML,
+    parseGeneralMessageHistoryHTML,
+    generalMessageIndex,
+    selectGeneralHistoryRecords,
+    enrichGeneralMessageHistories,
     parseSidebarPreviews,
     parseOpenThreadPreview,
     enrichMessageRecords,
