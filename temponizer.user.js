@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.19
+// @version      7.14.20
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -22,7 +22,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.19';
+  const TP_VERSION = '7.14.20';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -726,6 +726,82 @@
     }
     return { init, record, begin, detail, active, report, show, download, paint, leadership, requestScope, errorKind, flush };
   }
+  /** @typedef {{label: string, blocked: boolean}} RuntimeFailure */
+  /** @typedef {{record: function(string): void, changed: function(): void}} RuntimeHooks */
+  const runtimeFeatures = Object.freeze({
+    diagnostics:'Diagnose', receiver:'Opkaldsmodtagelse', migration:'Personlige indstillinger',
+    broadcast:'Notifikationsvisning', outgoing:'Udgaaende opkald', panel:'Notifikationspanel',
+    links:'Profilgenveje', authorization:'Autorisation', cpr:'CPR-kontrol', hover:'Vikaroverblik',
+    quick:'Telefonregistrering', contacts:'Kontaktsynkronisering', sharing:'Diagnosedeling',
+    storage:'Browserlager', leadership:'Faneansvar', messages:'Beskedkontrol',
+    interest:'Interessekontrol', phone:'Opkaldskontrol', mail:'Mailkontrol', push:'Pushover'
+  });
+
+  // Bounded feature names and callbacks only; no DOM or personal payloads in this supervisor.
+  /** @param {RuntimeHooks} hooks */
+  function createRuntimeSupervisor(hooks) {
+    const errors = new Set();
+    const known = name => Object.hasOwn(runtimeFeatures, name);
+    function changed() { try { hooks.changed(); } catch (_) {} }
+    function fail(name) {
+      if (!known(name) || errors.has(name)) return;
+      errors.add(name);
+      try { hooks.record(name); } catch (_) {}
+      changed();
+    }
+    function recovered(name) {
+      // A later unrelated write cannot prove that previously lost durable state was recovered.
+      if (name !== 'storage' && errors.delete(name)) changed();
+    }
+    function run(name, task) {
+      if (!known(name)) throw new Error('Unknown runtime feature');
+      try {
+        const result = task();
+        if (result && typeof result.then === 'function') {
+          return Promise.resolve(result).then(value => { recovered(name); return value; }, () => { fail(name); });
+        }
+        recovered(name);
+        return result;
+      } catch (_) { fail(name); }
+    }
+    return Object.freeze({run, fail, canNotify:() => !errors.has('storage'),
+      failures:() => [...errors].map(name => ({label:runtimeFeatures[name], blocked:name === 'storage'}))});
+  }
+
+  const runtimeGuard = createRuntimeSupervisor({
+    record:() => {
+      diagnostics.record('runtime','error',{outcome:'failed'},true);
+      eventJournal.record('runtime','start','failed');
+    },
+    changed:() => { paintRuntimeWarning(); paintPollingHealth(); }
+  });
+
+  function paintRuntimeWarning() {
+    const failures = runtimeGuard.failures();
+    let warning = document.getElementById('tpRuntimeWarning');
+    if (!failures.length) { warning?.remove(); return; }
+    const parent = document.getElementById('tpPanelBody');
+    if (!warning) {
+      warning = document.createElement('div'); warning.id = 'tpRuntimeWarning';
+      warning.setAttribute('role','alert');
+    }
+    warning.style.cssText = 'box-sizing:border-box;max-width:240px;padding:8px;color:#a12626;background:#fff;font:11px/1.4 sans-serif;overflow-wrap:anywhere';
+    if (!parent) warning.style.cssText += ';position:fixed;right:8px;bottom:12px;z-index:2147483646;border:1px solid #a12626';
+    (parent || document.body)?.appendChild(warning);
+    warning.textContent = failures.some(item => item.blocked)
+      ? 'Notifikationer er sat på pause: browserlageret virker ikke. Genindlæs siden.'
+      : failures.map(item => item.label).join(', ') + ' fejlede. Genindlæs siden.';
+  }
+
+  function assertRuntimeStorage() {
+    const key = 'tpStorageProbe_' + TAB_ID;
+    try {
+      localStorage.setItem(key, '1');
+      if (localStorage.getItem(key) !== '1') throw new Error('Storage unavailable');
+      return true;
+    } finally { localStorage.removeItem(key); }
+  }
+
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -1729,6 +1805,7 @@
     try {
       localStorage.setItem(key, JSON.stringify(value));
     } catch (error) {
+      runtimeGuard.fail('storage');
       console.warn('[TP] Kunne ikke gemme lokal status', error);
     }
   }
@@ -1780,7 +1857,6 @@
   async function fetchJson(url, options) {
     return fetchWithTimeout(url, options, FETCH_TIMEOUT_MS, 'json');
   }
-
   async function fetchIncomingCallMatches(phone) {
     const normalized = normalizePhoneNumber(phone);
     if (!normalized) return [];
@@ -1914,6 +1990,10 @@
       fetchText(MSG_LIST_URLS.generel + '&_=' + stamp),
       fetchText(MSG_LIST_URLS.allGenerel + '&_=' + stamp)
     ]);
+
+    const loginFailure = [vagtResult, generalResult, allGeneralResult].find(result =>
+      result.status === 'rejected' && diagnostics.errorKind(result.reason) === 'login');
+    if (loginFailure) throw loginFailure.reason;
 
     if (counterResult.status === 'rejected' && vagtResult.status === 'rejected' && generalResult.status === 'rejected') {
       throw new Error('Alle beskedkilder fejlede');
@@ -2049,7 +2129,6 @@
       throw error;
     }
   }
-
   async function fetchInterestEntriesForShift(shift) {
     const url = INTEREST_DETAIL_URL
       + '&vagt_type=' + encodeURIComponent(shift.type)
@@ -2312,7 +2391,10 @@
       const stale = !checkedAt || now() - checkedAt > 120000;
       return { warning: !!state.error || stale, text: label + ': ' + (state.error || (stale ? 'Afventer frisk kontrol' : 'OK')) + '. Seneste kontrol: ' + checked };
     });
-    const outstanding = getNotificationOutbox().filter(job => !['sent', 'cancelled'].includes(job.status));
+    for (const item of runtimeGuard.failures()) entries.push({warning:true,text:item.label + ': fejl. Genindlæs siden.'});
+    let outstanding = [];
+    try { outstanding = getNotificationOutbox().filter(job => !['sent', 'cancelled'].includes(job.status)); }
+    catch (_) { entries.push({warning:true,text:'Browserlager: afsendelseskøen kunne ikke læses.'}); }
     if (outstanding.length) entries.push({ warning: true, text: `Pushover: ${outstanding.length} afsendelse(r) afventer eller kræver kontrol. Klik for status.` });
     const warning = entries.some(entry => entry.warning);
     indicator.textContent = warning ? '!' : '\u00b7';
@@ -2329,6 +2411,14 @@
     paintPollingHealth();
   }
 
+  function pollingFailureText(error) {
+    const kind = diagnostics.errorKind(error);
+    if (kind === 'login') return 'Log ind på Temponizer igen';
+    if (kind === 'timeout') return 'Temponizer svarer for langsomt; prøver igen';
+    if (kind === 'network') return 'Netværksfejl; prøver igen';
+    if (kind === 'http') return 'Temponizer returnerede en serverfejl; prøver igen';
+    return 'Oplysninger kunne ikke bekræftes; seneste status bevares';
+  }
   function getDefaultMessageState() {
     return { initialized: false, total: 0, rawTotal: 0, records: {}, pending: [], seen: {}, lastPush: 0, genericSequence: 0 };
   }
@@ -2533,7 +2623,7 @@
     } catch (error) {
       pollError = error;
       console.warn('[TP][ERR][MSG]', error);
-      setPollingHealth('msg', 'Kontrol afbrudt');
+      setPollingHealth('msg', pollingFailureText(error));
     } finally {
       messagePollInFlight = false;
       finish(pollError);
@@ -2562,13 +2652,12 @@
     } catch (error) {
       pollError = error;
       console.warn('[TP][ERR][INT]', error);
-      setPollingHealth('int', 'Kontrol afbrudt');
+      setPollingHealth('int', pollingFailureText(error));
     } finally {
       interestPollInFlight = false;
       finish(pollError);
     }
   }
-
   function gmRequest(options) {
     return new Promise((resolve, reject) => {
       const finishDiagnostic = diagnostics.begin(diagnostics.requestScope(options.url), 3000);
@@ -2824,13 +2913,13 @@
   }
 
   async function drainNotificationOutbox() {
-    if (!isLeader() || outboxInFlight) return;
+    if (!runtimeGuard.canNotify() || !isLeader() || outboxInFlight) return;
     outboxInFlight = true;
     try {
       await withCrossTabProcessLock('push-outbox', async () => {
         const jobs = getNotificationOutbox();
         for (const saved of jobs) {
-          if (!isLeader()) break;
+          if (!runtimeGuard.canNotify() || !isLeader()) break;
           let job = loadJson(OUTBOX_PREFIX + saved.id, null);
           if (!job) continue;
           if (job.splitJobs) jobs.push(...restoreInterestSplit(job));
@@ -2879,7 +2968,7 @@
             saveOutboxJob({ ...job, status: 'blocked', reason: 'Pushover-modtageren blev ændret under kontrollen. Ikke sendt.' });
             continue;
           }
-          if (!isLeader()) break;
+          if (!runtimeGuard.canNotify() || !isLeader()) break;
           const lateSplit = splitUncertainInterestJob(job);
           if (lateSplit.length) { jobs.push(...lateSplit); continue; }
           job = refreshQueuedNotification(job);
@@ -2902,6 +2991,7 @@
         }
       });
     } catch (error) {
+      diagnostics.record('push','error',{outcome:'failed'},true);
       console.warn('[TP][PUSHOVER] Køen kunne ikke behandles', error?.message);
     } finally {
       outboxInFlight = false;
@@ -2917,10 +3007,24 @@
     const heading = document.createElement('strong');
     heading.textContent = 'Pushover-afsendelser';
     dialog.appendChild(heading);
-    const jobs = getNotificationOutbox().filter(job => !['sent', 'cancelled'].includes(job.status));
+    const sourceWarnings = [['msg','Beskeder'],['int','Interesser']].map(([kind,label]) => {
+      const health = loadJson('tpPollHealthV1_' + kind, {});
+      return health.error ? label + ': ' + health.error : '';
+    }).filter(Boolean);
+    sourceWarnings.push(...runtimeGuard.failures().map(item => item.label + ': fejl. Genindlæs siden.'));
+    for (const text of sourceWarnings) {
+      const row = document.createElement('p'); row.textContent = text; row.style.color = '#a12626'; dialog.appendChild(row);
+    }
+    let jobs = [], queueAvailable = true;
+    try { jobs = getNotificationOutbox().filter(job => !['sent', 'cancelled'].includes(job.status)); }
+    catch (_) {
+      queueAvailable = false;
+      const row = document.createElement('p'); row.textContent = 'Browserlageret kunne ikke læses. Genindlæs siden.'; dialog.appendChild(row);
+    }
     if (!jobs.length) {
       const text = document.createElement('p');
-      text.textContent = 'Ingen afsendelser afventer.';
+      text.textContent = !queueAvailable ? 'Afsendelsernes status er ukendt.'
+        : sourceWarnings.length ? 'Ingen kendte afsendelser i kø. Kontrollen ovenfor skal afklares.' : 'Ingen afsendelser afventer.';
       dialog.appendChild(text);
     }
     for (const job of jobs.slice(-20).reverse()) {
@@ -4819,7 +4923,7 @@
     const style = document.createElement('style');
     style.id = 'tpWorkerHoverStyles';
     style.textContent = `
-      .tp-worker-hover-image {
+      tr[id^="row_"] img[src*="/vikarimages/"] {
         cursor: help !important;
       }
       .tp-worker-hover-popover {
@@ -5196,20 +5300,15 @@
       popover.dataset.open = 'true';
       loadActiveWorker();
     };
-    const decorate = (root = document) => {
-      for (const row of root.querySelectorAll?.(WORKER_ROW_SELECTOR) || []) {
-        const workerId = row.id.match(/^row_(\d+)$/)?.[1];
-        if (!workerId) continue;
-        const image = Array.from(row.querySelectorAll('img')).find(candidate =>
-          String(candidate.getAttribute('src') || '').includes('/vikarimages/' + workerId + '/')
-        );
-        if (!image || image.dataset.tpWorkerHoverReady === 'true' || !findWorkerHoverContext(image)) continue;
-        image.dataset.tpWorkerHoverReady = 'true';
-        image.classList.add('tp-worker-hover-image');
-        image.addEventListener('mouseenter', () => showForImage(image));
-        image.addEventListener('mouseleave', hideSoon);
-      }
-    };
+    // Delegation also covers inserted/replaced worker rows without watching every DOM change.
+    document.addEventListener('mouseover', event => {
+      const image = event.target.closest?.('img');
+      if (image && image !== activeImage && findWorkerHoverContext(image)) showForImage(image);
+      else if (image === activeImage) cancelHide();
+    });
+    document.addEventListener('mouseout', event => {
+      if (event.target === activeImage && !activeImage?.contains(event.relatedTarget)) hideSoon();
+    });
 
     popover.addEventListener('mouseenter', cancelHide);
     popover.addEventListener('mouseleave', hideSoon);
@@ -5219,18 +5318,6 @@
     window.addEventListener('resize', () => {
       if (activeImage && popover.dataset.open === 'true') positionWorkerHover(popover, activeImage);
     });
-    decorate();
-
-    let decorateScheduled = false;
-    const observer = new MutationObserver(() => {
-      if (decorateScheduled) return;
-      decorateScheduled = true;
-      setTimeout(() => {
-        decorateScheduled = false;
-        decorate();
-      }, 0);
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
   }
 
   function initWorkerProfileDeepLinks() {
@@ -5254,7 +5341,6 @@
     };
     openSubtab();
   }
-
   function parseCprBirthDate(value) {
     const digits = String(value || '').replace(/\D/g, '');
     if (digits.length !== 10 || /^(?:0{6}|9{6})/.test(digits)) return '';
@@ -6146,49 +6232,45 @@
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
+  let pollingStarted = false, runtimeStarted = false;
   function startPolling() {
-    ensureIncomingCallQueueState();
-    heartbeatLeadership();
-    pollMessages();
-    pollInterest();
-    pollIncomingCalls();
-    refreshMailPushSetting();
-    void drainNotificationOutbox();
+    if (pollingStarted) return;
+    pollingStarted = true;
+    if (!runtimeGuard.run('storage', assertRuntimeStorage)) return;
+    runtimeGuard.run('phone', ensureIncomingCallQueueState);
+    const actions = {
+      messages:pollMessages, interest:pollInterest, phone:pollIncomingCalls,
+      mail:refreshMailPushSetting, push:drainNotificationOutbox
+    };
+    const check = name => runtimeGuard.run(name, actions[name]);
+    const checkAll = () => { for (const name of Object.keys(actions)) check(name); };
+    runtimeGuard.run('leadership', heartbeatLeadership);
+    checkAll();
 
     setInterval(() => {
-      const wasLeader = isLeader();
-      const leaderNow = heartbeatLeadership();
+      const wasLeader = runtimeGuard.run('leadership', isLeader);
+      const leaderNow = runtimeGuard.run('leadership', heartbeatLeadership);
       if (!wasLeader && leaderNow) {
-        pollMessages();
-        pollInterest();
-        pollIncomingCalls();
-        refreshMailPushSetting();
+        checkAll();
       }
     }, HEARTBEAT_MS);
-    setInterval(pollMessages, MESSAGE_POLL_MS);
-    setInterval(pollInterest, INTEREST_POLL_MS);
-    setInterval(pollIncomingCalls, TP_CALL_QUEUE.pollMs);
-    setInterval(drainNotificationOutbox, 5000);
+    setInterval(() => check('messages'), MESSAGE_POLL_MS);
+    setInterval(() => check('interest'), INTEREST_POLL_MS);
+    setInterval(() => check('phone'), TP_CALL_QUEUE.pollMs);
+    setInterval(() => check('push'), 5000);
 
     window.addEventListener('online', () => {
-      heartbeatLeadership();
-      pollMessages();
-      pollInterest();
-      pollIncomingCalls();
-      void drainNotificationOutbox();
-      refreshMailPushSetting();
+      runtimeGuard.run('leadership', heartbeatLeadership);
+      checkAll();
     });
 
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
-        if (isLeader()) writeLeadership();
+        runtimeGuard.run('leadership', () => { if (isLeader()) writeLeadership(); });
         return;
       }
-      tryBecomeLeader(true);
-      pollMessages();
-      pollInterest();
-      pollIncomingCalls();
-      refreshMailPushSetting();
+      runtimeGuard.run('leadership', () => tryBecomeLeader(true));
+      checkAll();
     });
 
     window.addEventListener('beforeunload', () => {
@@ -6200,23 +6282,28 @@
   }
 
   function startRuntime() {
-    diagnostics.init();
-    if (initIncomingCallReceiver()) return;
-    migrateUserKeyToGM();
-    initToastBroadcast();
-    initOutgoingCallTracking();
-    injectUI();
-    initWorkerProfileDeepLinks();
-    initAuthorizationLookup();
-    initCprLookupActions();
-    initWorkerProfileHover();
-    initQuickNoAnswer();
+    if (runtimeStarted) return;
+    runtimeStarted = true;
+    runtimeGuard.run('diagnostics', () => diagnostics.init());
+    const receiver = runtimeGuard.run('receiver', initIncomingCallReceiver);
+    if (receiver || runtimeGuard.failures().some(item => item.label === runtimeFeatures.receiver)) return;
+    runtimeGuard.run('migration', migrateUserKeyToGM);
+    runtimeGuard.run('broadcast', initToastBroadcast);
+    runtimeGuard.run('outgoing', initOutgoingCallTracking);
+    runtimeGuard.run('panel', injectUI);
+    runtimeGuard.run('links', initWorkerProfileDeepLinks);
+    runtimeGuard.run('authorization', initAuthorizationLookup);
+    runtimeGuard.run('cpr', initCprLookupActions);
+    runtimeGuard.run('hover', initWorkerProfileHover);
+    runtimeGuard.run('quick', initQuickNoAnswer);
     startPolling();
-    initWorkerContactSync();
-    diagnosticSharing.init();
+    runtimeGuard.run('contacts', initWorkerContactSync);
+    runtimeGuard.run('sharing', () => diagnosticSharing.init());
+    paintRuntimeWarning();
   }
-
   const TEST_API = Object.freeze({
+    createRuntimeSupervisor,
+    runtimeGuard,
     normalizeContactPhone,
     validateContactSnapshot,
     parseActiveContactListHTML,
