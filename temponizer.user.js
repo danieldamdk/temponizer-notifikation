@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.17
+// @version      7.14.18
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
 (() => {
   'use strict';
 
-  const TP_VERSION = '7.14.17';
+  const TP_VERSION = '7.14.18';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -1306,14 +1306,16 @@
     const shifts = [];
     const seen = new Set();
     const boxes = Array.from(doc.querySelectorAll('[id^="vagtlist_synlig_interesse_display_number_"], [id*="interesse"][id*="display_number"]'));
+    let invalid = false;
 
     for (const box of boxes) {
       const match = (box.id || '').match(/display_number_(\d+)_(single|multi)/i);
-      if (!match) continue;
+      if (!match) { invalid = true; continue; }
       const id = match[1];
       const type = match[2].toLowerCase();
-      const countMatch = normalizeText(box.textContent).match(/\d+/);
-      const count = countMatch ? clampInteger(countMatch[0], 0) : 0;
+      const countText = normalizeText(box.textContent);
+      if (countText && !/^\d+$/.test(countText)) { invalid = true; continue; }
+      const count = countText ? clampInteger(countText, 0) : 0;
       if (count <= 0 || seen.has(`${id}:${type}`)) continue;
       seen.add(`${id}:${type}`);
 
@@ -1332,10 +1334,15 @@
       shifts.push({ id, type, count, date, time, education, customer });
     }
 
+    const list = doc.querySelector('#freeVagt table.vagtlist');
+    const headers = Array.from(list?.querySelectorAll('th') || []).map(cell => normalizeText(cell.textContent));
+    const emptyList = !!list && ['Dato', 'Tidsrum', 'Kunde'].every(label => headers.includes(label))
+      && Array.from(list.querySelectorAll('tr')).every(row => row.querySelector('th')
+        || !normalizeText(row.textContent) || normalizeText(row.textContent) === '{GroupName}');
     return {
       shifts,
       total: shifts.reduce((sum, shift) => sum + shift.count, 0),
-      recognized: boxes.length > 0
+      recognized: !invalid && (boxes.length > 0 || emptyList)
     };
   }
 
@@ -1383,7 +1390,14 @@
     const previous = previousMap || {};
     const current = currentMap || {};
     return Object.values(current)
-      .filter(entry => entry?.key && !previous[entry.key])
+      .filter(entry => {
+        if (!entry?.key) return false;
+        const old = previous[entry.key];
+        if (old) return !!(old.interestDate && entry.interestDate && old.interestDate !== entry.interestDate);
+        // Expand old group-level state without re-alerting interests already seen before the update.
+        const group = entry.shift?.groupId && previous[`${entry.shift.groupId}:${entry.vikarId}`];
+        return !(group?.shift?.type === 'multi' && group.interestDate === entry.interestDate);
+      })
       .map(entry => ({
         kind: 'interest',
         key: entry.key,
@@ -1394,7 +1408,11 @@
 
   function prunePendingInterestEvents(pending, currentMap) {
     const current = currentMap || {};
-    return (pending || []).filter(event => !!current[event.key]);
+    return (pending || []).filter(event => {
+      const entry = current[event.key];
+      return !!entry && !(event.entry?.interestDate && entry.interestDate
+        && event.entry.interestDate !== entry.interestDate);
+    });
   }
 
   function formatShift(shift) {
@@ -1836,23 +1854,71 @@
     return entries;
   }
 
+  async function expandInterestShift(shift) {
+    if (shift.type !== 'multi') return [shift];
+    // The group badge counts worker/shift pairs, not the worker cards in its popup.
+    const readMembers = async () => {
+      const html = await fetchText(ORIGIN + '/index.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ page: 'get_multi_vagter', ajax: 'true',
+          vagt_avail_multi_id: 'Multi' + shift.id, vikar_id: '0' }).toString()
+      });
+      return parseInterestOverviewHTML(html);
+    };
+    let members = await readMembers();
+    const complete = value => value.recognized && value.total === shift.count
+      && value.shifts.every(member => member.type === 'single');
+    if (!complete(members)) { await sleep(650); members = await readMembers(); }
+    if (!complete(members)) throw new Error('Multivagtens interesser kunne ikke kontrolleres fuldstændigt');
+    return members.shifts.map(member => ({ ...member, groupId: String(shift.id) }));
+  }
+
+  function interestBelongsToFailedShift(entry, failedShifts) {
+    return failedShifts.includes(String(entry?.vagtId))
+      || !!(entry?.shift?.groupId && failedShifts.includes(String(entry.shift.groupId)));
+  }
+
   async function fetchInterestSnapshot() {
     const overview = parseInterestOverviewHTML(await fetchText(INTEREST_URL + '&_=' + Date.now()));
-    if (!overview.recognized && overview.shifts.length === 0) {
+    if (!overview.recognized) {
       throw new Error('Kunne ikke genkende interessetællerne på siden');
     }
     const previous = loadJson(ST_INT_KEY, getDefaultInterestState());
     const failedShifts = [];
-    const nested = await mapLimit(overview.shifts, INTEREST_DETAIL_CONCURRENCY, async shift => {
+    const expanded = await mapLimit(overview.shifts, INTEREST_DETAIL_CONCURRENCY, async shift => {
+      try { return await expandInterestShift(shift); }
+      catch (error) {
+        failedShifts.push(String(shift.id));
+        console.warn('[TP][INT] Bevarer seneste status for multivagt', shift.id, error?.message);
+        return [];
+      }
+    });
+    const shifts = new Map();
+    for (const shift of expanded.flat()) {
+      const old = shifts.get(String(shift.id));
+      if (old && old.count !== shift.count) throw new Error('Modstridende interessetal for samme vagt');
+      shifts.set(String(shift.id), { ...old, ...shift, groupId: shift.groupId || old?.groupId });
+    }
+    // Two bounded stages keep the global request limit intact, also with several groups.
+    const nested = await mapLimit([...shifts.values()], INTEREST_DETAIL_CONCURRENCY, async shift => {
       try {
         return await fetchInterestEntriesForShift(shift);
       } catch (error) {
         failedShifts.push(String(shift.id));
+        if (shift.groupId && ((previous.baselinePendingShifts || []).includes(shift.groupId)
+          || Object.values(previous.pairs || {}).some(entry =>
+            entry.shift?.type === 'multi' && String(entry.vagtId) === shift.groupId))) {
+          failedShifts.push(shift.groupId);
+        }
         console.warn('[TP][INT] Bevarer seneste status for vagt', shift.id, error?.message);
-        return Object.values(previous.pairs || {}).filter(entry => String(entry.vagtId) === String(shift.id));
+        return [];
       }
     });
-    const entries = nested.flat();
+    const entries = [
+      ...Object.values(previous.pairs || {}).filter(entry => interestBelongsToFailedShift(entry, failedShifts)),
+      ...nested.flat()
+    ];
     return {
       total: overview.total,
       pairs: entriesToMap(entries),
@@ -2200,7 +2266,7 @@
     const baselinePendingShifts = Array.isArray(state.baselinePendingShifts) ? state.baselinePendingShifts : [];
     let eventSequence = clampInteger(state.eventSequence, 0);
     const events = diffInterestPairs(state.pairs, snapshot.pairs)
-      .filter(event => !baselinePendingShifts.includes(String(event.entry.vagtId)))
+      .filter(event => !interestBelongsToFailedShift(event.entry, baselinePendingShifts))
       .map(event => ({ ...event, eventId: `${event.key}:occurrence:${++eventSequence}` }));
     let pending = prunePendingInterestEvents(state.pending, snapshot.pairs);
     pending = mergePendingEvents(pending, events);
@@ -2278,7 +2344,7 @@
         const processed = diagnostics.begin('interest', 100);
         const result = processInterestSnapshot(snapshot);
         processed(null, {count:Object.keys(snapshot.pairs || {}).length});
-        diagnostics.record('interest','snapshot',{outcome:snapshot.failedShifts?.length ? 'partial' : result.baseline ? 'baseline' : 'ok',count:result.events.length,pending:result.pending?.length || 0},!!snapshot.failedShifts?.length);
+        diagnostics.record('interest','snapshot',{outcome:snapshot.failedShifts?.length ? 'partial' : result.baseline ? 'baseline' : 'ok',count:result.events.length,pending:result.pending?.length || 0},!!snapshot.failedShifts?.length || result.events.length > 0);
         setPollingHealth('int', snapshot.failedShifts?.length ? 'Nogle vagter kunne ikke kontrolleres' : '', true);
       });
     } catch (error) {
@@ -2497,7 +2563,7 @@
       || Math.max(state.total || 0, state.rawTotal || 0) >= clampInteger(event.targetTotal, 1)) : job.events;
     if (!relevant.length) return { ...job, status:'cancelled', reason:'Hændelsen er ikke længere aktuel', notification:undefined, events:undefined };
     const uncertain = relevant.some(event => job.kind === 'int'
-      ? (state.failedShifts || []).includes(String(event.entry?.vagtId))
+      ? interestBelongsToFailedShift(state.pairs?.[event.key] || event.entry, state.failedShifts || [])
       : (event.kind === 'generic' ? !!health.error : state.records?.[event.key]?.unread > 0 && state.records[event.key].incoming == null));
     if (uncertain) return { ...job, status: 'waiting', reason: 'Afventer kontrol af denne hændelse' };
     const events = job.kind === 'msg'
