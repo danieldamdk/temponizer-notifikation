@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.21
+// @version      7.14.22
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.21';
+  const TP_VERSION = '7.14.22';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -1009,6 +1009,64 @@
     };
   }
 
+  const WORKER_COMPLETED_TYPES = ['afholdtikkegodkendt', 'afholdtgodkendt', 'loenudbetalt'];
+
+  function parseWorkerCompletedCounts(html) {
+    const doc = parseHtml(html);
+    return Object.fromEntries(WORKER_COMPLETED_TYPES.map(type => {
+      const tab = doc.getElementById(type + '_link');
+      return [type, tab ? parseLabelCount(tab.textContent) : null];
+    }));
+  }
+
+  function readWorkerCustomerNumber(doc = document) {
+    const values = new Set();
+    for (const cell of doc.querySelectorAll('#themaincontent td.vagtinfo_key')) {
+      if (!/^kunde nr\s*:?$/i.test(normalizeText(cell.textContent))) continue;
+      const value = normalizeText(cell.nextElementSibling?.textContent);
+      if (/^\d+$/.test(value)) values.add(value);
+    }
+    return values.size === 1 ? [...values][0] : '';
+  }
+
+  function parseWorkerCompletedPage(html, type) {
+    if (!WORKER_COMPLETED_TYPES.includes(type)) throw new Error('Ukendt vagtgruppe');
+    const doc = parseHtml(html);
+    const table = Array.from(doc.querySelectorAll('table')).find(element => {
+      const headers = Array.from(element.querySelectorAll('th')).map(th => normalizeText(th.textContent));
+      return headers.includes('Vagt ID') && headers.includes('Kunde nr');
+    });
+    if (!table || doc.querySelector('#login-form')) throw new Error('Vagthistorik kunne ikke kontrolleres');
+    const headers = Array.from(table.querySelectorAll('th')).map(th => normalizeText(th.textContent));
+    const customerIndex = headers.indexOf('Kunde nr');
+    const dateIndex = headers.indexOf('Dato');
+    const timeIndex = headers.indexOf('Tidsrum');
+    if (customerIndex < 0 || dateIndex < 0 || timeIndex < 0) throw new Error('Ufuldstændig vagthistorik');
+    const rows = [];
+    for (const row of table.querySelectorAll('tr[id^="vagtrow_"]')) {
+      const id = row.id.match(/^vagtrow_booket_(\d+)$/)?.[1];
+      const customer = normalizeText(row.cells[customerIndex]?.textContent);
+      const dateText = normalizeText(row.cells[dateIndex]?.textContent);
+      const date = parseDanishDate(dateText);
+      const dateParts = dateText.match(/\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b/);
+      const time = normalizeText(row.cells[timeIndex]?.textContent).match(/^(\d{2}):(\d{2})\s*-\s*(\d{2}):(\d{2})$/);
+      if (!id || !/^\d+$/.test(customer) || !date || !dateParts || date.getDate() !== Number(dateParts[1]) || date.getMonth() + 1 !== Number(dateParts[2]) || !time || Number(time[1]) > 23 || Number(time[3]) > 23 || Number(time[2]) > 59 || Number(time[4]) > 59) {
+        throw new Error('Ufuldstændig vagthistorik');
+      }
+      const end = new Date(date);
+      end.setHours(Number(time[3]), Number(time[4]), 0, 0);
+      if (time[3] + time[4] <= time[1] + time[2]) end.setDate(end.getDate() + 1);
+      rows.push({id, customer, end: end.getTime()});
+    }
+    const offsets = new Set();
+    for (const element of doc.querySelectorAll('[onclick*="switchpage"]')) {
+      const match = element.getAttribute('onclick').match(/switchpage\(\s*['"]([a-z]+)['"]\s*,\s*(\d+)\s*\)/);
+      if (!match || match[1] !== type) throw new Error('Ukendt paginering');
+      offsets.add(Number(match[2]));
+    }
+    return {rows, offsets: [...offsets]};
+  }
+
   function parseWorkerStatsHTML(html) {
     const doc = parseHtml(html);
     const values = new Map();
@@ -1069,7 +1127,6 @@
     const toggle = doc.querySelector('#fold_knap');
     return toggle ? parseLabelCount(toggle.textContent, true) : null;
   }
-
   function getFirstText(root, selectors) {
     for (const selector of selectors) {
       const element = root.querySelector(selector);
@@ -1986,6 +2043,61 @@
     return workerHoverRequests.get(key);
   }
 
+  async function fetchWorkerCustomerHistory(workerId) {
+    const cacheKey = 'history:' + workerId;
+    const cached = getCachedWorkerHoverData(cacheKey);
+    if (cached?.byCustomer) return cached.byCustomer;
+    const counts = parseWorkerCompletedCounts(await fetchText(buildWorkerProfileURL(workerId)));
+    if (!Object.values(counts).every(value => Number.isInteger(value) && value >= 0)) throw new Error('Ufuldstændig vagtoversigt');
+    const records = new Map();
+    let pages = 0;
+    for (const type of WORKER_COMPLETED_TYPES) {
+      if (counts[type] === 0) continue;
+      const pending = [0], visited = new Set(), seen = new Set();
+      while (pending.length) {
+        const offset = pending.shift();
+        if (visited.has(offset)) continue;
+        if (++pages > 30) throw new Error('Vagthistorik overstiger sidegrænsen');
+        visited.add(offset);
+        const params = new URLSearchParams({page:'vagtlist_get', ajax:'true', switchpage:'true',
+          vikar_id:String(workerId), type, field:'dato', sort:'desc', offset:String(offset)});
+        const parsed = parseWorkerCompletedPage(await fetchText(ORIGIN + '/index.php?' + params), type);
+        if (!parsed.rows.length) throw new Error('Ufuldstændig vagthistorik');
+        for (const row of parsed.rows) {
+          if (seen.has(row.id)) throw new Error('Vagthistorik ændret under hentning');
+          seen.add(row.id);
+          const previous = records.get(row.id);
+          if (previous && (previous.customer !== row.customer || previous.end !== row.end)) throw new Error('Vagthistorik ændret under hentning');
+          records.set(row.id, row);
+        }
+        for (const next of parsed.offsets) if (!visited.has(next) && !pending.includes(next)) pending.push(next);
+      }
+      if (seen.size !== counts[type]) throw new Error('Ikke alle afholdte vagter kunne kontrolleres');
+    }
+    const byCustomer = {};
+    for (const row of records.values()) {
+      if (row.end <= now()) byCustomer[row.customer] = (byCustomer[row.customer] || 0) + 1;
+    }
+    saveCachedWorkerHoverData(cacheKey, {byCustomer});
+    return byCustomer;
+  }
+
+  let workerHistoryActive = 0;
+  async function getWorkerCustomerHistory(workerId, customerNumber) {
+    if (!/^\d+$/.test(String(workerId)) || !/^\d+$/.test(String(customerNumber))) return null;
+    const key = 'history:' + workerId;
+    if (!workerHoverRequests.has(key)) {
+      // Rapid movement across photos must not launch an unbounded history scan.
+      if (workerHistoryActive >= 2) return null;
+      workerHistoryActive++;
+      workerHoverRequests.set(key, fetchWorkerCustomerHistory(workerId).finally(() => {
+        workerHoverRequests.delete(key);
+        workerHistoryActive--;
+      }));
+    }
+    const byCustomer = await workerHoverRequests.get(key);
+    return byCustomer[customerNumber] ?? 0;
+  }
   async function fetchMessageSnapshot() {
     const stamp = Date.now();
     const [counterResult, vagtResult, generalResult, allGeneralResult] = await Promise.allSettled([
@@ -4225,6 +4337,14 @@
       } catch (_) { return false; }
     };
     function configured() { return collector?.enabled === true && collectorExpires > Date.now(); }
+    function paintConfiguration() {
+      if (remoteStopped) status = 'Deaktiveret centralt';
+      else if (!configured()) status = 'Afventer opsætning';
+      else if (['Afventer opsætning', 'Afventer forbindelse', 'Deaktiveret centralt'].includes(status)) {
+        status = 'Klar; sender automatisk højst én gang i timen';
+      }
+      paint();
+    }
     function paint() {
       const checkbox = document.getElementById('tpWorkflowEnabled');
       if (checkbox) checkbox.checked = enabled();
@@ -4397,7 +4517,7 @@
       GM_setValue(WORKFLOW_CONFIG, {checkedAt:configCheckedAt, value:collector, disabled});
       if (disabled && !remoteStopped) { remoteStopped = true; await reset(); }
       if (collector) remoteStopped = false;
-      status = disabled ? 'Deaktiveret centralt' : collector ? 'Klar' : 'Afventer opsætning'; paint();
+      paintConfiguration();
     }
     function readConfig() {
       try {
@@ -4413,6 +4533,7 @@
         }
         else collector = null;
       } catch (_) { collector = null; }
+      paintConfiguration();
     }
     function send(packet, epoch) {
       return new Promise((resolve, reject) => {
@@ -5557,7 +5678,10 @@
         z-index: 10030;
         display: none;
         width: 300px;
-        overflow: hidden;
+        box-sizing: border-box;
+        max-width: calc(100vw - 10px);
+        max-height: calc(100vh - 10px);
+        overflow: auto;
         border: 1px solid #aeb2b4;
         border-radius: 2px;
         background: #ffffff;
@@ -5613,6 +5737,7 @@
         align-items: center;
         gap: 5px;
       }
+      .tp-worker-hover-label { overflow-wrap: anywhere; }
       .tp-worker-hover-value {
         justify-content: flex-end;
         color: #555b5e;
@@ -5673,7 +5798,7 @@
       .tp-worker-hover-marker-withdrawn { background: ${WORKER_WITHDRAWN_COLOR}; }
       .tp-worker-hover-pair {
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
       }
       .tp-worker-hover-pair .tp-worker-hover-row:first-child {
         border-right: 1px solid #d8dadb;
@@ -5713,7 +5838,7 @@
   function createWorkerHoverRow({ label, value, detail = '', href, marker = '' }) {
     const link = document.createElement('a');
     link.className = 'tp-worker-hover-row';
-    link.href = href;
+    if (href) link.href = href;
 
     const labelElement = document.createElement('span');
     labelElement.className = 'tp-worker-hover-label';
@@ -5729,6 +5854,7 @@
     valueElement.className = 'tp-worker-hover-value';
     const strong = document.createElement('strong');
     strong.textContent = value === null || value === undefined ? '–' : String(value);
+    if (value === null || value === undefined) link.title = 'Kunne ikke kontrolleres';
     valueElement.appendChild(strong);
     if (detail) {
       const detailElement = document.createElement('span');
@@ -5740,7 +5866,7 @@
     const arrow = document.createElement('span');
     arrow.className = 'tp-worker-hover-arrow';
     arrow.setAttribute('aria-hidden', 'true');
-    arrow.textContent = '›';
+    arrow.textContent = href ? '›' : '';
     link.append(labelElement, valueElement, arrow);
     return link;
   }
@@ -5789,14 +5915,14 @@
       href: buildWorkerProfileURL(context.workerId, '#vagter')
     });
     const sick = createWorkerHoverRow({
-      label: 'Sygevagter',
+      label: 'Sygemeldinger',
       detail: '90 dage',
       value: data.sickShifts,
       href: buildWorkerProfileURL(context.workerId, '#vagter,annullerede'),
       marker: 'sick'
     });
     const withdrawn = createWorkerHoverRow({
-      label: 'Sprunget fra',
+      label: 'Sprunget fra vagter',
       detail: '90 dage',
       value: data.withdrawnShifts,
       href: buildWorkerProfileURL(context.workerId, '#vagter,annullerede'),
@@ -5807,19 +5933,22 @@
     pair.append(
       createWorkerHoverRow({
         label: 'Klager',
-        detail: 'I alt',
         value: data.complaints,
         href: buildWorkerProfileURL(context.workerId, '#klager')
       }),
       createWorkerHoverRow({
         label: 'Blokeringer',
-        detail: 'Permanente',
         value: data.blockings,
         href: buildWorkerProfileURL(context.workerId, '#blokeringer')
       })
     );
+    const customer = createWorkerHoverRow({label:'Tidligere vagter hos kunde', detail:'I alt', value:data.customerPending ? '…' : data.customerShifts});
+    customer.dataset.customerHistory = 'true';
+    customer.title = context.customerNumber ? 'Afholdte vagter i alt hos kunde ' + context.customerNumber : 'Kundenummer kunne ikke bestemmes';
+    if (!data.customerPending && data.customerShifts == null) customer.title = 'Kundehistorik kunne ikke kontrolleres';
     popover.replaceChildren(
       createWorkerHoverHead(context.name),
+      customer,
       completed,
       sick,
       withdrawn,
@@ -5854,7 +5983,7 @@
       return text && !/^\d+$/.test(text) && !/^(Kalender|Stamdata|Kommunikation|Log)$/i.test(text);
     });
     const name = normalizeText(nameLink?.textContent);
-    return name ? { workerId, name } : null;
+    return name ? { workerId, name, customerNumber: readWorkerCustomerNumber() } : null;
   }
 
   function positionWorkerHover(popover, image) {
@@ -5905,9 +6034,15 @@
       renderWorkerHoverLoading(popover, activeContext);
       positionWorkerHover(popover, activeImage);
       try {
-        const data = await getWorkerHoverData(activeContext.workerId);
+        const context = activeContext;
+        const history = getWorkerCustomerHistory(context.workerId, context.customerNumber).catch(() => null);
+        const data = await getWorkerHoverData(context.workerId);
         if (generation !== requestGeneration || !activeImage || !activeContext) return;
-        renderWorkerHoverData(popover, activeContext, data);
+        renderWorkerHoverData(popover, context, {...data, customerPending:!!context.customerNumber});
+        positionWorkerHover(popover, activeImage);
+        const customerShifts = await history;
+        if (generation !== requestGeneration || !activeImage || !activeContext) return;
+        renderWorkerHoverData(popover, context, {...data, customerShifts});
         positionWorkerHover(popover, activeImage);
       } catch (error) {
         if (generation !== requestGeneration || !activeImage || !activeContext) return;
@@ -6026,7 +6161,7 @@
       AuthorizationDateFrom: '1899-12-31',
       AuthorizationDateTo: formatIsoDate(referenceDate),
       ProfessionGroup: profile.professionCode,
-      AuthorizationStatus: 'Valid',
+      AuthorizationStatus: 'NotSpecified',
       SeventyFiveYearsRule: 'NotSpecified'
     });
     return AUTREG_API_URL + '?' + params.toString();
@@ -6034,6 +6169,7 @@
 
   function normalizeAuthorizationName(value) {
     return normalizeText(value)
+      .normalize('NFC')
       .toLocaleLowerCase('da')
       .replace(/[^a-z0-9\u00c0-\u024f]+/gi, ' ')
       .replace(/\s+/g, ' ')
@@ -6050,11 +6186,12 @@
       const returnedName = normalizeAuthorizationName([record?.FirstName, record?.LastName].filter(Boolean).join(' '));
       const nameMatches = returnedName && (
         returnedName === expectedName ||
-        (allowNameVariant && expectedName && (returnedName.includes(expectedName) || expectedName.includes(returnedName)))
+        (allowNameVariant && expectedName && (
+          returnedName.includes(expectedName) || expectedName.includes(returnedName) ||
+          expectedName.split(' ').filter(Boolean).every(part => returnedName.split(' ').includes(part))
+        ))
       );
-      const validValue = record?.AuthorizationValid;
-      const isValid = validValue == null || validValue === true || /^(?:true|valid|gyldig)$/i.test(String(validValue));
-      return birthDate === profile.birthDate && professionCode === profile.professionCode && nameMatches && isValid;
+      return birthDate === profile.birthDate && professionCode === profile.professionCode && nameMatches && normalizeText(record?.AuthorizationID);
     });
     const uniqueMatches = new Map(matches.map(record => [
       String(record?.AuthorizationID || JSON.stringify(record)),
@@ -6067,6 +6204,32 @@
     const matches = getAuthorizationLookupMatches(payload, profile);
     return matches.length === 1 ? 'found' : matches.length > 1 ? 'multiple'
       : getAuthorizationLookupMatches(payload, profile, true).length ? 'possible' : 'not-found';
+  }
+
+  function authorizationRecordState(record) {
+    const value = record?.AuthorizationValid;
+    if (value === false || /^(?:false|invalid|ugyldig)$/i.test(String(value))) return 'invalid';
+    if (!(value === true || /^(?:true|valid|gyldig)$/i.test(String(value)))) return 'unknown';
+    if (isMeaningfulAuthorizationDate(record.TempAuthorizationEnd) && String(record.TempAuthorizationEnd).slice(0, 10) < formatIsoDate()) return 'invalid';
+    if (isMeaningfulAuthorizationDate(record.TempAuthorizationBegin) && String(record.TempAuthorizationBegin).slice(0, 10) > formatIsoDate()) return 'unknown';
+    return isTemporaryAuthorization(record) ? 'temporary' : 'valid';
+  }
+
+  async function findAuthorizationRecords(profile) {
+    const payload = await fetchPublicJson(buildAuthorizationLookupURL(profile));
+    const exact = getAuthorizationLookupMatches(payload, profile);
+    if (exact.length === 1) return {exact:exact[0], candidates:[]};
+    // Names in Temponizer may omit middle names. DOB and profession stay mandatory.
+    const expanded = await fetchPublicJson(buildAuthorizationLookupURL({...profile, name:''}));
+    getAuthorizationLookupMatches(expanded, profile); // Validate the response contract.
+    const candidates = expanded.GetHealthProfessionalsResult.filter(record =>
+      String(record?.BirthDate || '').slice(0, 10) === profile.birthDate &&
+      String(record?.ProfessionCode || '') === profile.professionCode &&
+      normalizeText(record?.FirstName) && normalizeText(record?.LastName) && normalizeText(record?.AuthorizationID));
+    const unique = [...new Map(candidates.map(record => [String(record.AuthorizationID), record])).values()];
+    if (unique.length > 30) throw new Error('For mange mulige autorisationsmatch');
+    const exactExpanded = getAuthorizationLookupMatches({GetHealthProfessionalsResult:unique}, profile);
+    return {exact:exactExpanded.length === 1 ? exactExpanded[0] : null, candidates:unique};
   }
 
   function isMeaningfulAuthorizationDate(value) {
@@ -6288,13 +6451,26 @@
       #tpAuthorizationLookupDetails[hidden] { display: none; }
       #tpAuthorizationLookupDetails > div {
         display: grid;
-        grid-template-columns: minmax(110px, 0.9fr) minmax(130px, 1.1fr);
+        grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
         gap: 10px;
         padding: 6px 0;
         border-bottom: 1px solid #e3e6e8;
       }
       #tpAuthorizationLookupDetails > div:last-child { border-bottom: 0; }
       #tpAuthorizationLookupDetails dt { color: #687278; }
+      #tpAuthorizationLookupDetails dt { min-width: 0; overflow-wrap: anywhere; }
+      #tpAuthorizationCandidates { padding: 0 10px; }
+      #tpAuthorizationCandidates > div { padding: 8px 0; border-bottom: 1px solid #e3e6e8; overflow-wrap: anywhere; }
+      #tpAuthorizationCandidates strong, #tpAuthorizationCandidates span { display: block; margin-bottom: 4px; }
+      #tpAuthorizationCandidates button, #tpAuthorizationSearch button {
+        font: inherit; padding: 4px 7px; border: 1px solid #aab2b6; border-radius: 3px;
+        background: #f5f6f6; color: #245c75; cursor: pointer;
+      }
+      #tpAuthorizationSearch { padding: 8px 10px; border-top: 1px solid #d6dbdd; }
+      #tpAuthorizationSearch label { display: block; margin-bottom: 4px; }
+      #tpAuthorizationSearch > div { display: flex; gap: 6px; }
+      #tpAuthorizationSearch input { width: 100%; min-width: 0; box-sizing: border-box; font: inherit; padding: 5px; }
+      #tpAuthorizationCandidates[hidden], #tpAuthorizationSearch[hidden] { display: none; }
       #tpAuthorizationLookupDetails dd {
         min-width: 0;
         margin: 0;
@@ -6390,6 +6566,32 @@
       appendAuthorizationDetail(details, 'Specialisering', getAuthorizationSpecialities(record));
     }
 
+    const candidates = popup.querySelector('#tpAuthorizationCandidates');
+    candidates.replaceChildren();
+    candidates.hidden = !options.candidates?.length;
+    for (const record of options.candidates || []) {
+      const row = document.createElement('div');
+      const name = document.createElement('strong');
+      name.textContent = normalizeText(record.FirstName + ' ' + record.LastName);
+      const identity = document.createElement('span');
+      identity.textContent = formatAuthorizationDate(record.BirthDate) + ' · ' + options.profile.professionLabel + ' · ' + record.AuthorizationID;
+      const confirm = document.createElement('button');
+      confirm.type = 'button';
+      confirm.textContent = 'Bekræft person';
+      confirm.addEventListener('click', () => {
+        if (!authorizationProfileUnchanged(options.originalProfile)) {
+          closeAuthorizationLookupPopup(button, popup);
+          return;
+        }
+        showAuthorizationRecord(button, record, options.profile);
+      });
+      row.append(name, identity, confirm);
+      candidates.appendChild(row);
+    }
+    const search = popup.querySelector('#tpAuthorizationSearch');
+    search.hidden = !options.allowSearch;
+    if (options.allowSearch) search.querySelector('input').value = options.profile?.name || '';
+
     const registerLink = popup.querySelector('#tpAuthorizationLookupRegisterLink');
     registerLink.href = buildAuthorizationRegisterURL(options.record, options.profile);
     popup.hidden = false;
@@ -6397,10 +6599,26 @@
     positionAuthorizationLookupPopup(button, popup);
   }
 
-  async function runAuthorizationLookup(container) {
+  function authorizationProfileUnchanged(profile) {
+    const current = readAuthorizationProfile();
+    return profile && ['name', 'birthDate', 'professionCode'].every(key => profile[key] === current[key]);
+  }
+
+  function showAuthorizationRecord(button, record, profile) {
+    const state = authorizationRecordState(record);
+    showAuthorizationLookupPopup(button, {
+      state:state === 'valid' ? 'success' : state === 'invalid' ? 'missing' : 'warning',
+      title:({valid:'Gyldig autorisation', temporary:'Midlertidig autorisation', invalid:'Autorisation ikke gyldig', unknown:'Gyldighed kunne ikke bekræftes'})[state],
+      subtitle:normalizeText(record.FirstName + ' ' + record.LastName) + ' · ' + profile.professionLabel,
+      record, profile
+    });
+  }
+
+  async function runAuthorizationLookup(container, searchName) {
     const button = container.querySelector('#tpAuthorizationLookupButton');
     if (!button || button.disabled) return;
-    const profile = readAuthorizationProfile();
+    const originalProfile = readAuthorizationProfile();
+    const profile = {...originalProfile, name:searchName === undefined ? originalProfile.name : normalizeText(searchName)};
 
     if (!profile.name) {
       showAuthorizationLookupPopup(button, {
@@ -6439,48 +6657,36 @@
       profile
     });
     try {
-      const payload = await fetchPublicJson(buildAuthorizationLookupURL(profile));
-      const matches = getAuthorizationLookupMatches(payload, profile);
-      if (matches.length === 1) {
-        const record = matches[0];
-        const temporary = isTemporaryAuthorization(record);
-        showAuthorizationLookupPopup(button, {
-          state: temporary ? 'temporary' : 'success',
-          title: temporary ? 'Midlertidig autorisation' : 'Gyldig autorisation',
-          subtitle: profile.name + ' \u00b7 ' + profile.professionLabel,
-          record,
-          profile
-        });
-      } else if (matches.length > 1) {
+      const result = await findAuthorizationRecords(profile);
+      if (!authorizationProfileUnchanged(originalProfile)) {
+        showAuthorizationLookupPopup(button, {state:'warning', title:'Oplysninger ændret', subtitle:'Start et nyt opslag', profile});
+        return;
+      }
+      if (result.exact) {
+        showAuthorizationRecord(button, result.exact, profile);
+      } else if (result.candidates.length) {
         showAuthorizationLookupPopup(button, {
           state: 'warning',
-          title: 'Flere mulige fund',
-          subtitle: 'Kontrollér resultatet manuelt i registeret',
-          profile
-        });
-      } else if (getAuthorizationLookupMatches(payload, profile, true).length) {
-        showAuthorizationLookupPopup(button, {
-          state: 'warning',
-          title: 'Muligt fund: navnet afviger',
-          subtitle: 'Kontrollér navnet manuelt i registeret',
-          profile
+          title: 'Bekræft den rigtige person',
+          subtitle: 'Fødselsdato og faggruppe stemmer; kontrollér navnet',
+          profile, originalProfile, candidates:result.candidates, allowSearch:true
         });
       } else {
         showAuthorizationLookupPopup(button, {
           state: 'missing',
-          title: 'Ingen gyldig autorisation fundet',
-          subtitle: 'Kontrollér oplysningerne manuelt',
-          profile
+          title: 'Ingen sikker autorisation fundet',
+          subtitle: 'Prøv et andet søgenavn eller kontrollér registeret',
+          profile, allowSearch:true
         });
       }
     } catch (error) {
-      console.warn('[TP][ERR][AUTREG]', error?.message || 'Kontrol mislykkedes');
+      console.warn('[TP][ERR][AUTREG] Kontrol mislykkedes');
       diagnostics.record('authorization','error',{outcome:diagnostics.errorKind(error)},true);
       showAuthorizationLookupPopup(button, {
         state: 'warning',
         title: 'Kontrol mislykkedes',
         subtitle: 'Prøv igen eller åbn registeret manuelt',
-        profile
+        profile, allowSearch:true
       });
     } finally {
       button.disabled = false;
@@ -6556,7 +6762,31 @@
       registerLink.rel = 'noopener noreferrer';
       registerLink.textContent = 'Åbn register \u2197';
       footer.append(note, registerLink);
-      popup.append(header, details, footer);
+      const candidates = document.createElement('div');
+      candidates.id = 'tpAuthorizationCandidates';
+      candidates.hidden = true;
+      const search = document.createElement('form');
+      search.id = 'tpAuthorizationSearch';
+      search.hidden = true;
+      const searchLabel = document.createElement('label');
+      searchLabel.htmlFor = 'tpAuthorizationSearchName';
+      searchLabel.textContent = 'Søgenavn (kun til dette opslag)';
+      const searchRow = document.createElement('div');
+      const searchInput = document.createElement('input');
+      searchInput.id = 'tpAuthorizationSearchName';
+      searchInput.type = 'text';
+      searchInput.maxLength = 150;
+      searchInput.autocomplete = 'off';
+      const searchButton = document.createElement('button');
+      searchButton.type = 'submit';
+      searchButton.textContent = 'Søg';
+      searchRow.append(searchInput, searchButton);
+      search.append(searchLabel, searchRow);
+      search.addEventListener('submit', event => {
+        event.preventDefault();
+        void runAuthorizationLookup(container, searchInput.value);
+      });
+      popup.append(header, details, candidates, search, footer);
 
       container.appendChild(button);
       select.insertAdjacentElement('afterend', container);
@@ -6574,7 +6804,6 @@
     };
     attach();
   }
-
   function isCprLookupAction(button) {
     if (!(button instanceof HTMLButtonElement)) return false;
     const action = button.getAttribute('onclick') || '';
