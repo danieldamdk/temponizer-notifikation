@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.22
+// @version      7.14.23
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.22';
+  const TP_VERSION = '7.14.23';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -1555,7 +1555,7 @@
   function selectGeneralHistoryRecords(visible, all, previous, time = Date.now()) {
     const index = generalMessageIndex([...all, ...visible], time);
     const visibleKeys = new Set(visible.map(record => record.key));
-    const records = new Map(visible.filter(record => record.unread > 0).map(record => [record.key, record]));
+    const records = new Map(visible.filter(record => record.unread > 0).map(record => [record.key, { ...record, hidden:false }]));
     for (const record of all) {
       if (!record.unread || records.has(record.key)) continue;
       const old = previous.records?.[record.key];
@@ -1628,7 +1628,6 @@
     }
     return null;
   }
-
   function cleanCellText(cell) {
     if (!cell) return '';
     const clone = cell.cloneNode(true);
@@ -2064,7 +2063,7 @@
         const parsed = parseWorkerCompletedPage(await fetchText(ORIGIN + '/index.php?' + params), type);
         if (!parsed.rows.length) throw new Error('Ufuldstændig vagthistorik');
         for (const row of parsed.rows) {
-          if (seen.has(row.id)) throw new Error('Vagthistorik ændret under hentning');
+          // Adjacent pages can overlap; identical rows still count only once.
           seen.add(row.id);
           const previous = records.get(row.id);
           if (previous && (previous.customer !== row.customer || previous.end !== row.end)) throw new Error('Vagthistorik ændret under hentning');
@@ -2483,6 +2482,13 @@
     );
   }
 
+  function messageBadgeTotal(state) {
+    // Hidden conversations still participate in delivery, but not the active inbox badge.
+    const hiddenIncoming = Object.values(state?.records || {})
+      .filter(record => record.hidden && isIncomingMessageRecord(record)).length;
+    return Math.max(0, clampInteger(state?.total, 0) - hiddenIncoming);
+  }
+
   function updateMessageBadge(total) {
     const badge = document.getElementById('tpMsgCountBadge');
     const previous = clampInteger(badge?.textContent, 0);
@@ -2607,7 +2613,7 @@
         genericSequence: 0,
         generalIndex:snapshot.generalIndex, generalHistorySince:snapshot.generalHistorySince
       });
-      updateMessageBadge(snapshot.total);
+      updateMessageBadge(messageBadgeTotal(snapshot));
       return { baseline: true, events: [] };
     }
 
@@ -2657,7 +2663,7 @@
       genericSequence,
       generalIndex:snapshot.generalIndex, generalHistorySince:snapshot.generalHistorySince
     });
-    updateMessageBadge(snapshot.total);
+    updateMessageBadge(messageBadgeTotal(snapshot));
     return { baseline: false, events, queued, pending };
   }
 
@@ -3690,7 +3696,7 @@
         } catch (_) {}
       }
       if (event.key === ST_MSG_KEY && event.newValue) {
-        try { updateMessageBadge(JSON.parse(event.newValue).total); } catch (_) {}
+        try { updateMessageBadge(messageBadgeTotal(JSON.parse(event.newValue))); } catch (_) {}
       }
       if (event.key === ST_INT_KEY && event.newValue) {
         try { updateInterestBadge(JSON.parse(event.newValue).total); } catch (_) {}
@@ -3703,7 +3709,6 @@
       if (event.key?.startsWith('tpPollHealthV1_') || event.key?.startsWith(OUTBOX_PREFIX)) paintPollingHealth();
     });
   }
-
   function odataQuote(value) {
     return String(value).replace(/'/g, "''");
   }
@@ -5351,7 +5356,7 @@
 
     const messageState = loadJson(ST_MSG_KEY, getDefaultMessageState());
     const interestState = loadJson(ST_INT_KEY, getDefaultInterestState());
-    setBadge(panel.querySelector('#tpMsgCountBadge'), messageState.total);
+    setBadge(panel.querySelector('#tpMsgCountBadge'), messageBadgeTotal(messageState));
     setBadge(panel.querySelector('#tpIntCountBadge'), interestState.total);
     paintPollingHealth();
     const health = panel.querySelector('#tpPollingHealth');
@@ -5830,7 +5835,7 @@
     nameElement.textContent = name;
     const period = document.createElement('span');
     period.className = 'tp-worker-hover-period';
-    period.textContent = 'Seneste 90 dage';
+    period.textContent = 'Vagthistorik';
     head.append(nameElement, period);
     return head;
   }
