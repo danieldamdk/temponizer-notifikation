@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.23
+// @version      7.14.24
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.23';
+  const TP_VERSION = '7.14.24';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -1489,10 +1489,10 @@
     return Array.from(merged.values());
   }
 
-  function prunePendingMessageEvents(pending, currentMap, currentTotal) {
+  function prunePendingMessageEvents(pending, currentMap, currentTotal, rawTotal = currentTotal) {
     const map = currentMap || {};
     return (pending || []).filter(event => {
-      if (event.kind === 'generic') return currentTotal >= clampInteger(event.targetTotal, 1);
+      if (event.kind === 'generic') return rawTotal !== 0 && currentTotal >= clampInteger(event.targetTotal, 1);
       const record = map[event.key];
       if (!isIncomingMessageRecord(record)) return false;
       if (event.record?.messageIdentity) return event.record.messageIdentity === record.messageIdentity;
@@ -2620,9 +2620,15 @@
     let events = diffMessageThreads(state.records, snapshot.records)
       .filter(event => event.kind !== 'thread' || isIncomingMessageRecord(event.record));
     const detailedDelta = events.reduce((sum, event) => sum + event.delta, 0);
-    const totalDelta = Math.max(0, snapshot.total - clampInteger(state.total, 0));
+    // Reconfirming the same dated message after a timeout is not new counter activity.
+    const restoredKnownThreads = Object.values(snapshot.records || {}).filter(record => {
+      const previous = state.records[record.key];
+      return record.messageIdentity && record.messageIdentity === previous?.messageIdentity
+        && isIncomingMessageRecord(record) && !isIncomingMessageRecord(previous);
+    }).length;
+    const totalDelta = Math.max(0, snapshot.total - clampInteger(state.total, 0) - restoredKnownThreads);
     let genericSequence = clampInteger(state.genericSequence, 0);
-    if (totalDelta > detailedDelta) {
+    if (snapshot.rawTotal !== 0 && totalDelta > detailedDelta) {
       const unknownDelta = totalDelta - detailedDelta;
       genericSequence += 1;
       events.push({
@@ -2640,7 +2646,7 @@
     for (const event of events) seen[event.eventId] = observedAt;
     seen = rememberMessageRecords(seen, snapshot.records, observedAt);
 
-    let pending = prunePendingMessageEvents(state.pending, snapshot.records, snapshot.total);
+    let pending = prunePendingMessageEvents(state.pending, snapshot.records, snapshot.total, snapshot.rawTotal);
     pending = mergePendingEvents(pending, events);
     let lastPush = clampInteger(state.lastPush, 0);
     let queued = [];
@@ -2987,14 +2993,14 @@
     const state = loadJson(job.kind === 'msg' ? ST_MSG_KEY : ST_INT_KEY, {});
     if (!state.initialized) return { ...job, status: 'waiting', reason: 'Afventer initialisering' };
     const relevant = job.kind === 'msg' ? job.events.filter(event => event.kind !== 'generic'
-      || Math.max(state.total || 0, state.rawTotal || 0) >= clampInteger(event.targetTotal, 1)) : job.events;
+      || (state.rawTotal !== 0 && Math.max(state.total || 0, state.rawTotal || 0) >= clampInteger(event.targetTotal, 1))) : job.events;
     if (!relevant.length) return { ...job, status:'cancelled', reason:'Hændelsen er ikke længere aktuel', notification:undefined, events:undefined };
     const uncertain = relevant.some(event => job.kind === 'int'
       ? interestBelongsToFailedShift(state.pairs?.[event.key] || event.entry, state.failedShifts || [])
       : (event.kind === 'generic' ? !!health.error : state.records?.[event.key]?.unread > 0 && state.records[event.key].incoming == null));
     if (uncertain) return { ...job, status: 'waiting', reason: 'Afventer kontrol af denne hændelse' };
     const events = job.kind === 'msg'
-      ? prunePendingMessageEvents(relevant, state.records, state.total)
+      ? prunePendingMessageEvents(relevant, state.records, state.total, state.rawTotal)
       : prunePendingInterestEvents(relevant, state.pairs);
     if (!events.length) return { ...job, status: 'cancelled', reason: 'Hændelsen er ikke længere aktuel', notification: undefined, events: undefined };
     return { ...job, events, notification: job.kind === 'msg' ? formatMessageNotification(events)
