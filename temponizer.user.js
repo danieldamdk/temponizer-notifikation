@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.24
+// @version      7.14.25
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.24';
+  const TP_VERSION = '7.14.25';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -158,7 +158,7 @@
       network:'Netværksfejl',http:'Serverfejl',unknown:'Ukendt udfald',queued:'I kø',sending:'Sender',sent:'Accepteret af Pushover',
       retry:'Nyt forsøg afventer',waiting:'Afventer',blocked:'Stoppet',cancelled:'Annulleret',expired:'Udløbet',handled:'Vist',ignored:'Ignoreret',duplicate:'Dublet'};
     let ready = false, unavailable = false, databasePromise = null, pending = [], memory = [], timer = null, flushing = null, dropped = 0;
-    const sampled = new Map();
+    const sampled = new Map(), failedScopes = new Set();
     const newTrace = () => { try { return crypto.randomUUID(); } catch (_) { return ''; } };
     const validTrace = value => typeof value === 'string' && uuid.test(value);
     function sanitize(value) {
@@ -262,9 +262,11 @@
         if(['messages','interest'].includes(scope)&&['finish','slow'].includes(event))return;
         const status=event==='error'?(statuses.has(data.outcome)?data.outcome:'failed')
           : ['partial','baseline'].includes(data.outcome)?data.outcome:'ok';
+        if(event==='error')failedScopes.add(scope);
+        const recovered=status==='ok'&&failedScopes.delete(scope);
         const sampleKey=scope+(event==='error'?':error:'+status:':poll');
         const previous=sampled.get(sampleKey), interval=status==='ok'?3600000:300000;
-        if(previous?.status===status&&Date.now()-previous.at<interval)return;
+        if(!recovered&&previous?.status===status&&Date.now()-previous.at<interval)return;
         sampled.set(sampleKey,{status,at:Date.now()});
         record(scope,'poll',status,{durationMs:data.durationMs});
       } catch (_) {}
@@ -1090,16 +1092,31 @@
     const doc = parseHtml(html);
     const startTime = range.start instanceof Date ? range.start.getTime() : -Infinity;
     const endTime = range.end instanceof Date ? range.end.getTime() : Infinity;
-    const records = [];
+    const recordsById = new Map();
+    const rows = Array.from(doc.querySelectorAll('tr[id^="vagtrow_"]'));
+    let complete = true;
 
-    for (const row of doc.querySelectorAll('tr[id^="vagtrow_"]')) {
+    for (const row of rows) {
       const date = parseDanishDate(row.textContent);
-      if (!date) continue;
+      const parts = normalizeText(row.textContent).match(/\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b/);
+      if (!date || !parts || date.getDate() !== Number(parts[1]) || date.getMonth() + 1 !== Number(parts[2]) || date.getFullYear() !== Number(parts[3])) {
+        complete = false;
+        continue;
+      }
+      const id = row.id.match(/^vagtrow_(?:booket_)?(\d+)$/)?.[1];
       const marker = row.querySelector('span[style*="background-color"]');
       const color = (marker?.getAttribute('style')?.match(/#[0-9a-f]{6}/i)?.[0] || '').toLowerCase();
-      records.push({ date, color });
+      const relevant = date.getTime() >= startTime && date.getTime() <= endTime;
+      if (!id || !color) {
+        if (relevant) complete = false;
+        continue;
+      }
+      const previous = recordsById.get(id);
+      if (previous && (previous.date.getTime() !== date.getTime() || previous.color !== color)) complete = false;
+      recordsById.set(id, { id, date, color });
     }
 
+    const records = [...recordsById.values()];
     const inRange = records.filter(record => {
       const time = record.date.getTime();
       return time >= startTime && time <= endTime;
@@ -1113,9 +1130,11 @@
       : null;
 
     return {
-      withdrawnShifts: inRange.filter(record => record.color === WORKER_WITHDRAWN_COLOR).length,
-      recognized: records.length > 0 || /ingen (?:annullerede )?vagter/i.test(doc.body?.textContent || ''),
-      redSickMarkers: inRange.filter(record => record.color === WORKER_SICK_COLOR).length,
+      withdrawnShifts: complete ? inRange.filter(record => record.color === WORKER_WITHDRAWN_COLOR).length : null,
+      recognized: rows.length > 0 || /ingen (?:annullerede )?vagter/i.test(doc.body?.textContent || ''),
+      complete,
+      records,
+      redSickMarkers: complete ? inRange.filter(record => record.color === WORKER_SICK_COLOR).length : null,
       recordCount: records.length,
       oldestDate: oldestTime === null ? null : new Date(oldestTime),
       nextOffsets: Array.from(new Set(offsets.filter(offset => offset > 0))).sort((left, right) => left - right)
@@ -1494,6 +1513,7 @@
     return (pending || []).filter(event => {
       if (event.kind === 'generic') return rawTotal !== 0 && currentTotal >= clampInteger(event.targetTotal, 1);
       const record = map[event.key];
+      if (record?.unread > 0 && record.incoming == null) return true;
       if (!isIncomingMessageRecord(record)) return false;
       if (event.record?.messageIdentity) return event.record.messageIdentity === record.messageIdentity;
       const activity = stableMessageActivity(event.record?.activity);
@@ -1563,7 +1583,15 @@
       // Hidden old conversations form a baseline, not a backlog to send after installing the update.
       if (changed || old?.hidden) records.set(record.key, { ...record, hidden:!visibleKeys.has(record.key) });
     }
-    return { index, records:Array.from(records.values()) };
+    return { index, records:Array.from(records.values()).map(record => {
+      const oldIndex = previous.generalIndex?.[record.key], current = index[record.key];
+      const old = previous.records?.[record.key];
+      const advanced = !!previous.generalIndex && (!oldIndex || current.unread > oldIndex.unread
+        || (/^\d{1,2}:\d{2}$/.test(current.activity)
+          && (current.activity !== oldIndex.activity || current.day !== oldIndex.day)));
+      // Retain observed new activity through deferred history reads, never infer it from visibility.
+      return { ...record, historyAfterBaseline:advanced || (old?.incoming == null && old?.historyAfterBaseline === true) };
+    }) };
   }
 
   async function enrichGeneralMessageHistories(snapshot) {
@@ -1974,6 +2002,7 @@
   async function fetchWorkerCancellationSummary(workerId, range) {
     const pendingOffsets = [0];
     const visitedOffsets = new Set();
+    const records = new Map();
     let withdrawnShifts = 0;
 
     while (pendingOffsets.length && visitedOffsets.size < WORKER_HOVER_CANCEL_PAGE_LIMIT) {
@@ -1984,7 +2013,15 @@
         encodeURIComponent(workerId) + '&type=annullerede&field=dato&sort=desc&offset=' + offset;
       const parsed = parseWorkerCancellationHTML(await fetchText(url), range);
       if (!parsed.recognized) throw new Error('Annullerede vagter kunne ikke kontrolleres');
-      withdrawnShifts += parsed.withdrawnShifts;
+      if (!parsed.complete) return { withdrawnShifts: null };
+      for (const record of parsed.records) {
+        const previous = records.get(record.id);
+        if (previous && (previous.date.getTime() !== record.date.getTime() || previous.color !== record.color)) return { withdrawnShifts: null };
+        if (previous) continue;
+        records.set(record.id, record);
+        const time = record.date.getTime();
+        if (record.color === WORKER_WITHDRAWN_COLOR && time >= (range?.start?.getTime() ?? -Infinity) && time <= (range?.end?.getTime() ?? Infinity)) withdrawnShifts++;
+      }
 
       for (const nextOffset of parsed.nextOffsets) {
         if (!visitedOffsets.has(nextOffset) && !pendingOffsets.includes(nextOffset)) pendingOffsets.push(nextOffset);
@@ -2034,12 +2071,47 @@
     return data;
   }
 
-  function getWorkerHoverData(workerId) {
-    const key = String(workerId);
-    if (!workerHoverRequests.has(key)) {
-      workerHoverRequests.set(key, fetchWorkerHoverData(key).finally(() => workerHoverRequests.delete(key)));
+  let workerHoverActive = 0;
+  const workerHoverQueue = new Map();
+
+  function drainWorkerHoverQueue() {
+    for (const [key, job] of workerHoverQueue) {
+      if (job.consumers.some(isCurrent => isCurrent())) continue;
+      workerHoverQueue.delete(key);
+      workerHoverRequests.delete(key);
+      job.resolve(null);
     }
-    return workerHoverRequests.get(key);
+    while (workerHoverActive < 2 && workerHoverQueue.size) {
+      const [key, job] = workerHoverQueue.entries().next().value;
+      workerHoverQueue.delete(key);
+      workerHoverActive++;
+      fetchWorkerHoverData(key).then(job.resolve, job.reject).finally(() => {
+        workerHoverRequests.delete(key);
+        workerHoverActive--;
+        drainWorkerHoverQueue();
+      });
+    }
+  }
+
+  function getWorkerHoverData(workerId, isCurrent = () => true) {
+    const key = String(workerId);
+    const cached = getCachedWorkerHoverData(key);
+    if (cached) {
+      drainWorkerHoverQueue();
+      return Promise.resolve(cached);
+    }
+    if (!workerHoverRequests.has(key)) {
+      let resolve, reject;
+      const promise = new Promise((onSuccess, onError) => { resolve = onSuccess; reject = onError; });
+      workerHoverRequests.set(key, promise);
+      workerHoverQueue.set(key, {resolve, reject, consumers:[isCurrent]});
+    } else if (workerHoverQueue.has(key)) {
+      workerHoverQueue.get(key).consumers.push(isCurrent);
+    }
+    const promise = workerHoverRequests.get(key);
+    // Only queued obsolete work is dropped; shared in-flight reads can finish and populate the cache.
+    drainWorkerHoverQueue();
+    return promise;
   }
 
   async function fetchWorkerCustomerHistory(workerId) {
@@ -2113,10 +2185,15 @@
     if (counterResult.status === 'rejected' && vagtResult.status === 'rejected' && generalResult.status === 'rejected') {
       throw new Error('Alle beskedkilder fejlede');
     }
+    // User messages have no list fallback; a failed counter must not become zero.
+    if (counterResult.status === 'rejected') {
+      throw new Error('Beskedtællerne kunne ikke kontrolleres. Seneste kendte status bevares.');
+    }
 
-    const counters = counterResult.status === 'fulfilled'
-      ? parseMessageCounters(counterResult.value)
-      : { vagt: null, generel: null, brugere: null };
+    const counters = parseMessageCounters(counterResult.value);
+    if (counters.brugere === null) {
+      throw new Error('Tælleren for brugerbeskeder er ukendt. Seneste kendte status bevares.');
+    }
     const vagtIndex = vagtResult.status === 'fulfilled'
       ? parseMessageIndexHTML(vagtResult.value, 'vagt')
       : { records: [], unread: 0, recognized: false };
@@ -2184,7 +2261,7 @@
     const rawTotal = Math.max(counterTotal, topMenuFallback);
     const indexedVagtTotal = sourceRecords.filter(record => record.type === 'vagt').length;
     const vagtFallback = Math.max(0, vagtTotal - indexedVagtTotal);
-    const userFallback = counters.brugere ?? 0;
+    const userFallback = counters.brugere;
     const total = incomingTotal + vagtFallback + userFallback;
 
     return {
@@ -2641,8 +2718,15 @@
       });
     }
 
-    events = events.filter(event => !seen[event.eventId]
-      && !(event.record?.messageIdentity && event.record.messageAt <= (snapshot.generalHistorySince || 0)));
+    const historySince = snapshot.generalHistorySince || 0;
+    events = events.filter(event => {
+      const record = event.record;
+      const baselineHistory = record?.messageIdentity && record.messageAt <= historySince;
+      // History timestamps have minute precision; a verified index advance can be newer than the baseline.
+      const advancedInBaselineMinute = record?.historyAfterBaseline === true
+        && record.messageAt >= Math.floor(historySince / 60000) * 60000;
+      return !seen[event.eventId] && (!baselineHistory || advancedInBaselineMinute);
+    });
     for (const event of events) seen[event.eventId] = observedAt;
     seen = rememberMessageRecords(seen, snapshot.records, observedAt);
 
@@ -2651,10 +2735,12 @@
     let lastPush = clampInteger(state.lastPush, 0);
     let queued = [];
 
-    if (pending.length && Date.now() - lastPush > SUPPRESS_MS && takeChannelLock('msg')) {
-      dispatchNotification('msg', 'tpPushEnableMsg', formatMessageNotification(pending), pending.map(event => event.eventId), pending);
-      queued = pending;
-      pending = [];
+    const ready = pending.filter(event => event.kind === 'generic' || isIncomingMessageRecord(snapshot.records?.[event.key]));
+    if (ready.length && Date.now() - lastPush > SUPPRESS_MS && takeChannelLock('msg')) {
+      dispatchNotification('msg', 'tpPushEnableMsg', formatMessageNotification(ready), ready.map(event => event.eventId), ready);
+      queued = ready;
+      const queuedIds = new Set(ready.map(event => event.eventId));
+      pending = pending.filter(event => !queuedIds.has(event.eventId));
       lastPush = Date.now();
     }
 
@@ -2831,7 +2917,7 @@
       timeout,
       headers: {
         'Accept': '*/*',
-        'Referer': globalThis.location?.href || ORIGIN,
+        ...(new URL(url, ORIGIN).origin === ORIGIN ? {Referer:globalThis.location?.href || ORIGIN} : {}),
         'Cache-Control': 'no-cache',
         'Pragma': 'no-cache'
       }
@@ -3251,13 +3337,16 @@
         ].join(';');
         document.body.appendChild(element);
         requestAnimationFrame(() => { element.style.opacity = '1'; });
+      } else {
+        element.style.opacity = '1';
       }
       element.textContent = safeMessage;
       positionDomToast(element);
       clearTimeout(element._tpTimer);
+      clearTimeout(element._tpRemoveTimer);
       element._tpTimer = setTimeout(() => {
         element.style.opacity = '0';
-        setTimeout(() => element.remove(), 250);
+        element._tpRemoveTimer = setTimeout(() => element.remove(), 250);
       }, duration);
     } catch (_) {}
   }
@@ -3517,7 +3606,7 @@
       event: normalizeText(config.event) || 'Opkalds start',
       type: normalizeText(config.type) || 'HTTP metoder',
       method: normalizeText(config.method).toUpperCase() || 'POST',
-      scope: normalizeText(config.scope) || 'Global'
+      scope: normalizeText(config.scope) || 'Delte medarbejdere'
     };
   }
 
@@ -3679,22 +3768,67 @@
     }
   }
 
+  const TOAST_EVENT_TTL_MS = 30000;
+  let toastCleanupTimer = null, toastBroadcastInitialized = false;
+
+  function parseToastBroadcast(raw) {
+    if (typeof raw !== 'string' || raw.length > 2048) return null;
+    try {
+      const data = JSON.parse(raw);
+      if (!data || Array.isArray(data) || Object.keys(data).sort().join(',') !== 'id,message,ts,type'
+          || typeof data.id !== 'string' || !/^[a-z0-9_-]{1,96}$/i.test(data.id)
+          || !['msg','int','mail'].includes(data.type)
+          || typeof data.message !== 'string' || !data.message.length || data.message.length > 260
+          || !Number.isSafeInteger(data.ts) || data.ts <= 0) return null;
+      return data;
+    } catch (_) { return null; }
+  }
+
+  function cleanupToastBroadcast() {
+    clearTimeout(toastCleanupTimer);
+    toastCleanupTimer = null;
+    try {
+      const raw = localStorage.getItem(TOAST_EVT_KEY);
+      if (raw === null) return;
+      const data = parseToastBroadcast(raw), age = data ? Date.now() - data.ts : -1;
+      if (!data || age < 0 || age >= TOAST_EVENT_TTL_MS) {
+        if (localStorage.getItem(TOAST_EVT_KEY) === raw) localStorage.removeItem(TOAST_EVT_KEY);
+        return;
+      }
+      toastCleanupTimer = setTimeout(() => {
+        toastCleanupTimer = null;
+        // A timer for an older event must not remove a newer tab's transport payload.
+        try { if (localStorage.getItem(TOAST_EVT_KEY) === raw) cleanupToastBroadcast(); } catch (_) {}
+      }, TOAST_EVENT_TTL_MS - age);
+    } catch (_) {}
+  }
+
   function broadcastToast(type, message) {
     try {
-      localStorage.setItem(TOAST_EVT_KEY, JSON.stringify({
+      const raw = JSON.stringify({
         id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
         type,
-        message,
+        message: truncateText(message, 260),
         ts: Date.now()
-      }));
+      });
+      if (!parseToastBroadcast(raw)) return;
+      localStorage.setItem(TOAST_EVT_KEY, raw);
+      cleanupToastBroadcast();
     } catch (_) {}
   }
 
   function initToastBroadcast() {
+    if (toastBroadcastInitialized) return;
+    toastBroadcastInitialized = true;
+    cleanupToastBroadcast();
+    window.addEventListener('pageshow', cleanupToastBroadcast);
+    document.addEventListener('visibilitychange', cleanupToastBroadcast);
     window.addEventListener('storage', event => {
-      if (event.key === TOAST_EVT_KEY && event.newValue) {
+      if (event.key === TOAST_EVT_KEY) {
+        cleanupToastBroadcast();
         try {
-          const data = JSON.parse(event.newValue);
+          const data = parseToastBroadcast(event.newValue);
+          if (!data || Date.now() < data.ts || Date.now() - data.ts >= TOAST_EVENT_TTL_MS) return;
           const seenKey = 'tpToastSeen_' + data.id;
           if (sessionStorage.getItem(seenKey)) return;
           sessionStorage.setItem(seenKey, '1');
@@ -4453,7 +4587,7 @@
           if (row) {
             if (!Number.isFinite(row.value.at) || row.value.at <= Date.now() - maxAge
                 || row.value.at > Date.now() + 60000 || !validateWorkflowPacket(row.value.packet)) { row.delete(); row.continue(); return; }
-            if (row.value.attempts >= 3 || row.value.retryAt > Date.now()) { row.continue(); return; }
+            if (row.value.quarantined || row.value.attempts >= 3 || row.value.retryAt > Date.now()) { row.continue(); return; }
             set(row.value.packet); return;
           }
           const events = tx.objectStore('events'), cursor = events.index('order').openCursor(), selected = [];
@@ -4556,10 +4690,13 @@
         const timer = setTimeout(() => { try { activeRequest?.abort(); } catch (_) {} finish(true); }, 15000);
         if (!enabled() || epoch !== generation || !configured()) { finish(true); return; }
         try {
-          activeRequest = GM_xmlhttpRequest({method:'POST', url:collector.url, anonymous:true,
+          activeRequest = GM_xmlhttpRequest({method:'POST', url:collector.url, anonymous:true, redirect:'error',
             headers:{'Content-Type':'application/json'}, data:JSON.stringify({type:'message', workflow:packet}), timeout:15000,
             onload:response => {
               try {
+                if (response.status >= 400 && response.status < 500 && ![408, 425, 429].includes(response.status)) {
+                  finish(null, {rejected:true}); return;
+                }
                 if (response.status === 202) { finish(null, {accepted:true}); return; }
                 const receipt = JSON.parse(response.responseText);
                 if (response.status !== 200 || receipt.stored !== true || receipt.id !== packet.id) return finish(true);
@@ -4600,7 +4737,14 @@
           if (!packet) { status = 'Vagtlog kunne ikke genkendes; intet udtræk gemt'; paint(); return; }
           await transact('readwrite', tx => {
             if (!initialized || !enabled() || !configured() || epoch !== generation) return;
-            if (previous?.packetId !== packet.id) tx.objectStore('packets').put({id:packet.id, at:Date.now(), packet});
+            if (previous?.packetId !== packet.id) {
+              const packets = tx.objectStore('packets'), request = packets.get(packet.id);
+              request.onsuccess = () => {
+                if (!request.result && initialized && enabled() && configured() && epoch === generation) {
+                  packets.put({id:packet.id, at:Date.now(), packet});
+                }
+              };
+            }
             tx.objectStore('logs').put({id:key, at:Date.now(), packetId:packet.id});
             prune(tx.objectStore('logs'), 200); prune(tx.objectStore('packets'), 32);
           });
@@ -4625,9 +4769,24 @@
           if (Number.isFinite(nextSend) && nextSend > Date.now() && nextSend <= Date.now() + WORKFLOW_SEND_MS) return;
           const packet = await nextPacket();
           if (!packet || !enabled() || epoch !== generation) return;
+          // The receiver deduplicates immutable packet IDs. Reserve before I/O so a crash cannot reset retries.
+          const attempt = await transact('readwrite', (tx, set) => {
+            const packets = tx.objectStore('packets'), request = packets.get(packet.id);
+            request.onsuccess = () => {
+              const row = request.result, count = row?.attempts ?? 0;
+              if (!row || !enabled() || epoch !== generation || row.quarantined || count >= 3 || row.retryAt > Date.now()) return;
+              if (!Number.isInteger(count) || count < 0) { row.quarantined = true; packets.put(row); return; }
+              row.attempts = count + 1;
+              row.retryAt = Date.now() + (row.attempts === 1 ? 1 : 3) * 86400000;
+              row.outcome = 'unknown';
+              row.quarantined = row.attempts >= 3;
+              packets.put(row); set(row.attempts);
+            };
+          });
+          if (!attempt || !enabled() || epoch !== generation) return;
           GM_setValue('tpWorkflowNextSendAtV1', Date.now() + WORKFLOW_SEND_MS);
           status = 'Sender opsummering'; paint();
-          const receipt = await send(packet, epoch);
+          const receipt = await send(packet, epoch).catch(() => ({unknown:true}));
           if (!enabled() || epoch !== generation) return;
           await transact('readwrite', tx => {
             const packets = tx.objectStore('packets');
@@ -4635,10 +4794,19 @@
             const request = packets.get(packet.id);
             request.onsuccess = () => {
               const row = request.result;
-              if (row) { row.attempts = (row.attempts || 0) + 1; row.retryAt = Date.now() + (row.attempts === 1 ? 1 : 3) * 86400000; packets.put(row); }
+              if (row) {
+                row.outcome = receipt.rejected ? 'rejected' : receipt.accepted ? 'accepted' : 'unknown';
+                if (receipt.rejected) row.quarantined = true;
+                packets.put(row);
+              }
             };
           });
-          status = receipt.stored ? 'Seneste opsummering gemt' : 'Modtaget til behandling; lokal kopi beholdes'; paint();
+          status = receipt.stored ? 'Seneste opsummering gemt'
+            : receipt.rejected ? 'Indsendelse afvist; lokal kopi tilbageholdt uden nye forsøg'
+            : receipt.accepted ? 'Modtaget til behandling; lokal kopi beholdes'
+            : attempt >= 3 ? 'Levering ukendt; lokal kopi tilbageholdt uden nye forsøg'
+            : 'Indsendelse afventer; levering ukendt, lokal kopi beholdes';
+          paint();
         });
       } catch (_) { status = 'Indsendelse afventer; data beholdes lokalt'; paint(); }
     }
@@ -4704,7 +4872,9 @@
       dialog.addEventListener('close', () => dialog.remove());
       document.body.appendChild(dialog); dialog.showModal();
       void report().then(result => {
-        dialog.querySelector('#tpWorkflowQueueCount').textContent = result.events.length + ' handlinger og ' + result.packets.length + ' pakker afventer. ' + result.dropped + ' poster udeladt ved kapacitetsgrænsen.';
+        const held = result.packets.filter(row => row.quarantined || row.attempts >= 3).length;
+        dialog.querySelector('#tpWorkflowQueueCount').textContent = result.events.length + ' handlinger og ' + (result.packets.length - held) + ' pakker afventer. '
+          + held + ' pakker tilbageholdt uden nye forsøg. ' + result.dropped + ' poster udeladt ved kapacitetsgrænsen.';
       }).catch(() => { dialog.querySelector('#tpWorkflowQueueCount').textContent = 'Den lokale kø kunne ikke læses.'; });
     }
     return Object.freeze({init, menu, paint, show, record, enabled, setEnabled, flush, nextPacket, report, tick, validateConfig, collectShiftLog,
@@ -4720,6 +4890,8 @@
   }
 
   const workflowTracker = createWorkflowTracker();
+  const ipnordicGuideConfigs = new WeakMap();
+
   function injectIPnordicGuideStyles() {
     if (document.getElementById('tpIPnordicGuideStyles')) return;
     const style = document.createElement('style');
@@ -4850,9 +5022,13 @@
       textarea.value = text;
       textarea.style.cssText = 'position:fixed;left:-9999px;top:0';
       document.body.appendChild(textarea);
-      textarea.select();
-      if (!document.execCommand('copy')) throw new Error('Kopiering blev afvist');
-      textarea.remove();
+      try {
+        textarea.select();
+        if (!document.execCommand('copy')) throw new Error('Kopiering blev afvist');
+      } finally {
+        textarea.value = '';
+        textarea.remove();
+      }
     }
     const original = button.textContent;
     button.textContent = 'Kopieret';
@@ -4886,8 +5062,9 @@
           <p class="tp-ip-path">Filer &gt; Indstillinger &gt; Programmer &gt; Tilføj</p>
           <div class="tp-ip-settings" aria-label="Indstillinger">
             <span>Kør automatisk</span><span>Indgående</span><span>Opkalds start</span>
-            <span>HTTP metoder</span><span>POST</span><span>Global</span>
+            <span>HTTP metoder</span><span>POST</span><span>Delte medarbejdere</span>
           </div>
+          <p class="tp-ip-path">Vælg kun medarbejdere, der bruger integrationen. Tilføj også dig selv. Brug ikke Global.</p>
           <div class="tp-ip-actions">
             <button id="tpIPnordicCopyUrl" class="tp-ip-button" type="button" disabled>Kopiér URL</button>
             <button id="tpIPnordicCopyDescription" class="tp-ip-button" type="button" disabled>Kopiér beskrivelse</button>
@@ -4911,6 +5088,7 @@
 
     const close = () => {
       backdrop.hidden = true;
+      ipnordicGuideConfigs.delete(backdrop);
       if (backdrop._tpTestTimer) diagnostics.record('phone','test',{outcome:'cancelled'},true);
       if (backdrop._tpTestTimer) clearInterval(backdrop._tpTestTimer);
       backdrop._tpTestTimer = null;
@@ -4925,11 +5103,11 @@
     const copyUrlButton = backdrop.querySelector('#tpIPnordicCopyUrl');
     const copyDescriptionButton = backdrop.querySelector('#tpIPnordicCopyDescription');
     copyUrlButton.addEventListener('click', async () => {
-      try { await copyIPnordicText(backdrop._tpConfig?.url, copyUrlButton); }
+      try { await copyIPnordicText(ipnordicGuideConfigs.get(backdrop)?.url, copyUrlButton); }
       catch (_) { showDomToast('URL kunne ikke kopieres.'); }
     });
     copyDescriptionButton.addEventListener('click', async () => {
-      try { await copyIPnordicText(backdrop._tpConfig?.description, copyDescriptionButton); }
+      try { await copyIPnordicText(ipnordicGuideConfigs.get(backdrop)?.description, copyDescriptionButton); }
       catch (_) { showDomToast('Beskrivelsen kunne ikke kopieres.'); }
     });
 
@@ -5000,7 +5178,7 @@
     const testButton = backdrop.querySelector('#tpIPnordicStartTest');
     const testState = backdrop.querySelector('#tpIPnordicTestState');
     const testText = backdrop.querySelector('#tpIPnordicTestText');
-    backdrop._tpConfig = null;
+    ipnordicGuideConfigs.delete(backdrop);
     backdrop.hidden = false;
     connectionState.dataset.state = 'warning';
     connectionState.textContent = 'Kontrollerer…';
@@ -5029,7 +5207,8 @@
         getIncomingCallUserEmail(),
         getIPnordicSetupConfig(true)
       ]);
-      backdrop._tpConfig = config;
+      if (backdrop.hidden) return;
+      ipnordicGuideConfigs.set(backdrop, config);
       connectionState.dataset.state = 'success';
       connectionState.textContent = 'Forbundet';
       connectionText.textContent = 'SharePoint er klar for ' + email + '.';
@@ -5114,6 +5293,7 @@
 
     globalThis.addEventListener('storage', event => {
       if (event.key !== PANEL_COLLAPSED_KEY) return;
+      if (event.newValue === 'true') closeMenu();
       setPanelCollapsed(panel, event.newValue === 'true', false);
     });
   }
@@ -5170,6 +5350,7 @@
     initIPnordicSetupGuide(panel);
     const gearButton = panel.querySelector('#tpGearBtn');
     let menu = null;
+    let cleanupMenuListeners = () => {};
 
     function buildMenu() {
       if (menu) return menu;
@@ -5183,6 +5364,7 @@
         borderRadius: '8px',
         boxShadow: '0 10px 28px rgba(0,0,0,.20)',
         padding: '10px',
+        boxSizing: 'border-box',
         width: '320px',
         maxWidth: 'calc(100vw - 16px)',
         maxHeight: '70vh',
@@ -5194,7 +5376,7 @@
         '<div style="font-weight:700;margin-bottom:6px">Indstillinger</div>' +
         '<div style="margin-bottom:10px">' +
           '<div style="font-weight:600;margin-bottom:4px">Pushover USER-token</div>' +
-          '<input id="tpUserKeyMenu" type="text" autocomplete="off" placeholder="uxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:6px">' +
+          '<input id="tpUserKeyMenu" type="password" autocomplete="off" placeholder="Ny USER-token" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:6px">' +
           '<div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
             '<button id="tpSaveUserKeyMenu" type="button" style="padding:6px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer">Gem</button>' +
             '<a href="https://pushover.net/" target="_blank" rel="noopener" style="color:#06c;text-decoration:none">Guide</a>' +
@@ -5229,16 +5411,25 @@
       diagnostics.paint();
       diagnosticSharing.paint();
       const input = menu.querySelector('#tpUserKeyMenu');
-      input.value = getUserKey();
-      menu.querySelector('#tpSaveUserKeyMenu').addEventListener('click', () => {
-        GM_setValue('tpUserKey', String(input.value || '').trim());
-        showToast('USER-token gemt.');
-      });
+      function saveUserKey() {
+        const value = String(input.value || '').trim();
+        input.value = '';
+        if (!value) {
+          showToast('Ingen ny USER-token angivet. Gemt token er uændret.');
+          return;
+        }
+        try {
+          GM_setValue('tpUserKey', value);
+          if (getUserKey() !== value) throw new Error('Token storage unconfirmed');
+          input.placeholder = 'Gemt token bevares';
+          showToast('USER-token gemt.');
+        } catch (_) { showToast('Kunne ikke gemme USER-token. Kontrollér lagring og prøv igen.'); }
+      }
+      menu.querySelector('#tpSaveUserKeyMenu').addEventListener('click', saveUserKey);
       input.addEventListener('keydown', event => {
         if (event.key !== 'Enter') return;
         event.preventDefault();
-        GM_setValue('tpUserKey', String(input.value || '').trim());
-        showToast('USER-token gemt.');
+        saveUserKey();
       });
       menu.querySelector('#tpTestPushover').addEventListener('click', () => {
         tpTestPushoverBoth();
@@ -5295,14 +5486,18 @@
       });
     }
 
+    function closeMenu() {
+      if (!menu) return;
+      menu.style.display = 'none';
+      menu.querySelector('#tpUserKeyMenu').value = '';
+      cleanupMenuListeners();
+      cleanupMenuListeners = () => {};
+    }
+
     function toggleMenu(show) {
+      if (show === false || menu?.style.display === 'block') return closeMenu();
       const element = buildMenu();
-      if (show === false) {
-        element.style.display = 'none';
-        return;
-      }
-      element.style.display = element.style.display === 'block' ? 'none' : 'block';
-      if (element.style.display !== 'block') return;
+      element.style.display = 'block';
       element.style.visibility = 'hidden';
       paintContactSyncUI();
       workflowTracker.paint();
@@ -5310,24 +5505,25 @@
       element.style.visibility = 'visible';
       ensureFullyVisible(element);
       const input = element.querySelector('#tpUserKeyMenu');
-      if (input) input.value = getUserKey();
+      if (input) {
+        input.value = '';
+        input.placeholder = getUserKey() ? 'Gemt token bevares' : 'Ny USER-token';
+      }
       diagnostics.paint();
       diagnosticSharing.paint();
       const outside = event => {
-        if (element.style.display !== 'block') return cleanup();
+        if (element.style.display !== 'block') return closeMenu();
         if (element.contains(event.target) || event.target === gearButton) return;
-        element.style.display = 'none';
-        cleanup();
+        closeMenu();
       };
       const escape = event => {
         if (event.key !== 'Escape') return;
-        element.style.display = 'none';
-        cleanup();
+        closeMenu();
       };
-      function cleanup() {
+      cleanupMenuListeners = () => {
         document.removeEventListener('mousedown', outside, true);
         document.removeEventListener('keydown', escape, true);
-      }
+      };
       document.addEventListener('mousedown', outside, true);
       document.addEventListener('keydown', escape, true);
     }
@@ -6046,12 +6242,12 @@
       positionWorkerHover(popover, activeImage);
       try {
         const context = activeContext;
-        const history = getWorkerCustomerHistory(context.workerId, context.customerNumber).catch(() => null);
-        const data = await getWorkerHoverData(context.workerId);
-        if (generation !== requestGeneration || !activeImage || !activeContext) return;
+        const isCurrent = () => generation === requestGeneration && !!activeImage && !!activeContext;
+        const data = await getWorkerHoverData(context.workerId, isCurrent);
+        if (!isCurrent() || !data) return;
         renderWorkerHoverData(popover, context, {...data, customerPending:!!context.customerNumber});
         positionWorkerHover(popover, activeImage);
-        const customerShifts = await history;
+        const customerShifts = await getWorkerCustomerHistory(context.workerId, context.customerNumber).catch(() => null);
         if (generation !== requestGeneration || !activeImage || !activeContext) return;
         renderWorkerHoverData(popover, context, {...data, customerShifts});
         positionWorkerHover(popover, activeImage);
@@ -6221,6 +6417,7 @@
     const value = record?.AuthorizationValid;
     if (value === false || /^(?:false|invalid|ugyldig)$/i.test(String(value))) return 'invalid';
     if (!(value === true || /^(?:true|valid|gyldig)$/i.test(String(value)))) return 'unknown';
+    if ([record.TempAuthorizationBegin, record.TempAuthorizationEnd].some(isMalformedAuthorizationDate)) return 'unknown';
     if (isMeaningfulAuthorizationDate(record.TempAuthorizationEnd) && String(record.TempAuthorizationEnd).slice(0, 10) < formatIsoDate()) return 'invalid';
     if (isMeaningfulAuthorizationDate(record.TempAuthorizationBegin) && String(record.TempAuthorizationBegin).slice(0, 10) > formatIsoDate()) return 'unknown';
     return isTemporaryAuthorization(record) ? 'temporary' : 'valid';
@@ -6244,14 +6441,20 @@
   }
 
   function isMeaningfulAuthorizationDate(value) {
-    const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+    const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})(?:T([0-2]\d):([0-5]\d):([0-5]\d)(?:\.\d+)?(?:Z|[+-]([0-2]\d):([0-5]\d))?)?$/);
     if (!match) return false;
     const year = Number(match[1]);
     const month = Number(match[2]);
     const day = Number(match[3]);
-    if (year < 1800 || year > 2999) return false;
+    if (year < 1800 || year > 2999 || Number(match[4] || 0) > 23 || Number(match[7] || 0) > 23) return false;
     const date = new Date(Date.UTC(year, month - 1, day));
     return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+  }
+
+  function isMalformedAuthorizationDate(value) {
+    if (value === undefined || value === null || value === '') return false;
+    if (/^0001-01-01(?:T00:00:00(?:\.0+)?(?:Z|[+-]00:00)?)?$/.test(String(value))) return false;
+    return !isMeaningfulAuthorizationDate(value);
   }
 
   function formatAuthorizationDate(value) {
@@ -6288,6 +6491,7 @@
   function getAuthorizationType(record) {
     const returnedType = normalizeText(record?.AuthorizationTypeName || record?.AuthorizationType);
     if (returnedType) return returnedType;
+    if ([record?.TempAuthorizationBegin, record?.TempAuthorizationEnd].some(isMalformedAuthorizationDate)) return 'Ikke oplyst';
     return isTemporaryAuthorization(record) ? 'Midlertidig autorisation' : 'Varig autorisation';
   }
 
