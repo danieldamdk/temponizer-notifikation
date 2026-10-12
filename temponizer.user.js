@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.25
+// @version      7.14.26
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.25';
+  const TP_VERSION = '7.14.26';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -843,11 +843,19 @@
   }
 
   function parseMessageCounters(payload) {
-    const data = payload && typeof payload === 'object' ? payload : {};
+    const data = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+    const read = key => {
+      if (!Object.prototype.hasOwnProperty.call(data, key)) return null;
+      const value = data[key];
+      // Temponizer's counter endpoint uses an empty string for a zero badge.
+      if (value === '') return 0;
+      const count = typeof value === 'number' || typeof value === 'string' ? parseNullableCount(value) : null;
+      return count !== null && Number.isSafeInteger(Number(value)) ? count : null;
+    };
     return {
-      vagt: parseNullableCount(data.vagt_unread),
-      generel: parseNullableCount(data.generel_unread),
-      brugere: parseNullableCount(data.brugere_unread)
+      vagt: read('vagt_unread'),
+      generel: read('generel_unread'),
+      brugere: read('brugere_unread')
     };
   }
 
