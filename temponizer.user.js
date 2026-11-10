@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.26
+// @version      7.14.27
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.26';
+  const TP_VERSION = '7.14.27';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -537,6 +537,7 @@
     const events = new Set(['start', 'finish', 'error', 'slow', 'leader', 'visibility', 'skip', 'snapshot', 'queue', 'call', 'test', 'detail', 'lag', 'storage']);
     const outcomes = new Set(['ok', 'failed', 'timeout', 'login', 'network', 'http', 'unknown', 'leader', 'follower', 'visible', 'hidden', 'inflight', 'duplicate', 'ignored', 'handled', 'baseline', 'pending', 'queued', 'sending', 'sent', 'retry', 'waiting', 'blocked', 'cancelled', 'expired', 'enabled', 'disabled', 'missing', 'partial', 'fallback']);
     const numbers = ['durationMs', 'count', 'pending', 'attempt', 'httpStatus', 'operation'];
+    const measurementLabels = {request:'Netværkskald', operation:'Samlet kontrol', processing:'Lokal behandling', wait:'Ventetid på lås'};
     const labels = { runtime:'Script', messages:'Beskeder', interest:'Interesser', phone:'Telefon', mail:'Mail', sms:'SMS', worker:'Vikaroverblik', authorization:'Autorisation', update:'Opdatering', network:'Netværk', html:'HTML', lock:'Flerfanelås', push:'Pushover', workflow:'Hjælp til udvikling' };
     const eventLabels = {start:'Start',finish:'Afsluttet',error:'Fejl',slow:'Langsomt',leader:'Faneansvar',visibility:'Synlighed',skip:'Sprunget over',snapshot:'Kontrol',queue:'Afsendelse',call:'Opkald',test:'Telefontest',detail:'Detaljelog',lag:'Forsinkelse',storage:'Lagring'};
     const outcomeLabels = {ok:'OK',failed:'mislykket',timeout:'tidsgrænse nået',login:'login/adgang',network:'netværk',http:'serversvar',unknown:'uafklaret',leader:'ansvarlig fane',follower:'anden fane har ansvaret',visible:'synlig',hidden:'i baggrunden',inflight:'allerede i gang',duplicate:'dublet',ignored:'ignoreret',handled:'vist',baseline:'startniveau',pending:'afventer',queued:'i kø',sending:'sender',sent:'sendt',retry:'nyt forsøg',waiting:'venter',blocked:'stoppet',cancelled:'annulleret',expired:'udløbet',enabled:'slået til',disabled:'slået fra',missing:'mangler',partial:'ufuldstændig',fallback:'reserveløsning'};
@@ -551,6 +552,7 @@
       if (!Number.isFinite(value.at) || value.at < Date.now() - maxAge || value.at > Date.now() + 60000) return null;
       const clean = { at: value.at, sequence: value.sequence, scope: value.scope, event: value.event };
       if (outcomes.has(value.outcome)) clean.outcome = value.outcome;
+      if (typeof value.measurement === 'string' && Object.prototype.hasOwnProperty.call(measurementLabels, value.measurement)) clean.measurement = value.measurement;
       for (const key of numbers) if (safeCount(value[key])) clean[key] = Math.round(value[key]);
       return clean;
     }
@@ -651,19 +653,20 @@
       if (error?.name === 'TypeError') return 'network';
       return 'failed';
     }
-    function begin(scope, slowMs = 1000) {
+    function begin(scope, slowMs = 1000, measurement = 'operation') {
       const started = tick();
       const id = ++operation;
-      record(scope,'start',{operation:id});
+      record(scope,'start',{operation:id, measurement});
       let finished = false;
       return (error = null, data = {}) => {
         if (finished) return;
         finished = true;
         const durationMs = tick() - started;
-        const sample = ['messages','interest','phone','mail','push'].includes(scope) && Date.now() - (sampledAt.get(scope) || 0) >= 60000;
-        if (sample) sampledAt.set(scope,Date.now());
+        const sampleKey = scope + ':' + (typeof measurement === 'string' && Object.prototype.hasOwnProperty.call(measurementLabels, measurement) ? measurement : 'unknown');
+        const sample = ['messages','interest','phone','mail','push'].includes(scope) && Date.now() - (sampledAt.get(sampleKey) || 0) >= 60000;
+        if (sample) sampledAt.set(sampleKey,Date.now());
         record(scope,error ? 'error' : durationMs >= slowMs ? 'slow' : 'finish',
-          { ...data, operation:id, durationMs, outcome:error ? errorKind(error) : 'ok' }, !!error || durationMs >= slowMs || sample);
+          { ...data, operation:id, durationMs, measurement, outcome:error ? errorKind(error) : 'ok' }, !!error || durationMs >= slowMs || sample);
       };
     }
     function requestScope(url) {
@@ -706,7 +709,7 @@
       for (const row of rows) {
         const line = document.createElement('div');
         line.style.cssText = 'padding:6px 0;border-top:1px solid #ddd;overflow-wrap:anywhere';
-        line.textContent = new Date(row.at).toLocaleTimeString('da-DK') + ' · #' + row.runtime + ' · ' + labels[row.scope] + ' · ' + eventLabels[row.event] + (row.outcome ? ' / ' + outcomeLabels[row.outcome] : '') + (row.durationMs != null ? ' · ' + row.durationMs + ' ms' : '') + (row.count != null ? ' · antal: ' + row.count : '');
+        line.textContent = new Date(row.at).toLocaleTimeString('da-DK') + ' · #' + row.runtime + ' · ' + labels[row.scope] + (row.measurement ? ' · ' + measurementLabels[row.measurement] : '') + ' · ' + eventLabels[row.event] + (row.outcome ? ' / ' + outcomeLabels[row.outcome] : '') + (row.durationMs != null ? ' · ' + row.durationMs + ' ms' : '') + (row.count != null ? ' · antal: ' + row.count : '');
         list.appendChild(line);
       }
       dialog.appendChild(list); document.body.appendChild(dialog); dialog.addEventListener('close',()=>dialog.remove(),{once:true}); dialog.showModal();
@@ -871,7 +874,7 @@
   }
 
   function parseHtml(html) {
-    const finish = diagnostics.begin('html', 100);
+    const finish = diagnostics.begin('html', 100, 'processing');
     let parseError = null;
     try { return new DOMParser().parseFromString(String(html || ''), 'text/html'); }
     catch (error) {parseError=error;throw error;}
@@ -880,9 +883,13 @@
 
   function parseLabelCount(value, zeroWhenUnnumbered = false) {
     const text = normalizeText(value);
-    const match = text.match(/\(([\d.]+)\)\s*$/);
-    if (match) return clampInteger(match[1].replace(/\./g, ''), 0);
-    return zeroWhenUnnumbered && text ? 0 : null;
+    const match = text.match(/\((\d+|\d{1,3}(?:\.\d{3})+)\)$/);
+    if (match) {
+      const count = Number(match[1].replace(/\./g, ''));
+      return Number.isSafeInteger(count) ? count : null;
+    }
+    const knownEmptyLabel = /^(?:afholdte - (?:ikke godkendt|godkendt)|løn udbetalt|klager|blokeringer)$/i.test(text);
+    return zeroWhenUnnumbered && knownEmptyLabel ? 0 : null;
   }
 
   function formatDanishDate(date) {
@@ -983,22 +990,48 @@
     const doc = parseHtml(html);
     const matches = [];
     const seen = new Set();
-    for (const row of doc.querySelectorAll('tr')) {
-      const profileLink = row.querySelector('a[href*="page=showvikaroplysninger"][href*="vikar_id="]');
-      const phoneLinks = Array.from(row.querySelectorAll('a[href^="tel:"], a[href^="callto:"]'));
-      const href = profileLink?.getAttribute('href') || '';
-      const workerId = href.match(/[?&]vikar_id=(\d+)/)?.[1] || '';
-      const rowPhone = phoneLinks.map(link => normalizePhoneNumber(link.getAttribute('href') || link.textContent))
-        .find(value => value === phone) || '';
-      if (!workerId || rowPhone !== phone || seen.has(workerId)) continue;
-
-      const profileLinks = Array.from(row.querySelectorAll('a[href*="page=showvikaroplysninger"][href*="vikar_id="]'));
-      const nameLink = profileLinks.find(link => !/^\d+$/.test(normalizeText(link.textContent))) || profileLink;
-      const name = normalizeText(nameLink?.textContent);
-      if (!name) continue;
-      seen.add(workerId);
-      matches.push({ workerId, name, phone: rowPhone, profileUrl: buildWorkerProfileURL(workerId) });
+    const emptyText = 'Der blev ikke fundet nogen vikarer';
+    const workerTables = Array.from(doc.querySelectorAll('table')).filter(table => {
+      const headers = Array.from(table.querySelectorAll('th')).map(th => normalizeText(th.textContent));
+      return headers.join('|') === 'Nr|Navn|Postnummer/by|Telefon|Uddannelse';
+    });
+    let recognized = false;
+    for (const table of workerTables) {
+      const rows = Array.from(table.rows).filter(row => !row.querySelector('th'));
+      if (!rows.length) throw new Error('Telefonopslag er ufuldstændigt');
+      const emptyRows = rows.filter(row => normalizeText(row.textContent) === emptyText && row.cells.length === 1 && row.cells[0].colSpan === 5);
+      if (emptyRows.length) {
+        if (rows.length !== 1) throw new Error('Modstridende telefonopslag');
+        recognized = true;
+      } else if (rows.some(row => !row.querySelector('a[href*="page=showvikaroplysninger"][href*="vikar_id="]'))) {
+        throw new Error('Telefonopslag er ufuldstændigt');
+      }
     }
+    const workerRows = Array.from(doc.querySelectorAll('tr')).filter(row => row.querySelector('a[href*="page=showvikaroplysninger"][href*="vikar_id="]'));
+    for (const row of workerRows) {
+      const phoneLinks = Array.from(row.querySelectorAll('a[href^="tel:"], a[href^="callto:"]'));
+      const phones = phoneLinks.map(link => normalizePhoneNumber(link.getAttribute('href') || link.textContent)).filter(Boolean);
+      const profileLinks = Array.from(row.querySelectorAll('a[href*="page=showvikaroplysninger"][href*="vikar_id="]'));
+      const identities = profileLinks.map(link => {
+        const url = new URL(link.getAttribute('href'), location.href);
+        const id = url.searchParams.get('vikar_id');
+        if (url.origin !== location.origin || url.searchParams.get('page') !== 'showvikaroplysninger'
+          || url.searchParams.getAll('vikar_id').length !== 1 || !/^\d+$/.test(id || '')) {
+          throw new Error('Ugyldig identitet i telefonopslag');
+        }
+        return id;
+      });
+      const workerId = identities[0];
+      if (identities.some(id => id !== workerId)) throw new Error('Modstridende identitet i telefonopslag');
+      const nameLink = profileLinks.find(link => normalizeText(link.textContent) && !/^\d+$/.test(normalizeText(link.textContent)));
+      const name = normalizeText(nameLink?.textContent);
+      if (!workerId || !name || !phones.length) throw new Error('Telefonopslag er ufuldstændigt');
+      recognized = true;
+      if (!phones.includes(phone) || seen.has(workerId)) continue;
+      seen.add(workerId);
+      matches.push({ workerId, name, phone, profileUrl: buildWorkerProfileURL(workerId) });
+    }
+    if (!recognized || doc.querySelector('#login-form, form[action*="login"]')) throw new Error('Telefonopslag kunne ikke kontrolleres');
     return matches;
   }
 
@@ -1012,7 +1045,7 @@
     const completedCounts = completedTabs.map(tab => tab ? parseLabelCount(tab.textContent, true) : null);
     const complaintTab = doc.querySelector('#klager_link');
     return {
-      totalCompletedShifts: completedCounts.every(Number.isInteger)
+      totalCompletedShifts: completedCounts.every(Number.isSafeInteger) && Number.isSafeInteger(completedCounts.reduce((sum, count) => sum + count, 0))
         ? completedCounts.reduce((sum, count) => sum + count, 0)
         : null,
       complaints: complaintTab ? parseLabelCount(complaintTab.textContent, true) : null
@@ -1170,10 +1203,10 @@
 
   function readUnreadValue(row) {
     const input = row.querySelector('input[id*="unread_count"], input[name*="unread_count"]');
-    if (input) return clampInteger(input.value, 0);
-    const count = getFirstText(row, ['[id^="new_count_"]', '[class*="unread"]']);
-    const match = count.match(/\d+/);
-    return match ? clampInteger(match[0], 0) : 0;
+    const value = normalizeText(input ? input.value : getFirstText(row, ['[id^="new_count_"]', '[class*="unread"]']));
+    // Unlike the native aggregate badge, an absent/empty row counter is not a known zero.
+    const count = /^\d+$/.test(value) ? Number(value) : null;
+    return Number.isSafeInteger(count) ? count : null;
   }
 
   function parseMessageRowIdentity(row, typeHint) {
@@ -1205,6 +1238,7 @@
     ));
     const seenNodes = new Set();
     const records = [];
+    let complete = true;
 
     for (const candidate of candidates) {
       const row = candidate.closest('.vikarsms, .generelsms, [id^="vikarsms_"], [id^="generelsms_"]') || candidate;
@@ -1212,7 +1246,10 @@
       seenNodes.add(row);
 
       const identity = parseMessageRowIdentity(row, typeHint);
-      if (!identity) continue;
+      if (!identity) {
+        complete = false;
+        continue;
+      }
 
       const unread = readUnreadValue(row);
       const name = getFirstText(row, [
@@ -1241,12 +1278,13 @@
       });
     }
 
+    complete = complete && records.every(record => record.unread !== null);
     return {
       records,
-      unread: records.reduce((sum, record) => sum + record.unread, 0),
-      recognized: records.length > 0
+      unread: complete ? records.reduce((sum, record) => sum + record.unread, 0) : null,
+      recognized: complete && (records.length > 0
         || (candidates.length === 0 && !!doc.querySelector('#vikar_sms_list'))
-        || /Endnu ikke aktiveret|ingen beskeder/i.test(doc.body?.textContent || '')
+        || /Endnu ikke aktiveret|ingen beskeder/i.test(doc.body?.textContent || ''))
     };
   }
 
@@ -1907,7 +1945,7 @@
   }
 
   async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS, responseType = 'text') {
-    const finish = diagnostics.begin(diagnostics.requestScope(url), 3000);
+    const finish = diagnostics.begin(diagnostics.requestScope(url), 3000, 'request');
     let requestError = null;
     const controller = new AbortController();
     let timer;
@@ -1969,9 +2007,6 @@
       },
       body
     });
-    if (parseHtml(html).querySelector('#login-form, form[action*="login"]')) {
-      throw new Error('TP_LOGIN_REQUIRED');
-    }
     return parseIncomingCallSearchHTML(html, normalized);
   }
 
@@ -2165,6 +2200,8 @@
   async function getWorkerCustomerHistory(workerId, customerNumber) {
     if (!/^\d+$/.test(String(workerId)) || !/^\d+$/.test(String(customerNumber))) return null;
     const key = 'history:' + workerId;
+    const cached = getCachedWorkerHoverData(key);
+    if (cached?.byCustomer) return cached.byCustomer[customerNumber] ?? 0;
     if (!workerHoverRequests.has(key)) {
       // Rapid movement across photos must not launch an unbounded history scan.
       if (workerHistoryActive >= 2) return null;
@@ -2211,9 +2248,12 @@
     const allGeneralIndex = allGeneralResult.status === 'fulfilled'
       ? parseMessageIndexHTML(allGeneralResult.value, 'generel')
       : { records: [], unread: 0, recognized:false };
-    const vagtAvailable = vagtResult.status === 'fulfilled' && (vagtIndex.recognized || counters.vagt === 0);
-    const generalAvailable = generalResult.status === 'fulfilled' && (generalIndex.recognized || counters.generel === 0);
+    const vagtAvailable = vagtResult.status === 'fulfilled' && vagtIndex.unread !== null
+      && (vagtIndex.recognized || counters.vagt === 0);
+    const generalAvailable = generalResult.status === 'fulfilled' && generalIndex.unread !== null
+      && (generalIndex.recognized || counters.generel === 0);
     const allGeneralAvailable = allGeneralResult.status === 'fulfilled'
+      && allGeneralIndex.unread !== null
       && (allGeneralIndex.recognized || (counters.generel === 0 && !generalIndex.records.length));
     if (!vagtAvailable || !generalAvailable || !allGeneralAvailable) {
       throw new Error('Beskedoversigten er ufuldstændig. Seneste kendte status bevares.');
@@ -2418,6 +2458,8 @@
     };
   }
 
+  let leadershipSequence = 0;
+
   function getLeader() {
     try {
       return JSON.parse(localStorage.getItem(LEADER_KEY) || 'null');
@@ -2437,9 +2479,25 @@
     return !!(leader && leader.id === TAB_ID && leader.until > now());
   }
 
+  function getLeadershipGeneration() {
+    const leader = getLeader();
+    return leader?.id === TAB_ID && leader.until > now()
+      && typeof leader.generation === 'string' && leader.generation ? leader.generation : null;
+  }
+
+  function isCurrentLeadership(generation) {
+    return !!generation && getLeadershipGeneration() === generation;
+  }
+
   function writeLeadership(time = now()) {
+    const previous = getLeader();
+    // Heartbeats retain the fence; reacquisition and legacy leases must create a new one.
+    const generation = previous?.id === TAB_ID && previous.until > time
+      && typeof previous.generation === 'string' && previous.generation
+      ? previous.generation : `${TAB_ID}:${++leadershipSequence}`;
     setLeader({
       id: TAB_ID,
+      generation,
       until: time + LEASE_MS,
       ts: time,
       visible: !document.hidden,
@@ -2515,7 +2573,7 @@
 
   async function withCrossTabProcessLock(name, task) {
     let started = false;
-    const finishWait = diagnostics.begin('lock', 1000);
+    const finishWait = diagnostics.begin('lock', 1000, 'wait');
     try {
       if (globalThis.navigator?.locks?.request) {
         return await globalThis.navigator.locks.request(
@@ -2533,7 +2591,18 @@
       diagnostics.record('lock', 'error', { outcome:'fallback' }, true);
       console.warn('[TP] Browserens flerfanelås fejlede; bruger lokal reserve.', error);
     }
-    return withLocalStorageMutex(name, () => { finishWait(); return task(); });
+    try {
+      const result = await withLocalStorageMutex(name, () => {
+        started = true;
+        finishWait();
+        return task();
+      });
+      if (!started) finishWait(new Error('Timeout'));
+      return result;
+    } catch (error) {
+      if (!started) finishWait(error);
+      throw error;
+    }
   }
 
   function takeChannelLock(kind) {
@@ -2819,7 +2888,8 @@
   }
 
   async function pollMessages() {
-    if (!isLeader() || messagePollInFlight) {
+    const generation = getLeadershipGeneration();
+    if (!generation || messagePollInFlight) {
       diagnostics.record('messages','skip',{outcome:messagePollInFlight ? 'inflight' : 'follower'});
       return;
     }
@@ -2828,11 +2898,12 @@
     messagePollInFlight = true;
     try {
       const snapshot = await fetchMessageSnapshot();
+      if (!isCurrentLeadership(generation)) return;
       const enriched = await refreshMessageEnrichmentIfNeeded(snapshot);
-      if (!isLeader()) return;
+      if (!isCurrentLeadership(generation)) return;
       await withCrossTabProcessLock('message-state', async () => {
-        if (!isLeader()) return;
-        const processed = diagnostics.begin('messages', 100);
+        if (!isCurrentLeadership(generation)) return;
+        const processed = diagnostics.begin('messages', 100, 'processing');
         const result = processMessageSnapshot(enriched);
         processed(null, {count:Object.keys(enriched.records || {}).length});
         const unresolved = hasUnresolvedGeneralDirection(enriched.records);
@@ -2845,7 +2916,7 @@
     } catch (error) {
       pollError = error;
       console.warn('[TP][ERR][MSG]', error);
-      setPollingHealth('msg', pollingFailureText(error));
+      if (isCurrentLeadership(generation)) setPollingHealth('msg', pollingFailureText(error));
     } finally {
       messagePollInFlight = false;
       finish(pollError);
@@ -2853,7 +2924,8 @@
   }
 
   async function pollInterest() {
-    if (!isLeader() || interestPollInFlight) {
+    const generation = getLeadershipGeneration();
+    if (!generation || interestPollInFlight) {
       diagnostics.record('interest','skip',{outcome:interestPollInFlight ? 'inflight' : 'follower'});
       return;
     }
@@ -2862,10 +2934,10 @@
     interestPollInFlight = true;
     try {
       const snapshot = await fetchInterestSnapshot();
-      if (!isLeader()) return;
+      if (!isCurrentLeadership(generation)) return;
       await withCrossTabProcessLock('interest-state', async () => {
-        if (!isLeader()) return;
-        const processed = diagnostics.begin('interest', 100);
+        if (!isCurrentLeadership(generation)) return;
+        const processed = diagnostics.begin('interest', 100, 'processing');
         const result = processInterestSnapshot(snapshot);
         processed(null, {count:Object.keys(snapshot.pairs || {}).length});
         diagnostics.record('interest','snapshot',{outcome:snapshot.failedShifts?.length ? 'partial' : result.baseline ? 'baseline' : 'ok',count:result.events.length,pending:result.pending?.length || 0},!!snapshot.failedShifts?.length || result.events.length > 0);
@@ -2874,7 +2946,7 @@
     } catch (error) {
       pollError = error;
       console.warn('[TP][ERR][INT]', error);
-      setPollingHealth('int', pollingFailureText(error));
+      if (isCurrentLeadership(generation)) setPollingHealth('int', pollingFailureText(error));
     } finally {
       interestPollInFlight = false;
       finish(pollError);
@@ -2882,7 +2954,7 @@
   }
   function gmRequest(options) {
     return new Promise((resolve, reject) => {
-      const finishDiagnostic = diagnostics.begin(diagnostics.requestScope(options.url), 3000);
+      const finishDiagnostic = diagnostics.begin(diagnostics.requestScope(options.url), 3000, 'request');
       let request;
       let settled = false;
       const timeout = options.timeout || FETCH_TIMEOUT_MS;
@@ -3487,8 +3559,29 @@
     return isHidden || !hasFocus;
   }
 
-  async function claimIncomingCall(phone, eventId = phone) {
+  let incomingCallAccountGeneration = 0;
+  let incomingCallIdentityRequest = 0;
+  let incomingCallIdentityApplied = 0;
+
+  function getIncomingCallAccount() {
+    return { email: incomingCallUserEmail, generation: incomingCallAccountGeneration };
+  }
+
+  function isIncomingCallAccountCurrent(account) {
+    return !!account?.email && account.email === incomingCallUserEmail
+      && account.generation === incomingCallAccountGeneration;
+  }
+
+  async function releaseIncomingCallClaim(eventId) {
+    await withCrossTabProcessLock('incoming-call', () => {
+      const claim = loadJson(INCOMING_CALL_LOCK_KEY, null);
+      if (claim?.eventId === eventId && claim.owner === TAB_ID) localStorage.removeItem(INCOMING_CALL_LOCK_KEY);
+    });
+  }
+
+  async function claimIncomingCall(phone, eventId = phone, account = null) {
     return withCrossTabProcessLock('incoming-call', () => {
+      if (account && !isIncomingCallAccountCurrent(account)) return false;
       const last = loadJson(INCOMING_CALL_LOCK_KEY, null);
       const time = now();
       const lastEventId = last?.eventId || last?.phone;
@@ -3499,21 +3592,31 @@
   }
 
   async function handleIncomingCall(phone, eventId = phone, options = {}) {
-    if (options.queueTagged !== true && await consumeRecentOutgoingCall(phone)) {
+    const account = options.account || (incomingCallUserEmail ? getIncomingCallAccount() : null);
+    const isCurrent = () => !account || isIncomingCallAccountCurrent(account);
+    if (!isCurrent()) return { status: 'stale' };
+    const outgoing = options.queueTagged !== true && await consumeRecentOutgoingCall(phone);
+    if (!isCurrent()) return { status: 'stale' };
+    if (outgoing) {
       diagnostics.record('phone','call',{outcome:'ignored'},true);
       console.info('[TP][CALL] Ignorerer callback fra et nyligt udgående opkald', formatPhoneNumber(phone));
       return { status: 'ignored' };
     }
-    const claimed = await claimIncomingCall(phone, eventId);
+    const claimed = await claimIncomingCall(phone, eventId, account);
+    if (!isCurrent()) {
+      if (claimed) await releaseIncomingCallClaim(eventId);
+      return { status: 'stale' };
+    }
     if (!claimed) {
       diagnostics.record('phone','call',{outcome:'duplicate'},true);
       return { status: 'duplicate' };
     }
-    const finishDiagnostic = diagnostics.begin('phone', 3000);
+    const finishDiagnostic = diagnostics.begin('phone', 3000, 'operation');
     let lookupError = null;
-    showIncomingCallCard({ phone, state: 'loading' });
+    const loadingCard = showIncomingCallCard({ phone, state: 'loading' });
     try {
       const matches = await fetchIncomingCallMatches(phone);
+      if (!isCurrent()) return { status: 'stale' };
       showIncomingCallCard({ phone, matches });
       diagnostics.record('phone','call',{outcome:'handled',count:matches.length},true);
       if (shouldShowIncomingCallOsNotification()) {
@@ -3524,15 +3627,17 @@
       }
       return { status: 'handled', matches: matches.length };
     } catch (error) {
+      if (!isCurrent()) return { status: 'stale' };
       lookupError = error;
       console.warn('[TP][CALL] Nummeropslag fejlede', error);
       showIncomingCallCard({ phone, state: error?.message === 'TP_LOGIN_REQUIRED' ? 'login' : 'error' });
-      await withCrossTabProcessLock('incoming-call', () => {
-        const claim = loadJson(INCOMING_CALL_LOCK_KEY, null);
-        if (claim?.eventId === eventId && claim.owner === TAB_ID) localStorage.removeItem(INCOMING_CALL_LOCK_KEY);
-      });
+      await releaseIncomingCallClaim(eventId);
       return { status: 'failed', reason: error?.message };
     } finally {
+      if (!isCurrent()) {
+        if (loadingCard.isConnected) removeIncomingCallCard();
+        await releaseIncomingCallClaim(eventId);
+      }
       finishDiagnostic(lookupError);
     }
   }
@@ -3570,18 +3675,32 @@
 
   async function getIncomingCallUserEmail(force = false) {
     if (!force && incomingCallUserEmail && now() - incomingCallUserEmailCheckedAt < 60000) return incomingCallUserEmail;
+    const requestId = ++incomingCallIdentityRequest;
     const response = await gmRequest({
       url: TP_CALL_QUEUE.spSite.replace(/\/$/, '') + '/_api/web/currentuser?$select=Email',
       headers: { 'Accept': 'application/json;odata=nometadata' }
+    }).catch(error => {
+      if (requestId < incomingCallIdentityApplied) throw new Error('TP_CALL_ACCOUNT_CHANGED');
+      throw error;
     });
+    // Neither success nor failure from an older identity request may undo a newer one.
+    if (requestId < incomingCallIdentityApplied) throw new Error('TP_CALL_ACCOUNT_CHANGED');
     if (/^https:\/\/(?:login\.(?:microsoftonline\.com|windows\.net)|[^/]*\.sharepoint\.com\/.*Authenticate)/i.test(response.finalUrl || '')) {
       throw new Error('SP_LOGIN_REQUIRED');
     }
     const json = JSON.parse(response.responseText || '{}');
     const email = normalizeText(json.Email || json?.d?.Email).toLocaleLowerCase('da');
     if (!email || !email.includes('@')) throw new Error('SharePoint-brugerens e-mail mangler');
+    incomingCallIdentityApplied = requestId;
+    const changed = email !== incomingCallUserEmail;
+    if (changed) incomingCallAccountGeneration++;
     incomingCallUserEmail = email;
     incomingCallUserEmailCheckedAt = now();
+    if (changed) {
+      removeIncomingCallCard();
+      invalidateIPnordicGuideAccount();
+      paintIPnordicSetupStatus('ready');
+    }
     return email;
   }
 
@@ -3650,7 +3769,7 @@
     const button = document.getElementById('tpIPnordicSetupBtn');
     if (!status) return;
     const verified = getIPnordicVerification();
-    if (verified && (!incomingCallUserEmail || verified.email === incomingCallUserEmail) && state !== 'login' && state !== 'error') {
+    if (verified && incomingCallUserEmail && verified.email === incomingCallUserEmail && state !== 'login' && state !== 'error') {
       status.textContent = 'klar';
       status.style.color = '#0a7a35';
       if (button) button.textContent = 'Tjek';
@@ -3732,23 +3851,27 @@
       return;
     }
     incomingCallPollInFlight = true;
-    const finishDiagnostic = diagnostics.begin('phone', 5000);
+    const finishDiagnostic = diagnostics.begin('phone', 5000, 'operation');
     let pollError = null;
+    let account = null;
     try {
       const email = await getIncomingCallUserEmail();
+      account = getIncomingCallAccount();
+      if (email !== account.email || !isIncomingCallAccountCurrent(account)) return;
       const rows = await fetchIncomingCallQueueItems(email);
-      if (!isLeader()) return;
+      if (!isLeader() || !isIncomingCallAccountCurrent(account)) return;
       paintIPnordicSetupStatus('ready');
 
       await withCrossTabProcessLock('incoming-call-queue', async () => {
-        if (!isLeader()) return;
+        if (!isLeader() || !isIncomingCallAccountCurrent(account)) return;
         const state = ensureIncomingCallQueueState(email);
         const latestId = rows.reduce((highest, row) => Math.max(highest, row.id), state.lastId);
         const pending = selectPendingIncomingCallRows(rows, state);
         diagnostics.record('phone','snapshot',{outcome:state.ready ? 'ok' : 'baseline',count:rows.length,pending:pending.length}, pending.length > 0);
 
         for (const row of pending) {
-          const result = await handleIncomingCall(row.phone, 'sharepoint:' + row.id, { queueTagged: row.queueTagged });
+          const result = await handleIncomingCall(row.phone, 'sharepoint:' + row.id, { queueTagged: row.queueTagged, account });
+          if (!isLeader() || !isIncomingCallAccountCurrent(account) || result?.status === 'stale') return;
           if (result?.status === 'failed') throw new Error('TP_CALL_LOOKUP_FAILED');
           if (result?.status === 'handled') markIPnordicVerified(email, 'sharepoint:' + row.id);
           saveJson(INCOMING_CALL_QUEUE_STATE_KEY, { ...state, lastId: row.id, ready: true });
@@ -3761,6 +3884,7 @@
         });
       });
     } catch (error) {
+      if ((account && !isIncomingCallAccountCurrent(account)) || error?.message === 'TP_CALL_ACCOUNT_CHANGED') return;
       pollError = error;
       incomingCallUserEmail = '';
       incomingCallUserEmailCheckedAt = 0;
@@ -4900,6 +5024,36 @@
   const workflowTracker = createWorkflowTracker();
   const ipnordicGuideConfigs = new WeakMap();
 
+  function resetIPnordicGuideTest(backdrop) {
+    if (backdrop._tpTestTimer) clearInterval(backdrop._tpTestTimer);
+    backdrop._tpTestTimer = null;
+    backdrop._tpTestStartedAt = 0;
+    backdrop._tpTestAccount = null;
+    const state = backdrop.querySelector('#tpIPnordicTestState');
+    state.dataset.state = 'warning';
+    state.textContent = 'Ikke testet';
+    backdrop.querySelector('#tpIPnordicTestText').textContent = 'Start testen, og få derefter nogen til at ringe ind til dig.';
+    backdrop.querySelector('#tpIPnordicStartTest').textContent = 'Start test';
+  }
+
+  function invalidateIPnordicGuideAccount() {
+    const backdrop = document.getElementById('tpIPnordicGuideBackdrop');
+    if (!backdrop?._tpAccount || isIncomingCallAccountCurrent(backdrop._tpAccount)) return;
+    showIPnordicGuideAccountChanged(backdrop);
+  }
+
+  function showIPnordicGuideAccountChanged(backdrop) {
+    if (backdrop._tpTestTimer) diagnostics.record('phone','test',{outcome:'cancelled'},true);
+    resetIPnordicGuideTest(backdrop);
+    ipnordicGuideConfigs.delete(backdrop);
+    backdrop.querySelectorAll('#tpIPnordicCopyUrl,#tpIPnordicCopyDescription,#tpIPnordicStartTest')
+      .forEach(button => { button.disabled = true; });
+    const state = backdrop.querySelector('#tpIPnordicConnectionState');
+    state.dataset.state = 'warning';
+    state.textContent = 'Konto ændret';
+    backdrop.querySelector('#tpIPnordicConnectionText').textContent = 'Åbn guiden igen for at kontrollere den aktuelle konto.';
+  }
+
   function injectIPnordicGuideStyles() {
     if (document.getElementById('tpIPnordicGuideStyles')) return;
     const style = document.createElement('style');
@@ -5098,8 +5252,9 @@
       backdrop.hidden = true;
       ipnordicGuideConfigs.delete(backdrop);
       if (backdrop._tpTestTimer) diagnostics.record('phone','test',{outcome:'cancelled'},true);
-      if (backdrop._tpTestTimer) clearInterval(backdrop._tpTestTimer);
-      backdrop._tpTestTimer = null;
+      resetIPnordicGuideTest(backdrop);
+      backdrop._tpOpening = null;
+      backdrop._tpAccount = null;
     };
     backdrop.querySelector('#tpIPnordicGuideClose').addEventListener('click', close);
     backdrop.querySelector('#tpIPnordicGuideDone').addEventListener('click', close);
@@ -5120,7 +5275,10 @@
     });
 
     const finishTest = verification => {
-      if (!verification || !backdrop._tpTestStartedAt || verification.verifiedAt < backdrop._tpTestStartedAt) return;
+      if (backdrop.hidden || !verification || !backdrop._tpTestStartedAt
+        || !isIncomingCallAccountCurrent(backdrop._tpTestAccount)
+        || normalizeText(verification.email).toLocaleLowerCase('da') !== backdrop._tpTestAccount.email
+        || verification.verifiedAt < backdrop._tpTestStartedAt) return false;
       if (backdrop._tpTestTimer) diagnostics.record('phone','test',{outcome:'ok',durationMs:now()-backdrop._tpTestStartedAt},true);
       if (backdrop._tpTestTimer) clearInterval(backdrop._tpTestTimer);
       backdrop._tpTestTimer = null;
@@ -5132,6 +5290,7 @@
       testState.dataset.state = 'success';
       testState.textContent = 'Klar';
       testText.textContent = 'Opkaldet nåede frem. Telefonintegrationen er klar.';
+      return true;
     };
     globalThis.addEventListener(TP_IPNORDIC_SETUP.verificationEvent, event => finishTest(event.detail));
     globalThis.addEventListener('storage', event => {
@@ -5141,10 +5300,14 @@
     });
 
     backdrop.querySelector('#tpIPnordicStartTest').addEventListener('click', () => {
+      const account = getIncomingCallAccount();
+      if (!isIncomingCallAccountCurrent(account)) return;
       const testButton = backdrop.querySelector('#tpIPnordicStartTest');
       const testState = backdrop.querySelector('#tpIPnordicTestState');
       const testText = backdrop.querySelector('#tpIPnordicTestText');
       backdrop._tpTestStartedAt = now();
+      backdrop._tpTestAccount = account;
+      backdrop._tpAccount = account;
       diagnostics.record('phone','test',{outcome:'pending'},true);
       const deadline = backdrop._tpTestStartedAt + TP_IPNORDIC_SETUP.testWaitMs;
       testButton.disabled = true;
@@ -5152,11 +5315,12 @@
       testState.textContent = 'Venter';
       if (backdrop._tpTestTimer) clearInterval(backdrop._tpTestTimer);
       const tick = () => {
-        const verification = getIPnordicVerification();
-        if (verification?.verifiedAt >= backdrop._tpTestStartedAt) {
-          finishTest(verification);
+        if (!isIncomingCallAccountCurrent(account)) {
+          invalidateIPnordicGuideAccount();
           return;
         }
+        const verification = getIPnordicVerification();
+        if (finishTest(verification)) return;
         const seconds = Math.max(0, Math.ceil((deadline - now()) / 1000));
         if (seconds <= 0) {
           diagnostics.record('phone','test',{outcome:'timeout',durationMs:now()-backdrop._tpTestStartedAt},true);
@@ -5171,8 +5335,8 @@
         }
         testText.textContent = 'Venter på et indgående opkald… ' + seconds + ' sek.';
       };
-      tick();
       backdrop._tpTestTimer = setInterval(tick, 1000);
+      tick();
     });
     return backdrop;
   }
@@ -5187,6 +5351,10 @@
     const testState = backdrop.querySelector('#tpIPnordicTestState');
     const testText = backdrop.querySelector('#tpIPnordicTestText');
     ipnordicGuideConfigs.delete(backdrop);
+    resetIPnordicGuideTest(backdrop);
+    const opening = {};
+    backdrop._tpOpening = opening;
+    backdrop._tpAccount = null;
     backdrop.hidden = false;
     connectionState.dataset.state = 'warning';
     connectionState.textContent = 'Kontrollerer…';
@@ -5195,27 +5363,24 @@
     copyButtons.forEach(button => { button.disabled = true; });
     testButton.disabled = true;
 
-    const verification = getIPnordicVerification();
-    if (verification) {
-      testState.dataset.state = 'success';
-      testState.textContent = 'Klar';
-      testText.textContent = 'Senest bekræftet ' + new Date(verification.verifiedAt).toLocaleString('da-DK', {
-        dateStyle: 'short', timeStyle: 'short'
-      }) + '.';
-      testButton.textContent = 'Test igen';
-    } else {
-      testState.dataset.state = 'warning';
-      testState.textContent = 'Ikke testet';
-      testText.textContent = 'Start testen, og få derefter nogen til at ringe ind til dig.';
-      testButton.textContent = 'Start test';
-    }
-
+    let account = null;
     try {
-      const [email, config] = await Promise.all([
-        getIncomingCallUserEmail(),
-        getIPnordicSetupConfig(true)
-      ]);
-      if (backdrop.hidden) return;
+      const email = await getIncomingCallUserEmail(true);
+      if (backdrop.hidden || backdrop._tpOpening !== opening) return;
+      account = getIncomingCallAccount();
+      if (email !== account.email || !isIncomingCallAccountCurrent(account)) return;
+      backdrop._tpAccount = account;
+      const config = await getIPnordicSetupConfig(true);
+      if (backdrop.hidden || backdrop._tpOpening !== opening || !isIncomingCallAccountCurrent(account)) return;
+      const verification = getIPnordicVerification();
+      if (verification?.email === email) {
+        testState.dataset.state = 'success';
+        testState.textContent = 'Klar';
+        testText.textContent = 'Senest bekræftet ' + new Date(verification.verifiedAt).toLocaleString('da-DK', {
+          dateStyle: 'short', timeStyle: 'short'
+        }) + '.';
+        testButton.textContent = 'Test igen';
+      }
       ipnordicGuideConfigs.set(backdrop, config);
       connectionState.dataset.state = 'success';
       connectionState.textContent = 'Forbundet';
@@ -5224,6 +5389,11 @@
       testButton.disabled = false;
       paintIPnordicSetupStatus('ready');
     } catch (error) {
+      if (backdrop.hidden || backdrop._tpOpening !== opening || (account && !isIncomingCallAccountCurrent(account))) return;
+      if (error?.message === 'TP_CALL_ACCOUNT_CHANGED') {
+        showIPnordicGuideAccountChanged(backdrop);
+        return;
+      }
       console.warn('[TP][IPNORDIC][SETUP]', error);
       connectionState.dataset.state = 'error';
       connectionState.textContent = 'Login kræves';
@@ -5731,7 +5901,6 @@
 
   function invokeIframeAction(iframe, wantOn) {
     const frameWindow = iframe.contentWindow;
-    const frameDocument = iframe.contentDocument;
     if (wantOn && typeof frameWindow.activate_cell_sms_notifikationer === 'function') {
       frameWindow.activate_cell_sms_notifikationer();
       return true;
@@ -5740,15 +5909,7 @@
       frameWindow.deactivate_cell_sms_notifikationer();
       return true;
     }
-    try {
-      const link = wantOn
-        ? frameDocument.querySelector('#sms_notifikation_ikke_aktiv a[onclick*="activate_cell_sms_notifikationer"]')
-        : frameDocument.querySelector('#sms_notifikation_aktiv a[onclick*="deactivate_cell_sms_notifikationer"]');
-      if (link) {
-        link.click();
-        return true;
-      }
-    } catch (_) {}
+    // A blocked link click is not a supported native action. Keep navigation hardened.
     return false;
   }
 
@@ -5887,6 +6048,10 @@
     style.textContent = `
       tr[id^="row_"] img[src*="/vikarimages/"] {
         cursor: help !important;
+      }
+      .tp-worker-hover-trigger:focus-visible {
+        outline: 2px solid #287ca5;
+        outline-offset: 2px;
       }
       .tp-worker-hover-popover {
         position: fixed;
@@ -6157,18 +6322,22 @@
         href: buildWorkerProfileURL(context.workerId, '#blokeringer')
       })
     );
-    const customer = createWorkerHoverRow({label:'Tidligere vagter hos kunde', detail:'I alt', value:data.customerPending ? '…' : data.customerShifts});
-    customer.dataset.customerHistory = 'true';
-    customer.title = context.customerNumber ? 'Afholdte vagter i alt hos kunde ' + context.customerNumber : 'Kundenummer kunne ikke bestemmes';
-    if (!data.customerPending && data.customerShifts == null) customer.title = 'Kundehistorik kunne ikke kontrolleres';
     popover.replaceChildren(
       createWorkerHoverHead(context.name),
-      customer,
+      createWorkerCustomerHistoryRow(context, data),
       completed,
       sick,
       withdrawn,
       pair
     );
+  }
+
+  function createWorkerCustomerHistoryRow(context, data) {
+    const customer = createWorkerHoverRow({label:'Tidligere vagter hos kunde', detail:'I alt', value:data.customerPending ? '…' : data.customerShifts});
+    customer.dataset.customerHistory = 'true';
+    customer.title = context.customerNumber ? 'Afholdte vagter i alt hos kunde ' + context.customerNumber : 'Kundenummer kunne ikke bestemmes';
+    if (!data.customerPending && data.customerShifts == null) customer.title = 'Kundehistorik kunne ikke kontrolleres';
+    return customer;
   }
 
   function renderWorkerHoverError(popover, context, retry) {
@@ -6184,7 +6353,7 @@
     popover.replaceChildren(createWorkerHoverHead(context.name), error);
   }
 
-  function findWorkerHoverContext(image) {
+  function findWorkerHoverContext(image, withCustomer = true) {
     const row = image.closest(WORKER_ROW_SELECTOR);
     const workerId = row?.id.match(/^row_(\d+)$/)?.[1];
     if (!row || !workerId || !String(image.getAttribute('src') || '').includes('/vikarimages/' + workerId + '/')) return null;
@@ -6198,7 +6367,7 @@
       return text && !/^\d+$/.test(text) && !/^(Kalender|Stamdata|Kommunikation|Log)$/i.test(text);
     });
     const name = normalizeText(nameLink?.textContent);
-    return name ? { workerId, name, customerNumber: readWorkerCustomerNumber() } : null;
+    return name ? { workerId, name, customerNumber: withCustomer ? readWorkerCustomerNumber() : '' } : null;
   }
 
   function positionWorkerHover(popover, image) {
@@ -6223,6 +6392,8 @@
     popover.id = 'tpWorkerHoverPopover';
     popover.className = 'tp-worker-hover-popover';
     popover.setAttribute('aria-live', 'polite');
+    popover.setAttribute('role', 'dialog');
+    popover.tabIndex = -1;
     popover.dataset.open = 'false';
     document.body.appendChild(popover);
 
@@ -6235,29 +6406,41 @@
       if (hideTimer) clearTimeout(hideTimer);
       hideTimer = null;
     };
+    const hasFocus = () => popover.contains(document.activeElement) || document.activeElement === activeImage;
+    const hide = (restoreFocus = false) => {
+      cancelHide();
+      const image = activeImage;
+      requestGeneration++;
+      popover.dataset.open = 'false';
+      image?.setAttribute('aria-expanded', 'false');
+      activeImage = null;
+      activeContext = null;
+      if (restoreFocus && image?.isConnected) image.focus({preventScroll:true});
+    };
     const hideSoon = () => {
       cancelHide();
+      if (hasFocus()) return;
       hideTimer = setTimeout(() => {
-        popover.dataset.open = 'false';
-        activeImage = null;
-        activeContext = null;
+        if (!hasFocus()) hide();
       }, WORKER_HOVER_HIDE_MS);
     };
     const loadActiveWorker = async () => {
       if (!activeImage || !activeContext) return;
       const generation = ++requestGeneration;
+      if (popover.contains(document.activeElement)) popover.focus({preventScroll:true});
       renderWorkerHoverLoading(popover, activeContext);
       positionWorkerHover(popover, activeImage);
       try {
         const context = activeContext;
-        const isCurrent = () => generation === requestGeneration && !!activeImage && !!activeContext;
+        const isCurrent = () => generation === requestGeneration && !!activeImage?.isConnected && !!activeContext;
         const data = await getWorkerHoverData(context.workerId, isCurrent);
         if (!isCurrent() || !data) return;
         renderWorkerHoverData(popover, context, {...data, customerPending:!!context.customerNumber});
         positionWorkerHover(popover, activeImage);
         const customerShifts = await getWorkerCustomerHistory(context.workerId, context.customerNumber).catch(() => null);
-        if (generation !== requestGeneration || !activeImage || !activeContext) return;
-        renderWorkerHoverData(popover, context, {...data, customerShifts});
+        if (!isCurrent()) return;
+        // Keep focused profile links intact when the slower customer total arrives.
+        popover.querySelector('[data-customer-history]')?.replaceWith(createWorkerCustomerHistoryRow(context, {customerShifts}));
         positionWorkerHover(popover, activeImage);
       } catch (error) {
         if (generation !== requestGeneration || !activeImage || !activeContext) return;
@@ -6267,19 +6450,88 @@
         positionWorkerHover(popover, activeImage);
       }
     };
-    const showForImage = image => {
-      const context = findWorkerHoverContext(image);
+    const prepareImage = image => {
+      const context = findWorkerHoverContext(image, false);
+      if (!context) return null;
+      image.classList.add('tp-worker-hover-trigger');
+      image.tabIndex = 0;
+      image.setAttribute('role', 'button');
+      image.setAttribute('aria-label', 'Vikaroverblik for ' + context.name);
+      image.setAttribute('aria-haspopup', 'dialog');
+      image.setAttribute('aria-controls', popover.id);
+      image.setAttribute('aria-expanded', image === activeImage ? 'true' : 'false');
+      return context;
+    };
+    const showForImage = (image, keyboard = false) => {
+      const context = prepareImage(image);
       if (!context) return;
       cancelHide();
+      if (image === activeImage) {
+        if (keyboard) popover.focus({preventScroll:true});
+        return;
+      }
+      activeImage?.setAttribute('aria-expanded', 'false');
       activeImage = image;
-      activeContext = context;
+      activeContext = {...context, customerNumber:readWorkerCustomerNumber()};
       popover.dataset.open = 'true';
+      popover.setAttribute('aria-label', 'Vikaroverblik for ' + context.name);
+      image.setAttribute('aria-expanded', 'true');
       loadActiveWorker();
+      if (keyboard) popover.focus({preventScroll:true});
     };
-    // Delegation also covers inserted/replaced worker rows without watching every DOM change.
+    const preparePhotos = root => {
+      if (root.matches?.('img')) prepareImage(root);
+      for (const image of root.querySelectorAll('img[src*="/vikarimages/"]')) prepareImage(image);
+    };
+    preparePhotos(document);
+    const observer = new MutationObserver(records => {
+      if (activeImage && !activeImage.isConnected) hide();
+      const roots = new Set();
+      for (const record of records) for (const node of record.addedNodes) {
+        if (node.nodeType !== 1 || !node.isConnected || popover.contains(node)) continue;
+        roots.add(node.closest(WORKER_ROW_SELECTOR) || node);
+      }
+      for (const root of roots) {
+        let parent = root.parentElement;
+        while (parent && !roots.has(parent)) parent = parent.parentElement;
+        if (!parent) preparePhotos(root);
+      }
+    });
+    observer.observe(document.body, {childList:true, subtree:true});
+    // Focus makes photos reachable but never fetches; activation is explicit.
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && activeImage && (event.target === activeImage || popover.contains(event.target))) {
+        event.preventDefault();
+        event.stopPropagation();
+        hide(true);
+        return;
+      }
+      const image = event.target.closest?.('img');
+      if ((event.key === 'Enter' || event.key === ' ') && image && findWorkerHoverContext(image, false)) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!event.repeat) showForImage(image, true);
+      }
+    });
+    document.addEventListener('click', event => {
+      const image = event.target.closest?.('img');
+      if (!image || !findWorkerHoverContext(image, false)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      showForImage(image, true);
+    }, true);
+    document.addEventListener('focusin', event => {
+      if (event.target === activeImage || popover.contains(event.target)) cancelHide();
+      else if (activeImage) hideSoon();
+    });
+    document.addEventListener('focusout', event => {
+      if ((event.target === activeImage || popover.contains(event.target)) &&
+          event.relatedTarget !== activeImage && !popover.contains(event.relatedTarget)) hideSoon();
+    });
+    // Delegation also covers inserted/replaced worker rows before decoration runs.
     document.addEventListener('mouseover', event => {
       const image = event.target.closest?.('img');
-      if (image && image !== activeImage && findWorkerHoverContext(image)) showForImage(image);
+      if (image && image !== activeImage && findWorkerHoverContext(image, false)) showForImage(image);
       else if (image === activeImage) cancelHide();
     });
     document.addEventListener('mouseout', event => {
@@ -7238,8 +7490,9 @@
   }
 
   function decorateQuickNoAnswerLinks(root = document) {
-    const finishDiagnostic = diagnostics.begin('html', 100);
-    const links = root.querySelectorAll?.(QUICK_NO_ANSWER_LINK_SELECTOR) || [];
+    const finishDiagnostic = diagnostics.begin('html', 100, 'processing');
+    const links = [...(root.querySelectorAll?.(QUICK_NO_ANSWER_LINK_SELECTOR) || [])];
+    if (root.matches?.(QUICK_NO_ANSWER_LINK_SELECTOR)) links.unshift(root);
     for (const link of links) {
       if (link.dataset.tpQuickNoAnswerReady === 'true') continue;
       const target = parseCallRegistrationTarget(link.getAttribute('onclick'));
@@ -7299,14 +7552,17 @@
     injectQuickNoAnswerStyles();
     decorateQuickNoAnswerLinks();
 
-    let decorateScheduled = false;
-    const observer = new MutationObserver(() => {
-      if (decorateScheduled) return;
-      decorateScheduled = true;
-      setTimeout(() => {
-        decorateScheduled = false;
-        decorateQuickNoAnswerLinks();
-      }, 0);
+    const observer = new MutationObserver(records => {
+      const roots = new Set();
+      for (const record of records) for (const node of record.addedNodes) {
+        if (node.nodeType === 1 && node.isConnected && !node.closest('.tp-quick-no-answer-menu')) roots.add(node);
+      }
+      // Inspect only new subtrees, once per batch; text/status changes need no rescan.
+      for (const root of roots) {
+        let parent = root.parentElement;
+        while (parent && !roots.has(parent)) parent = parent.parentElement;
+        if (!parent) decorateQuickNoAnswerLinks(root);
+      }
     });
     observer.observe(document.body, { childList: true, subtree: true });
   }
