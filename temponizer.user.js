@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.34
+// @version      7.14.35
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -25,7 +25,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.34';
+  const TP_VERSION = '7.14.35';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -8090,14 +8090,17 @@
     }};
   }
 
-  function showAnnualConfirmation(host,snapshot,row,previous,mode,request,scopeCheck,onResult,onDismiss) {
+  function showAnnualConfirmation(host,snapshot,row,previous,mode,request,scopeCheck,onResult,onDismiss,execute) {
     const panel = document.createElement('section'); panel.id='tpAnnualMatch'; panel.setAttribute('aria-label','Manuelt personmatch');
     panel.innerHTML='<h3 tabindex="-1">Gennemgå match</h3><p class="tpMatchPerson"></p><p class="tpMatchStatus" role="status"></p><div class="tpMatchCandidates"></div><p class="tpMatchWarning">Personkobling, ikke godkendelse af autorisation. Eksisterende attesttekst bevares. Undgå samtidig redigering af denne attest.</p><button type="button" class="tpMatchSave" disabled>Bekræft og gem på vikaren</button> <button type="button" class="tpMatchCancel">Annuller</button>';
     host.appendChild(panel);
     const status=panel.querySelector('.tpMatchStatus'),choices=panel.querySelector('.tpMatchCandidates'),save=panel.querySelector('.tpMatchSave');
     panel.querySelector('.tpMatchPerson').textContent=row.name;
-    let closed=false,session=null,selected='',pending=false,controller=null,writeStarted=false,writeSettled=false,uncertain=false;
-    const check=()=>!closed && !controller?.signal.aborted && scopeCheck();
+    let closed=false,session=null,selected='',pending=false,controller=null,operationSignal=null,writeStarted=false,writeSettled=false,uncertain=false;
+    const check=()=>!closed && !controller?.signal.aborted && !operationSignal?.aborted && scopeCheck();
+    const executeOperation=execute || ((action,signal)=>navigator.locks.request('tpAnnualAuthorizationV1',{ifAvailable:true},lock=>{
+      if(!lock)throw new Error('TP_ANNUAL_BUSY');return action(signal);
+    }));
     const markUncertain=()=>{if(writeStarted&&!writeSettled&&!uncertain){uncertain=true;onResult({...previous,state:'manual-save-unknown',identity:'unconfirmed'});}};
     const dispose=()=>{markUncertain();closed=true;controller?.abort();session=null;selected='';panel.replaceChildren();panel.remove();};
     dispose.pendingWrite=()=>writeStarted&&!writeSettled;
@@ -8106,15 +8109,16 @@
     panel.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();dismiss();}});
     async function operation(action) {
       if(pending || closed)return;
-      pending=true;save.disabled=true;controller=new AbortController();
+      pending=true;save.disabled=true;controller=new AbortController();operationSignal=controller.signal;
+      status.textContent='Afventer sikkert kontrolpunkt…';
       for(const input of choices.querySelectorAll('input'))input.disabled=true;
       const timer=setTimeout(()=>controller.abort(),120000);
       try {
-        await navigator.locks.request('tpAnnualAuthorizationV1',{ifAvailable:true},async lock=>{
-          if(!lock)throw new Error('TP_ANNUAL_BUSY');
+        await executeOperation(async signal=>{
+          operationSignal=signal;
           if(!check())throw new Error('TP_ANNUAL_SCOPE');
-          await action((kind,key)=>{if(kind==='save-certificate')writeStarted=true;return request(kind,key,controller.signal);});
-        });
+          await action((kind,key)=>{if(kind==='save-certificate')writeStarted=true;return request(kind,key,operationSignal);});
+        },controller.signal);
       } catch(error) {
         markUncertain();
         if(!closed){
@@ -8131,8 +8135,9 @@
       if(!check())throw new Error('TP_ANNUAL_SAVE_UNKNOWN');
       writeSettled=true;onResult(result);dispose();onDismiss();
     }));
-    panel.querySelector('h3').focus();status.textContent='Henter friske registeroplysninger…';
+    panel.querySelector('h3').focus();
     void operation(async get=>{
+      status.textContent='Henter friske registeroplysninger…';
       session=await prepareAnnualConfirmation(snapshot,row,previous,get,check);
       if(!check())throw new Error('TP_ANNUAL_SCOPE');
       status.textContent=session.candidates.length ? 'Fødselsdato og faggruppe stemmer. Personens identitet skal bekræftes manuelt.' : 'Ingen kandidater fundet med samme fødselsdato og faggruppe.';
@@ -8156,10 +8161,27 @@
       .map(row => ({...row, professionCodes:[...row.professionCodes]}));
     const mode = Object.freeze({supervision:options.supervision === true});
     const controller = new AbortController();
-    let wake = null, started = false, deadline;
+    let wake = null, started = false, deadline, reviewJob = null, activeReview = null;
     const run = {
       state:'ready', rows, results:[], excluded:snapshot.rows.length - rows.length,
-      current:0, mode, signal:controller.signal,
+      current:0, mode, signal:controller.signal, reviewing:false,
+      review(action,signal) {
+        if (!['running','paused'].includes(run.state) || controller.signal.aborted || signal?.aborted || typeof action !== 'function') return Promise.reject(new Error('TP_ANNUAL_SCOPE'));
+        if (reviewJob || activeReview) return Promise.reject(new Error('TP_ANNUAL_BUSY'));
+        return new Promise((resolve,reject) => {
+          const linked = new AbortController();
+          const job = {action,resolve,reject,signal:linked.signal,cleanup:() => {
+            controller.signal.removeEventListener('abort',abort); signal?.removeEventListener('abort',abort);
+          }};
+          const abort = () => {
+            linked.abort();
+            if (reviewJob === job) { reviewJob=null;job.cleanup();reject(new Error('TP_ANNUAL_STOP')); }
+          };
+          reviewJob=job;
+          controller.signal.addEventListener('abort',abort,{once:true}); signal?.addEventListener('abort',abort,{once:true});
+          wake?.(); wake=null;
+        });
+      },
       pause() { if (run.state === 'running') { run.state = 'paused'; notify(); } },
       resume() { if (run.state === 'paused') { run.state = 'running'; wake?.(); wake = null; notify(); } },
       stop() {
@@ -8191,7 +8213,7 @@
               run.current += 1; notify();
               if (result.state === 'manual-save-unknown') { run.stop(); return; }
             }
-            run.state = 'complete'; notify();
+            await checkpoint(true);
           });
         } catch (error) {
           if (!controller.signal.aborted) {
@@ -8201,10 +8223,30 @@
         } finally { clearTimeout(deadline); }
       }
     };
-    async function checkpoint() {
-      while (run.state === 'paused') await new Promise(resolve => { wake = resolve; });
-      if (controller.signal.aborted) throw new Error('TP_ANNUAL_STOP');
-      if (!dependencies.check()) { run.invalidate(); throw new Error('TP_ANNUAL_SCOPE'); }
+    async function performReview() {
+      const job = reviewJob; reviewJob=null; activeReview=job; run.reviewing=true;
+      try {
+        notify();
+        const result = await job.action(job.signal);
+        if (job.signal.aborted) throw new Error('TP_ANNUAL_STOP');
+        if (!dependencies.check()) { run.invalidate(); throw new Error('TP_ANNUAL_SCOPE'); }
+        job.resolve(result);
+      } catch (error) { job.reject(error); }
+      finally { job.cleanup();activeReview=null;run.reviewing=false;notify(); }
+    }
+    async function checkpoint(complete = false) {
+      for (;;) {
+        if (controller.signal.aborted) throw new Error('TP_ANNUAL_STOP');
+        if (!dependencies.check()) { run.invalidate(); throw new Error('TP_ANNUAL_SCOPE'); }
+        // No second lock or parallel transport: the batch lends its held lock here.
+        if (reviewJob) { await performReview(); continue; }
+        if (run.state !== 'paused') {
+          // Close admission in this turn, before awaiting the completed checkpoint.
+          if (complete) { run.state = 'complete'; notify(); }
+          return;
+        }
+        await new Promise(resolve => { wake = resolve; });
+      }
     }
     function notify() { dependencies.changed?.(run); }
     return run;
@@ -8217,14 +8259,18 @@
       if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
       if (['profile','certificate','save-certificate'].includes(kind)) {
         // Never send a write if the same serial run cannot afford its readback.
-        if (kind === 'save-certificate' && nativeCalls + 2 > 2100) throw new Error('TP_ANNUAL_LIMIT');
-        if (++nativeCalls > 2100) throw new Error('TP_ANNUAL_LIMIT');
+        if (kind === 'save-certificate' && nativeCalls + 2 > 2700) throw new Error('TP_ANNUAL_LIMIT');
+        if (++nativeCalls > 2700) throw new Error('TP_ANNUAL_LIMIT');
       } else {
-        if (++publicCalls > 1200) throw new Error('TP_ANNUAL_LIMIT');
-        const delay = Math.max(0, 2000 - (Date.now() - lastPublicAt));
-        if (delay) await annualAuthorizationDelay(delay,signal);
-        await checkpoint();
-        if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
+        if (++publicCalls > 1500) throw new Error('TP_ANNUAL_LIMIT');
+        for (;;) {
+          await checkpoint();
+          if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
+          // A manual review at the checkpoint may have moved the shared start time.
+          const delay = Math.max(0, 2000 - (Date.now() - lastPublicAt));
+          if (!delay) break;
+          await annualAuthorizationDelay(delay,signal);
+        }
         lastPublicAt = Date.now();
       }
       const result = await annualAuthorizationRequest(kind,key,signal);
@@ -8234,9 +8280,8 @@
     };
   }
 
-  function createAnnualAuthorizationProcessor(snapshot, check, onWrite = () => {}) {
+  function createAnnualAuthorizationProcessor(snapshot, check, onWrite = () => {}, request = createAnnualAuthorizationRequests(check)) {
     const {listValue,account} = snapshot;
-    const request = createAnnualAuthorizationRequests(check);
     return async (row,mode,signal,checkpoint = async () => {}) => {
       await checkpoint();
       if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
@@ -8413,7 +8458,7 @@
       tr.cells[1].textContent = 'Afventer'; tr.cells[2].textContent = 'Ikke undersøgt';
       body.appendChild(tr); cells.push(tr.cells);
     }
-    let run = null, rendered = 0, closed = false, scopeInvalid = false, finishedAt = null, dismissMatch = null, uncertainWrite = false, autoWritePending = false, autoSavedCount = 0;
+    let run = null, runTask = Promise.resolve(), rendered = 0, closed = false, scopeInvalid = false, finishedAt = null, dismissMatch = null, uncertainWrite = false, autoWritePending = false, autoSavedCount = 0;
     const renderedResults = [], reviewButtons = [];
     const clearRows = () => {
       uncertainWrite ||= autoWritePending || !!dismissMatch?.pendingWrite?.();
@@ -8446,10 +8491,11 @@
         return;
       }
       const active = ['running','paused'].includes(current.state);
-      for(const button of reviewButtons)button.disabled=active || !!dismissMatch;
+      for(const button of reviewButtons)button.disabled=!!dismissMatch;
       control('Pause').disabled = !active; control('Stop').disabled = !active;
       control('Pause').textContent = current.state === 'paused' ? 'Fortsæt' : 'Pause';
       control('Status').textContent = (stateLabels[current.state] || '') + ' · ' + current.current + ' / ' + eligible.length;
+      if (current.reviewing) control('Status').textContent += ' · Behandler manuelt match';
       if (uncertainWrite || (!active && autoWritePending)) control('Status').textContent += ' En gemning var allerede sendt; udfaldet er uafklaret. Kontrollér attesten før et nyt forsøg.';
       control('Progress').value = current.current;
       for(let index=0;index<current.results.length;index++) {
@@ -8470,12 +8516,14 @@
           const match=document.createElement('small');match.textContent='Attest-ID · fornavn og efternavn matcher';rowCells[1].appendChild(match);
         }
         if(['manual-id','manual-identity'].includes(result.state)){
-          const review=document.createElement('button');review.type='button';review.textContent='Gennemgå match';review.disabled=active || !!dismissMatch;reviewButtons.push(review);rowCells[1].appendChild(review);
+          const review=document.createElement('button');review.type='button';review.textContent='Gennemgå match';review.disabled=!!dismissMatch;reviewButtons.push(review);rowCells[1].appendChild(review);
           review.addEventListener('click',()=>{
-            if(dismissMatch || !sameScope() || !['complete','stopped','failed'].includes(run?.state))return;
+            if(dismissMatch || !sameScope() || !['running','paused','complete','stopped','failed'].includes(run?.state))return;
             dismissMatch=showAnnualConfirmation(control('MatchHost'),snapshot,eligible[index],run.results[index],run.mode,manualRequest,sameScope,result=>{
-              if(!sameScope())return;run.results[index]=result;render(run);
-            },()=>{dismissMatch=null;if(!closed && !scopeInvalid){render(run);(review.isConnected?review:rowCells[0].querySelector('a'))?.focus();}});
+              if(!sameScope())return;run.results[index]=result;
+              if(result.state==='manual-save-unknown'){uncertainWrite=true;run.stop();}
+              render(run);
+            },()=>{dismissMatch=null;if(!closed && !scopeInvalid){render(run);(review.isConnected?review:rowCells[0].querySelector('a'))?.focus();}},executeReview);
             for(const button of reviewButtons)button.disabled=true;
           });
         }
@@ -8521,6 +8569,17 @@
       }
     };
     const manualRequest=createAnnualAuthorizationRequests(sameScope);
+    const executeReview=async(action,signal)=>{
+      if (['running','paused'].includes(run?.state)) return run.review(action,signal);
+      // The last row may already be rendered while the batch is still releasing its lock.
+      await runTask;
+      if(signal.aborted || !sameScope())throw new Error('TP_ANNUAL_SCOPE');
+      return navigator.locks.request('tpAnnualAuthorizationV1',{ifAvailable:true},async lock=>{
+        if(!lock)throw new Error('TP_ANNUAL_BUSY');
+        if(signal.aborted || !sameScope())throw new Error('TP_ANNUAL_SCOPE');
+        return action(signal);
+      });
+    };
     const trackAutomaticWrite = state => {
       if (state === 'verified' && autoWritePending) autoSavedCount++;
       autoWritePending = state === 'started';
@@ -8562,9 +8621,9 @@
     if (canStart && sameScope()) {
       run = createAnnualAuthorizationRun(snapshot,{supervision:options.supervision === true},{
         lock:fn => navigator.locks.request('tpAnnualAuthorizationV1',{ifAvailable:true},lock => fn(!!lock)),
-        check:sameScope,process:createAnnualAuthorizationProcessor(snapshot,sameScope,trackAutomaticWrite),changed:render
+        check:sameScope,process:createAnnualAuthorizationProcessor(snapshot,sameScope,trackAutomaticWrite,manualRequest),changed:render
       });
-      void run.start();
+      runTask=run.start();
     } else expire();
     return dialog;
   }
