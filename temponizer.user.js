@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.35
+// @version      7.14.36
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -25,7 +25,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.35';
+  const TP_VERSION = '7.14.36';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -7850,6 +7850,34 @@
     return !!match && (Number(match[1]) > 5 || Number(match[1]) === 5 && Number(match[2]) >= 4);
   }
 
+  function annualPublicPressureError(response, expectedUrl) {
+    const error = new Error('TP_ANNUAL_HTTP');
+    if (![429,503].includes(response.status) || response.finalUrl !== expectedUrl) return error;
+    error.status = response.status;
+    error.retryAfterMs = 5000;
+    const headers = typeof response.responseHeaders === 'string' ? response.responseHeaders : '';
+    if (headers.length > 64000) { error.retryAfterMs = 30001; return error; }
+    const values = name => headers.split(/\r?\n/).filter(line => line.toLowerCase().startsWith(name + ':')).map(line => line.slice(name.length + 1).trim());
+    const retry = values('retry-after');
+    if (retry.length > 1) { error.retryAfterMs = 30001; return error; }
+    if (!retry.length) return error;
+    let delay;
+    if (/^\d+$/.test(retry[0])) delay = Math.min(Number.MAX_SAFE_INTEGER, Number(retry[0]) * 1000);
+    else {
+      const httpDate = value => {
+        if (typeof value !== 'string' || !/^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value)) return NaN;
+        const time = Date.parse(value);
+        return Number.isFinite(time) && new Date(time).toUTCString() === value ? time : NaN;
+      };
+      const until = httpDate(retry[0]), dates = values('date');
+      const serverDate = dates.length === 1 ? httpDate(dates[0]) : NaN;
+      // A fast local clock must not shorten the server's requested cooldown.
+      delay = Math.max(until - Date.now(), Number.isFinite(serverDate) ? until - serverDate : 0);
+    }
+    if (Number.isFinite(delay)) error.retryAfterMs = Math.max(5000, Math.ceil(delay));
+    return error;
+  }
+
   async function annualAuthorizationRequest(kind, key, signal) {
     if (signal.aborted) throw new Error('TP_ANNUAL_STOP');
     let url, body, method = 'GET', external = false, json = false;
@@ -7904,7 +7932,7 @@
       const finish = (error,value) => {
         if (finished) return;
         finished = true; clearTimeout(timer); signal.removeEventListener('abort',abort);
-        if (error) reject(new Error(error)); else resolve(value);
+        if (error) reject(typeof error === 'string' ? new Error(error) : error); else resolve(value);
       };
       const abort = () => { finish('TP_ANNUAL_STOP'); transport?.abort(); };
       const timer = setTimeout(() => { finish('TP_ANNUAL_TIMEOUT'); transport?.abort(); }, 20000);
@@ -7913,7 +7941,7 @@
         transport = GM_xmlhttpRequest({method,url,data:body,anonymous:true,fetch:true,redirect:'error',timeout:20000,
           headers:{Accept:json ? 'application/json' : 'text/html',...(body ? {'Content-Type':'application/json'} : {})},
           onload:response => {
-            if (response.status !== 200) { finish('TP_ANNUAL_HTTP'); return; }
+            if (response.status !== 200) { finish(annualPublicPressureError(response,url)); return; }
             try { finish(null,checked(response.responseText,response.finalUrl)); }
             catch (_) { finish('TP_ANNUAL_RESPONSE'); }
           },
@@ -8252,28 +8280,46 @@
     return run;
   }
 
-  function createAnnualAuthorizationRequests(check) {
-    let publicCalls = 0, nativeCalls = 0, lastPublicAt = 0;
+  function createAnnualAuthorizationRequests(check, onHalt = () => {}) {
+    let publicCalls = 0, nativeCalls = 0, lastPublicAt = -Infinity, intervalMs = 1000, cooldownUntil = 0, halted = false;
+    const halt = () => { if (!halted) { halted = true; onHalt(); } return new Error('TP_ANNUAL_PRESSURE'); };
     return async function request(kind,key,signal,checkpoint = async () => {}) {
+      if (halted) throw halt();
       await checkpoint();
+      if (halted) throw halt();
       if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
-      if (['profile','certificate','save-certificate'].includes(kind)) {
+      const publicRead = ['register','search','detail','candidates'].includes(kind);
+      if (!publicRead) {
         // Never send a write if the same serial run cannot afford its readback.
         if (kind === 'save-certificate' && nativeCalls + 2 > 2700) throw new Error('TP_ANNUAL_LIMIT');
         if (++nativeCalls > 2700) throw new Error('TP_ANNUAL_LIMIT');
-      } else {
-        if (++publicCalls > 1500) throw new Error('TP_ANNUAL_LIMIT');
-        for (;;) {
-          await checkpoint();
-          if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
-          // A manual review at the checkpoint may have moved the shared start time.
-          const delay = Math.max(0, 2000 - (Date.now() - lastPublicAt));
-          if (!delay) break;
-          await annualAuthorizationDelay(delay,signal);
-        }
-        lastPublicAt = Date.now();
       }
-      const result = await annualAuthorizationRequest(kind,key,signal);
+      let result;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (publicRead) {
+          for (;;) {
+            await checkpoint();
+            if (halted) throw halt();
+            if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
+            // Manual review may have moved either shared deadline at the checkpoint.
+            const now = performance.now();
+            if (cooldownUntil - now > 30000) throw halt();
+            const delay = Math.max(0, intervalMs - (now - lastPublicAt), cooldownUntil - now);
+            if (!delay) break;
+            await annualAuthorizationDelay(delay,signal);
+          }
+          if (++publicCalls > 1500) throw new Error('TP_ANNUAL_LIMIT');
+          lastPublicAt = performance.now();
+        }
+        try { result = await annualAuthorizationRequest(kind,key,signal); break; }
+        catch (error) {
+          if (!publicRead || error?.message !== 'TP_ANNUAL_HTTP' || ![429,503].includes(error.status) ||
+            !Number.isSafeInteger(error.retryAfterMs) || error.retryAfterMs < 0) throw error;
+          intervalMs = Math.min(8000, intervalMs * 2);
+          cooldownUntil = Math.max(cooldownUntil, performance.now() + Math.max(5000, error.retryAfterMs));
+          if (attempt === 1 || error.retryAfterMs > 30000) throw halt();
+        }
+      }
       await checkpoint();
       if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
       return result;
@@ -8339,7 +8385,7 @@
         const extra = parseAnnualSupervisionHTML(await get('detail',guid),guid,record);
         result.supervision = extra.status; result.items = extra.items;
       } catch (error) {
-        if (!automaticallySaved || signal.aborted || !check()) throw error;
+        if (!automaticallySaved || error.message === 'TP_ANNUAL_PRESSURE' || signal.aborted || !check()) throw error;
         result.supervision = 'unknown';
       }
       return result;
@@ -8568,7 +8614,7 @@
         for (const line of lines) {const p = document.createElement('p'); p.textContent = line; report.appendChild(p);}
       }
     };
-    const manualRequest=createAnnualAuthorizationRequests(sameScope);
+    const manualRequest=createAnnualAuthorizationRequests(sameScope,() => run?.stop());
     const executeReview=async(action,signal)=>{
       if (['running','paused'].includes(run?.state)) return run.review(action,signal);
       // The last row may already be rendered while the batch is still releasing its lock.
