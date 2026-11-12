@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.28
+// @version      7.14.29
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -25,7 +25,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.28';
+  const TP_VERSION = '7.14.29';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -7521,6 +7521,13 @@
     return annualSourceText(value).toLocaleLowerCase('da').replace(/[^\p{L}\p{N}]/gu, '');
   }
 
+  function readAnnualListScope(doc = document) {
+    try {
+      const selection = annualSourceListSelection(doc);
+      return { fingerprint: annualListFingerprint(doc), listValue: selection.value, listLabel: selection.label };
+    } catch (_) { throw annualSourceError('ANNUAL_LIST_SOURCE_INVALID'); }
+  }
+
   function annualSourceWorkerLink(href) {
     if (!/^(?:\?|(?:\.\/)?index\.php\?)/.test(href)) throw new Error('ANNUAL_SOURCE_SCHEMA');
     const url = new URL(href, 'https://annual.invalid/index.php');
@@ -7579,48 +7586,28 @@
     } catch (_) { throw annualSourceError('ANNUAL_LIST_SOURCE_INVALID'); }
   }
 
-  function annualSourceSemanticRows(rows) {
-    if (!Array.isArray(rows) || rows.length > 300) throw new Error('ANNUAL_SOURCE_SCHEMA');
-    const ids = new Set(), numbers = new Set();
-    return rows.map(row => {
-      if (!row || typeof row.id !== 'string' || !/^[1-9]\d*$/.test(row.id) ||
-          typeof row.number !== 'string' || !/^[1-9]\d*$/.test(row.number) ||
-          !annualAuthorizationNameComplete(row.name) || typeof row.profession !== 'string' || !annualSourceText(row.profession) ||
-          typeof row.active !== 'boolean' || !Array.isArray(row.professionCodes) || ids.has(row.id) || numbers.has(row.number)) {
-        throw new Error('ANNUAL_SOURCE_SCHEMA');
-      }
-      const codes = annualProfessionCodes(row.profession);
-      if (JSON.stringify([...row.professionCodes].sort()) !== JSON.stringify(codes)) throw new Error('ANNUAL_SOURCE_SCHEMA');
-      ids.add(row.id);
-      numbers.add(row.number);
-      return [row.id, row.number, normalizeAuthorizationName(row.name),
-        annualSourceText(row.profession).toLocaleLowerCase('da'), codes, row.active];
-    }).sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
-  }
-
-  function verifyAnnualListResponse(html, snapshot) {
+  function readAnnualListResponse(html, scope) {
     try {
-      if (typeof html !== 'string' || html.length > 2000000 || !snapshot ||
-          !Number.isSafeInteger(snapshot.total) || snapshot.total < 0 || snapshot.total > 300 ||
-          typeof snapshot.listValue !== 'string' || !annualSourceText(snapshot.listValue) ||
-          typeof snapshot.listLabel !== 'string' || !annualSourceText(snapshot.listLabel) ||
-          typeof snapshot.fingerprint !== 'string' || snapshot.fingerprint.length > 100000) throw new Error('ANNUAL_SOURCE_SCHEMA');
-      const expectedRows = annualSourceSemanticRows(snapshot.rows);
-      if (expectedRows.length !== snapshot.total) throw new Error('ANNUAL_SOURCE_SCHEMA');
-      const pairs = JSON.parse(snapshot.fingerprint);
+      if (typeof html !== 'string' || html.length > 2000000 || !scope ||
+          typeof scope.listValue !== 'string' || !annualSourceText(scope.listValue) ||
+          typeof scope.listLabel !== 'string' || !annualSourceText(scope.listLabel) ||
+          typeof scope.fingerprint !== 'string' || scope.fingerprint.length > 16000) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const pairs = JSON.parse(scope.fingerprint);
       if (!Array.isArray(pairs) || pairs.length > 1000 || pairs.some(pair => !Array.isArray(pair) || pair.length !== 2 ||
           pair.some(value => typeof value !== 'string') || !pair[0])) throw new Error('ANNUAL_SOURCE_SCHEMA');
       const listPairs = pairs.filter(pair => pair[0] === 'misc_22');
-      if (listPairs.length !== 1 || listPairs[0][1] !== snapshot.listValue) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      if (listPairs.length !== 1 || listPairs[0][1] !== scope.listValue) throw new Error('ANNUAL_SOURCE_SCHEMA');
       const doc = new DOMParser().parseFromString(html, 'text/html');
       const scripts = doc.querySelectorAll('script'), tables = doc.querySelectorAll('table');
       if (scripts.length !== 1 || scripts[0].hasAttribute('src') ||
           (scripts[0].type && !/^(?:text|application)\/javascript$/i.test(scripts[0].type)) ||
-          tables.length !== 1 || tables[0].rows.length > 301 ||
+          tables.length !== 1 ||
           doc.querySelector('form, #misc_22, #resultatcnt')) throw new Error('ANNUAL_SOURCE_SCHEMA');
       // This is a fixed completion marker, never JavaScript to execute.
       const marker = scripts[0].textContent.match(/^\s*newoffset\s*=\s*0\s*;\s*remaining\s*=\s*0\s*;\s*jQuery\(\s*(['"])#resultatcnt\1\s*\)\s*\.html\(\s*(0|[1-9]\d*)\s*\)\s*;\s*update_selects\(\s*\)\s*;\s*activate_vikarstatus\(\s*\)\s*;\s*$/);
-      if (!marker || Number(marker[2]) !== snapshot.total) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      if (!marker || !Number.isSafeInteger(Number(marker[2]))) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      if (Number(marker[2]) > 300) throw annualSourceError('TP_ANNUAL_LIMIT');
+      if (tables[0].rows.length > 301) throw new Error('ANNUAL_SOURCE_SCHEMA');
       scripts[0].remove();
       // Reconstruct only detached parsing context; transport must send these same pairs.
       const form = doc.createElement('form');
@@ -7632,7 +7619,7 @@
           field.id = 'misc_22';
           const option = doc.createElement('option');
           option.value = value;
-          option.textContent = snapshot.listLabel;
+          option.textContent = scope.listLabel;
           option.selected = true;
           field.appendChild(option);
         } else { field.type = 'hidden'; field.value = value; }
@@ -7643,11 +7630,15 @@
       count.textContent = marker[2];
       doc.body.append(form, count);
       const actual = readAnnualListSnapshot(doc);
-      if (actual.fingerprint !== snapshot.fingerprint || actual.listValue !== snapshot.listValue ||
-          actual.listLabel !== snapshot.listLabel || actual.total !== snapshot.total ||
-          JSON.stringify(annualSourceSemanticRows(actual.rows)) !== JSON.stringify(expectedRows)) throw new Error('ANNUAL_SOURCE_SCHEMA');
-      return true;
-    } catch (_) { throw annualSourceError('ANNUAL_LIST_RESPONSE_INVALID'); }
+      if (actual.fingerprint !== scope.fingerprint || actual.listValue !== scope.listValue ||
+          actual.listLabel !== scope.listLabel || actual.rows.some(row => !annualAuthorizationNameComplete(row.name))) {
+        throw new Error('ANNUAL_SOURCE_SCHEMA');
+      }
+      return actual;
+    } catch (error) {
+      if (error.code === 'TP_ANNUAL_LIMIT') throw error;
+      throw annualSourceError('ANNUAL_LIST_RESPONSE_INVALID');
+    }
   }
 
   function readAnnualProfileHTML(html, row, listValue, account) {
@@ -8057,6 +8048,9 @@
     const style = document.createElement('style'); style.id = 'tpAnnualStyles';
     style.textContent = `
       #tpAnnualButton{margin:6px 0;padding:6px 10px;background:#69ad2f;color:#fff;border:1px solid #559a25;border-radius:3px;cursor:pointer}
+      #tpAnnualListOptions{display:flex;align-items:flex-start;gap:5px;font:12px/1.4 Arial,sans-serif;max-width:300px;margin:4px 0;white-space:normal}
+      #tpAnnualListOptions input{flex:0 0 auto;margin:2px 0 0}
+      #tpAnnualButton:disabled{opacity:.6;cursor:wait}
       #tpAnnualDialog{box-sizing:border-box;width:min(1200px,calc(100vw - 32px));max-height:calc(100vh - 32px);padding:0;border:1px solid #9ba2a7;border-radius:4px;color:#30363a;background:#fff;font:13px/1.4 Arial,sans-serif;letter-spacing:0}
       #tpAnnualDialog::backdrop{background:rgba(0,0,0,.35)}
       #tpAnnualDialog header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;background:#ededed;border-bottom:1px solid #b5b8bb}
@@ -8067,7 +8061,6 @@
       #tpAnnualDialog .tpAnnualControls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid #d4d7da}
       #tpAnnualDialog label{display:flex;gap:6px;align-items:center;flex:1 1 290px}
       #tpAnnualDialog input{margin:0;width:16px;height:16px;flex-shrink:0}
-      #tpAnnualDialog #tpAnnualStart{background:#69ad2f;border-color:#559a25;color:#fff}
       #tpAnnualDialog .tpAnnualSummary{padding:10px 16px;margin:0}
       #tpAnnualDialog #tpAnnualReport{padding:12px 16px;border-top:1px solid #b5b8bb;background:#f5f7f5}
       #tpAnnualDialog #tpAnnualReport[hidden]{display:none}#tpAnnualDialog #tpAnnualReport p{margin:4px 0}
@@ -8092,20 +8085,21 @@
   }
 
   let closeAnnualAuthorizationUI = null;
-  function openAnnualAuthorizationUI(snapshot) {
+  function openAnnualAuthorizationUI(snapshot, options = {supervision:true}) {
     closeAnnualAuthorizationUI?.();
     snapshot = {...snapshot,rows:snapshot.rows.slice()};
     injectAnnualAuthorizationStyles();
     const dialog = document.createElement('dialog'); dialog.id = 'tpAnnualDialog';
     dialog.setAttribute('aria-labelledby','tpAnnualTitle');
     dialog.innerHTML = `<header><h2 id="tpAnnualTitle">Autorisationskontrol</h2><button type="button" id="tpAnnualClose" aria-label="Luk kontrollen" title="Luk kontrollen">&times;</button></header>
-      <div class="tpAnnualControls"><label><input type="checkbox" id="tpAnnualSupervision" checked>Medtag offentligt tilsyn og begrænsninger</label><button type="button" id="tpAnnualStart">Start kontrol</button><button type="button" id="tpAnnualPause" disabled>Pause</button><button type="button" id="tpAnnualStop" disabled>Stop</button></div>
+      <div class="tpAnnualControls"><label><input type="checkbox" id="tpAnnualSupervision" disabled>Medtag offentligt tilsyn og begrænsninger</label><button type="button" id="tpAnnualPause" disabled>Pause</button><button type="button" id="tpAnnualStop" disabled>Stop</button></div>
       <p class="tpAnnualSummary" id="tpAnnualScope"></p><p class="tpAnnualSummary" id="tpAnnualStatus" role="status" aria-live="polite"></p><progress id="tpAnnualProgress" value="0" max="1" aria-label="Kontrollerede vikarer"></progress>
       <div class="tpAnnualTable"><table><thead><tr><th>Vikar</th><th>Identitet / gyldighed</th><th>Offentligt tilsyn / begrænsninger</th><th>Register</th></tr></thead><tbody></tbody></table></div>
       <section id="tpAnnualReport" hidden aria-label="Slutrapport"></section>
       <footer>Kun læsning. Ingen profiler eller årslister ændres. Resultater slettes, når vinduet lukkes. Ikke alle tilsynsforhold offentliggøres; ingen automatisk godkendelse.</footer>`;
     document.body.appendChild(dialog);
     const control = id => dialog.querySelector('#tpAnnual' + id);
+    control('Supervision').checked = options.supervision === true;
     const eligible = snapshot.rows.filter(row => row.active && row.professionCodes.length);
     control('Scope').textContent = snapshot.listLabel + ': ' + eligible.length + ' aktive SSA/SPL af ' + snapshot.total + ' på den filtrerede liste. ' + (snapshot.total - eligible.length) + ' udeladt.';
     control('Status').textContent = 'Klar til kontrol';
@@ -8144,7 +8138,7 @@
       if (current.state === 'invalidated') {
         scopeInvalid = true; clearRows();
         control('Status').textContent = 'Listen, profilen eller kontoen er ændret. Resultater er ryddet. Luk og åbn kontrollen igen.';
-        control('Start').disabled = true; control('Pause').disabled = true; control('Stop').disabled = true;
+        control('Pause').disabled = true; control('Stop').disabled = true;
         control('Progress').value = 0;
         return;
       }
@@ -8192,32 +8186,26 @@
         for (const line of lines) {const p = document.createElement('p'); p.textContent = line; report.appendChild(p);}
       }
     };
-    control('Start').disabled = !eligible.length || snapshot.total > 300 || !navigator.locks?.request || !annualTransportSupported();
+    const canStart = eligible.length > 0 && snapshot.total <= 300 && !!navigator.locks?.request && annualTransportSupported();
     if (!navigator.locks?.request) control('Status').textContent = 'Browseren understøtter ikke sikker flerfanekontrol';
     else if (!annualTransportSupported()) control('Status').textContent = 'Opdatér Tampermonkey til version 5.4 eller nyere før årskontrollen';
     else if (snapshot.total > 300) control('Status').textContent = 'Højst 300 listeposter pr. kørsel. Afgræns listen først.';
-    control('Start').addEventListener('click',() => {
-      if (!sameScope() || run) { control('Status').textContent = 'Listen eller kontoen er ændret. Luk og åbn kontrollen igen.'; return; }
-      control('Start').disabled = true; control('Supervision').disabled = true;
-      run = createAnnualAuthorizationRun(snapshot,{supervision:control('Supervision').checked},{
-        lock:fn => navigator.locks.request('tpAnnualAuthorizationV1',{ifAvailable:true},lock => fn(!!lock)),
-        check:sameScope,process:createAnnualAuthorizationProcessor(snapshot,sameScope),changed:render
-      });
-      void run.start();
-    });
+    else if (!eligible.length) control('Status').textContent = 'Ingen aktive SSA/SPL på den valgte, filtrerede liste.';
     control('Pause').addEventListener('click',() => run?.state === 'paused' ? run.resume() : run?.pause());
     control('Stop').addEventListener('click',() => run?.stop());
     const expire = () => {
       if (closed || sameScope()) return;
-      run?.dispose(); clearRows(); control('Start').disabled = true;
+      run?.dispose(); clearRows();
       control('Pause').disabled = true; control('Stop').disabled = true;
       control('Status').textContent = 'Listen eller kontoen er ændret. Resultater er ryddet. Luk og åbn kontrollen igen.';
     };
     const timer = setInterval(expire,1000);
     document.addEventListener('change',expire,true);
+    document.addEventListener('input',expire,true);
     const cleanup = () => {
       if (closed) return;
       closed = true; run?.dispose(); clearRows(); clearInterval(timer); document.removeEventListener('change',expire,true);
+      document.removeEventListener('input',expire,true);
       window.removeEventListener('pagehide',cleanup); dialog.close(); dialog.remove();
       if (closeAnnualAuthorizationUI === cleanup) closeAnnualAuthorizationUI = null;
       document.getElementById('tpAnnualButton')?.focus();
@@ -8228,6 +8216,13 @@
     dialog.addEventListener('cancel',event => {event.preventDefault(); cleanup();});
     dialog.addEventListener('close',cleanup,{once:true});
     dialog.showModal(); control('Close').focus();
+    if (canStart && sameScope()) {
+      run = createAnnualAuthorizationRun(snapshot,{supervision:options.supervision === true},{
+        lock:fn => navigator.locks.request('tpAnnualAuthorizationV1',{ifAvailable:true},lock => fn(!!lock)),
+        check:sameScope,process:createAnnualAuthorizationProcessor(snapshot,sameScope),changed:render
+      });
+      void run.start();
+    } else expire();
     return dialog;
   }
 
@@ -8239,40 +8234,56 @@
     injectAnnualAuthorizationStyles();
     const button = document.createElement('button'); button.id = 'tpAnnualButton'; button.type = 'button';
     button.textContent = 'Kontrollér autorisationer';
-    const status = document.createElement('span'); status.setAttribute('role','status');
+    const choices = document.createElement('label'); choices.id = 'tpAnnualListOptions';
+    const supervision = document.createElement('input'); supervision.type = 'checkbox';
+    supervision.id = 'tpAnnualListSupervision'; supervision.defaultChecked = true; supervision.checked = true;
+    choices.append(supervision,document.createTextNode('Medtag offentligt tilsyn og begrænsninger'));
+    const status = document.createElement('span'); status.id = 'tpAnnualPreparationStatus'; status.setAttribute('role','status');
     status.style.cssText = 'display:block;font-size:12px;max-width:300px';
-    field.parentElement.append(button,status);
+    field.parentElement.append(choices,button,status);
     button.addEventListener('click',async () => {
+      if (button.disabled) return;
       annualPreparation?.abort();
       const preparation = new AbortController(); annualPreparation = preparation;
       const cancel = () => preparation.abort();
+      let account = '';
+      const checkAccount = () => {
+        if (account && account !== annualAccountIdentity(document)) cancel();
+      };
       const form = field.form;
-      form?.addEventListener('input',cancel,true); form?.addEventListener('change',cancel,true);
+      form?.addEventListener('input',cancel,true); form?.addEventListener('change',cancel,true); form?.addEventListener('reset',cancel,true);
+      document.addEventListener('change',checkAccount,true);
       window.addEventListener('pagehide',cancel);
-      button.disabled = true; status.textContent = '';
+      const mode = {supervision:supervision.checked};
+      button.disabled = true; supervision.disabled = true; status.textContent = 'Henter hele den valgte liste…';
       try {
-        const first = readAnnualListSnapshot(document);
-        const account = annualAccountIdentity(document);
+        if (!field.value.trim()) throw new Error('TP_ANNUAL_LIST_NOT_SELECTED');
+        const first = readAnnualListScope(document);
+        account = annualAccountIdentity(document);
         if (!account) throw new Error('TP_ANNUAL_ACCOUNT');
-        if (first.total > 300) throw new Error('TP_ANNUAL_LIMIT');
         const html = await annualAuthorizationRequest('list',first.fingerprint,preparation.signal);
-        verifyAnnualListResponse(html,first);
-        const second = readAnnualListSnapshot(document);
+        const snapshot = readAnnualListResponse(html,first);
+        const second = readAnnualListScope(document);
         if (preparation.signal.aborted || annualPreparation !== preparation || !button.isConnected ||
           JSON.stringify(first) !== JSON.stringify(second) || account !== annualAccountIdentity(document)) throw new Error('TP_ANNUAL_SCOPE');
-        openAnnualAuthorizationUI({...second,account});
+        if (snapshot.total > 300) throw new Error('TP_ANNUAL_LIMIT');
+        status.textContent = '';
+        openAnnualAuthorizationUI({...snapshot,account},mode);
       } catch (error) {
         const code = error?.code || error?.message;
-        if (preparation.signal.aborted || code === 'TP_ANNUAL_SCOPE') status.textContent = 'Listen eller kontoen blev ændret under kontrollen. Afvent søgningen, og prøv igen.';
+        if (preparation.signal.aborted || code === 'TP_ANNUAL_SCOPE') status.textContent = 'Listen eller kontoen blev ændret under hentningen. Vælg liste, og start kontrollen igen.';
+        else if (code === 'TP_ANNUAL_LIST_NOT_SELECTED') status.textContent = 'Vælg en kontrolliste først.';
         else if (code === 'TP_ANNUAL_LIMIT') status.textContent = 'Højst 300 listeposter pr. kørsel. Afgræns listen først.';
         else if (code === 'TP_ANNUAL_ACCOUNT') status.textContent = 'Kontroller login i Temponizer, og genindlæs siden.';
-        else if (['ANNUAL_LIST_SOURCE_INVALID','ANNUAL_LIST_RESPONSE_INVALID'].includes(code)) status.textContent = 'Vælg en kontrolliste, indlæs hele resultatet med Vis alle, og afvent søgningen. Det friske svar skal stemme med listen.';
+        else if (code === 'ANNUAL_LIST_SOURCE_INVALID') status.textContent = 'Listevalget kunne ikke læses sikkert. Genindlæs siden, og vælg listen igen.';
+        else if (code === 'ANNUAL_LIST_RESPONSE_INVALID') status.textContent = 'Temponizer returnerede ikke en komplet, genkendelig liste. Ingen kontrol er startet.';
         else status.textContent = 'Den friske listekontrol kunne ikke gennemføres. Kontrollér forbindelsen, og prøv igen.';
       } finally {
-        form?.removeEventListener('input',cancel,true); form?.removeEventListener('change',cancel,true);
+        form?.removeEventListener('input',cancel,true); form?.removeEventListener('change',cancel,true); form?.removeEventListener('reset',cancel,true);
+        document.removeEventListener('change',checkAccount,true);
         window.removeEventListener('pagehide',cancel);
         if (annualPreparation === preparation) annualPreparation = null;
-        button.disabled = false;
+        button.disabled = false; supervision.disabled = false;
       }
     });
   }
