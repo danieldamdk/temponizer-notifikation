@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.32
+// @version      7.14.33
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -25,7 +25,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.32';
+  const TP_VERSION = '7.14.33';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -7301,12 +7301,14 @@
       const start = text.lastIndexOf('\n', label.index - 1) + 1;
       if (text.slice(start, label.index).trim() || !/^autorisations[\s-]*(?:id|nummer|nr\.?)$/i.test(label[0])) return invalid();
       const afterLabel = label.index + label[0].length;
-      const value = /^[\t ]*(?::|-[\t ]+)[\t ]*(?:\n[\t ]*)?([^\n]*)/.exec(text.slice(afterLabel));
+      const tail = text.slice(afterLabel);
+      const value = /^[\t ]*(?::|-[\t ]+)[\t ]*(?:\n[\t ]*)?([^\n]*)/.exec(tail)
+        || /^[\t ]*\n(?:[\t ]*\n)*[\t ]*([^\n]*)/.exec(tail);
       if (!value || !annualAuthorizationId(value[1].trim())) return invalid();
       // Unlabelled continuation belongs to this field; the next labelled field does not.
       const remainder = text.slice(afterLabel + value[0].length, labels[index + 1]?.index ?? text.length);
       for (const line of remainder.split('\n')) {
-        if (/^[^:]+:/.test(line)) break;
+        if (/^[^:]+:/.test(line) || /^(?:FAGGRUPPE|AUTORISATIONSSTATUS|UDDANNELSESLAND\s*\(GRUNDUDDANNELSE\)|DATO FOR UDSTEDELSE AF AUTORISATION|SPECIALISERING)\s*$/i.test(line.trim())) break;
         if (exclusion.test(line) ||
           /^[\t ]*[a-z0-9]{5}[\t ]*$/i.test(line)) return invalid();
       }
@@ -7372,6 +7374,18 @@
     if (normalized !== text.toLocaleLowerCase('da').replace(/[ '\u2019-]+/g, ' ').trim()) return false;
     const words = normalized.split(' ');
     return words.length >= 2 && words.every(word => word.length >= 2);
+  }
+
+  function annualAuthorizationStoredNameMatch(profileName, registerName) {
+    if (!annualAuthorizationNameComplete(profileName) || !annualAuthorizationNameComplete(registerName)) return false;
+    // Split on whitespace first so a hyphenated first/last name stays one unit.
+    const endpoints = value => {
+      const words = normalizeText(value).normalize('NFC').split(/\s+/);
+      if (words.length < 2) return [];
+      return [normalizeAuthorizationName(words[0]),normalizeAuthorizationName(words[words.length-1])];
+    };
+    const left = endpoints(profileName), right = endpoints(registerName);
+    return !!left[0] && !!left[1] && left[0] === right[0] && left[1] === right[1];
   }
 
   function annualAuthorizationObject(value) {
@@ -7974,6 +7988,40 @@
       record.ProfessionCode === profile.professionCodes[0] && annualAuthorizationNameComplete(record.FirstName+' '+record.LastName));
   }
 
+  async function fillEmptyAnnualCertificate(snapshot,row,profile,certificate,candidate,get,check,onWrite) {
+    if (!certificate.courseId || typeof certificate.comment !== 'string' || certificate.comment.trim() || !check()) throw new Error('TP_ANNUAL_CHANGED');
+    const freshProfile = readAnnualProfileHTML(await get('profile',row.id),row,snapshot.listValue,snapshot.account);
+    if (JSON.stringify(profile) !== JSON.stringify(freshProfile)) throw new Error('TP_ANNUAL_CHANGED');
+    const verified = validateAnnualAuthorizationRecord(await get('register',candidate.AuthorizationID),
+      {...freshProfile,authorizationId:candidate.AuthorizationID},formatIsoDate());
+    if (verified.identity !== 'exact' || verified.record.FirstName !== candidate.FirstName ||
+      verified.record.LastName !== candidate.LastName) throw new Error('TP_ANNUAL_CHANGED');
+    await get.enterCommit();
+    const finalProfile = readAnnualProfileHTML(await get('profile',row.id),row,snapshot.listValue,snapshot.account);
+    if (JSON.stringify(profile) !== JSON.stringify(finalProfile)) throw new Error('TP_ANNUAL_CHANGED');
+    const fresh = parseAnnualCertificateHTML(await get('certificate',row.id),row.id,true);
+    if (fresh.courseId !== certificate.courseId || fresh.comment !== certificate.comment || fresh.comment.trim()) throw new Error('TP_ANNUAL_CHANGED');
+    const record = verified.record, at = new Date().toISOString();
+    const lines = ['Navn: '+record.FirstName+' '+record.LastName,
+      'Faggruppe: '+(record.ProfessionCode==='5152'?'Social- og sundhedsassistent':'Sygeplejerske'),
+      'Autorisations-ID: '+record.AuthorizationID];
+    if (record.AuthorizationDate) lines.push('Autorisationsdato: '+formatAuthorizationDate(record.AuthorizationDate));
+    lines.push('Registeropslag: '+at,'Indsat automatisk efter entydigt match på navn, fødselsdato og faggruppe.');
+    const comment = fresh.comment + (fresh.comment ? '\n' : '') + lines.join('\n');
+    if (!check()) throw new Error('TP_ANNUAL_SCOPE');
+    if (comment.length > 10000) throw new Error('TP_ANNUAL_NOTE');
+    // A started write may commit even if its acknowledgement or the following read is lost.
+    onWrite('started');
+    try {
+      try { await get('save-certificate',{workerId:row.id,courseId:fresh.courseId,comment}); }
+      catch (_) { if (!check()) throw new Error('TP_ANNUAL_SAVE_UNKNOWN'); }
+      const readback = parseAnnualCertificateHTML(await get('certificate',row.id),row.id,true);
+      if (readback.courseId !== fresh.courseId || readback.comment !== comment || !check()) throw new Error('TP_ANNUAL_SAVE_UNKNOWN');
+    } catch (_) { onWrite('unknown'); throw new Error('TP_ANNUAL_SAVE_UNKNOWN'); }
+    onWrite('verified');
+    return verified;
+  }
+
   async function prepareAnnualConfirmation(snapshot,row,previous,get,check) {
     if (!['manual-id','manual-identity'].includes(previous.state) || !check()) throw new Error('TP_ANNUAL_SCOPE');
     const profile = readAnnualProfileHTML(await get('profile',row.id),row,snapshot.listValue,snapshot.account);
@@ -8130,9 +8178,13 @@
             for (const row of rows) {
               await checkpoint();
               const result = await dependencies.process(row, mode, controller.signal, checkpoint);
-              await checkpoint();
+              if (result.state === 'manual-save-unknown') {
+                if (controller.signal.aborted) return;
+                if (!dependencies.check()) { run.invalidate(); return; }
+              } else await checkpoint();
               run.results.push({row, ...result});
               run.current += 1; notify();
+              if (result.state === 'manual-save-unknown') { run.stop(); return; }
             }
             run.state = 'complete'; notify();
           });
@@ -8153,15 +8205,17 @@
     return run;
   }
 
-  function createAnnualAuthorizationRequests(check, manual = false) {
+  function createAnnualAuthorizationRequests(check) {
     let publicCalls = 0, nativeCalls = 0, lastPublicAt = 0;
     return async function request(kind,key,signal,checkpoint = async () => {}) {
       await checkpoint();
       if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
       if (['profile','certificate','save-certificate'].includes(kind)) {
-        if (++nativeCalls > (manual ? 2100 : 600)) throw new Error('TP_ANNUAL_LIMIT');
+        // Never send a write if the same serial run cannot afford its readback.
+        if (kind === 'save-certificate' && nativeCalls + 2 > 2100) throw new Error('TP_ANNUAL_LIMIT');
+        if (++nativeCalls > 2100) throw new Error('TP_ANNUAL_LIMIT');
       } else {
-        if (++publicCalls > (manual ? 1200 : 900)) throw new Error('TP_ANNUAL_LIMIT');
+        if (++publicCalls > 1200) throw new Error('TP_ANNUAL_LIMIT');
         const delay = Math.max(0, 2000 - (Date.now() - lastPublicAt));
         if (delay) await annualAuthorizationDelay(delay,signal);
         await checkpoint();
@@ -8175,14 +8229,18 @@
     };
   }
 
-  function createAnnualAuthorizationProcessor(snapshot, check) {
+  function createAnnualAuthorizationProcessor(snapshot, check, onWrite = () => {}) {
     const {listValue,account} = snapshot;
     const request = createAnnualAuthorizationRequests(check);
     return async (row,mode,signal,checkpoint = async () => {}) => {
       await checkpoint();
       if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
       if (!annualAuthorizationNameComplete(row.name)) return {state:'manual-profile',supervision:'not-checked'};
-      const get = (kind,key) => request(kind,key,signal,checkpoint);
+      let committing = false;
+      const trackWrite = state => { if (state !== 'started') committing = false; onWrite(state); };
+      // Do not suspend a validated empty-field snapshot. Stop and scope checks still apply.
+      const get = (kind,key) => request(kind,key,signal,committing ? undefined : checkpoint);
+      get.enterCommit = async () => { await checkpoint(); committing = true; };
       let profile;
       try {
         profile = readAnnualProfileHTML(await get('profile',row.id),row,listValue,account);
@@ -8194,25 +8252,46 @@
       const ids = parseAnnualCertificateHTML(await get('certificate',row.id),row.id,true);
       const certificateHash = await annualConfirmationHash(ids.comment);
       const saved = await readAnnualConfirmation(ids.comment,row,profile,ids.courseId,formatIsoDate());
-      if (saved.status === 'invalid' || (saved.status !== 'valid' && ids.status !== 'unique')) return {state:'manual-id',idStatus:ids.status,certificateHash,supervision:'not-checked'};
-      const id = saved.status === 'valid' ? saved.link.authorizationId : ids.ids[0];
-      const verified = validateAnnualAuthorizationRecord(await get('register',id),
-        {...profile,authorizationId:id},formatIsoDate());
+      let verified, automaticallySaved = false;
+      if (saved.status === 'absent' && ids.courseId && !ids.comment.trim()) {
+        const candidates = parseAnnualConfirmationCandidates(await get('candidates',{
+          birthDate:profile.birthDate,professionCode:profile.professionCodes[0]}),profile,formatIsoDate());
+        const exact = candidates.filter(record => normalizeAuthorizationName(record.FirstName+' '+record.LastName) === normalizeAuthorizationName(profile.name));
+        if (exact.length === 1) {
+          try { verified = await fillEmptyAnnualCertificate(snapshot,row,profile,ids,exact[0],get,check,trackWrite); automaticallySaved = true; }
+          catch (error) { if (error.message === 'TP_ANNUAL_SAVE_UNKNOWN') return {state:'manual-save-unknown',supervision:'not-checked'}; throw error; }
+        }
+      }
+      if (!verified) {
+        if (saved.status === 'invalid' || (saved.status !== 'valid' && ids.status !== 'unique')) return {state:'manual-id',idStatus:ids.status,certificateHash,supervision:'not-checked'};
+        const id = saved.status === 'valid' ? saved.link.authorizationId : ids.ids[0];
+        verified = validateAnnualAuthorizationRecord(await get('register',id),{...profile,authorizationId:id},formatIsoDate());
+      }
       if (verified.identity === 'conflict') return {state:'manual-conflict',identity:'conflict',supervision:'not-checked'};
       const record = verified.record;
+      const id = record?.AuthorizationID;
       const result = {state:verified.status,identity:verified.identity,authorizationId:id,
         registerName:record ? record.FirstName + ' ' + record.LastName : '',
         authorizationDate:record?.AuthorizationDate || '',
         supervision:mode.supervision ? 'not-checked' : 'excluded',items:[],checkedAt:Date.now()};
+      if (automaticallySaved) result.certificateSaved = 'automatic';
       if (saved.status === 'valid' && normalizeAuthorizationName(saved.link.registerName) === normalizeAuthorizationName(result.registerName)) {
         result.identity = 'saved-confirmation';
         result.confirmedAt = saved.link.confirmedAt;
+      } else if (saved.status === 'absent' && ids.status === 'unique' && verified.identity === 'name-difference' &&
+        annualAuthorizationStoredNameMatch(profile.name,result.registerName)) {
+        result.identity = 'attest-match';
       } else if (verified.identity !== 'exact' || saved.status === 'valid') { result.state = 'manual-identity'; result.certificateHash=certificateHash; return result; }
       if (!mode.supervision) return result;
-      const guid = parseAnnualRegisterSearch(await get('search',id),record);
-      if (!guid) { result.supervision = 'unknown'; return result; }
-      const extra = parseAnnualSupervisionHTML(await get('detail',guid),guid,record);
-      result.supervision = extra.status; result.items = extra.items;
+      try {
+        const guid = parseAnnualRegisterSearch(await get('search',id),record);
+        if (!guid) { result.supervision = 'unknown'; return result; }
+        const extra = parseAnnualSupervisionHTML(await get('detail',guid),guid,record);
+        result.supervision = extra.status; result.items = extra.items;
+      } catch (error) {
+        if (!automaticallySaved || signal.aborted || !check()) throw error;
+        result.supervision = 'unknown';
+      }
       return result;
     };
   }
@@ -8229,7 +8308,7 @@
   function summarizeAnnualAuthorization(current,total) {
     const results = current.results;
     const count = predicate => results.filter(predicate).length;
-    const identityVerified = result => ['exact','manual-confirmed','saved-confirmation'].includes(result.identity);
+    const identityVerified = result => ['exact','attest-match','manual-confirmed','saved-confirmation'].includes(result.identity);
     const verified = result => identityVerified(result) && ['valid','temporary','invalid'].includes(result.state);
     return {processed:results.length,remaining:Math.max(0,total-results.length),
       valid:count(result => verified(result) && result.state === 'valid'),
@@ -8237,6 +8316,7 @@
       invalid:count(result => verified(result) && result.state === 'invalid'),
       manual:count(result => !verified(result)),
       confirmed:count(result => result.identity === 'manual-confirmed'),
+      automaticallySaved:count(result => result.certificateSaved === 'automatic'),
       findings:count(result => result.supervision === 'published' || result.items?.length > 0),
       noPublished:count(result => result.supervision === 'none-published'),
       extraUnknown:count(result => !['none-published','published','excluded'].includes(result.supervision)),
@@ -8303,7 +8383,7 @@
       <div id="tpAnnualMatchHost"></div>
       <div class="tpAnnualTable"><table><thead><tr><th>Vikar</th><th>Identitet / gyldighed</th><th>Offentligt tilsyn / begrænsninger</th><th>Register</th></tr></thead><tbody></tbody></table></div>
       <section id="tpAnnualReport" hidden aria-label="Slutrapport"></section>
-      <footer>Kørslen er kun læsende. Kun “Bekræft og gem på vikaren” ændrer attestkommentaren. Ingen årslister ændres. Resultater slettes ved lukning; gemte personkoblinger bevares. Ikke alle tilsynsforhold offentliggøres; ingen automatisk godkendelse.</footer>`;
+      <footer>Tomme attestkommentarer udfyldes automatisk ved entydigt fuldt navne-, fødselsdato- og faggruppematch. Anden tekst ændres kun med “Bekræft og gem på vikaren”. Ingen årslister ændres. Undgå samtidig attestredigering. Resultater slettes ved lukning; gemte oplysninger bevares. Ikke alle tilsynsforhold offentliggøres; ingen automatisk godkendelse.</footer>`;
     document.body.appendChild(dialog);
     const control = id => dialog.querySelector('#tpAnnual' + id);
     control('Supervision').checked = options.supervision === true;
@@ -8323,10 +8403,10 @@
       tr.cells[1].textContent = 'Afventer'; tr.cells[2].textContent = 'Ikke undersøgt';
       body.appendChild(tr); cells.push(tr.cells);
     }
-    let run = null, rendered = 0, closed = false, scopeInvalid = false, finishedAt = null, dismissMatch = null, uncertainWrite = false;
+    let run = null, rendered = 0, closed = false, scopeInvalid = false, finishedAt = null, dismissMatch = null, uncertainWrite = false, autoWritePending = false, autoSavedCount = 0;
     const renderedResults = [], reviewButtons = [];
     const clearRows = () => {
-      uncertainWrite ||= !!dismissMatch?.pendingWrite?.();
+      uncertainWrite ||= autoWritePending || !!dismissMatch?.pendingWrite?.();
       dismissMatch?.(); dismissMatch=null; renderedResults.length=0; reviewButtons.length=0;
       for (const rowCells of cells) for (const cell of rowCells) cell.replaceChildren();
       cells.length = 0; eligible.length = 0; body.replaceChildren();
@@ -8344,6 +8424,7 @@
     const stateLabels = {running:'Kontrol i gang',paused:'Sat på pause',complete:'Kørslen er afsluttet; gennemgå resultaterne',
       stopped:'Stoppet. Resterende vikarer er ikke kontrolleret',failed:'Stoppet ved kilde- eller netværksfejl. Aktuel og resterende vikarer kræver ny kontrol',busy:'En anden fane kører allerede en kontrol'};
     const invalidStatus = () => 'Kontrolgrundlaget (liste, profil eller konto) er ændret eller kunne ikke bekræftes. Resultater er ryddet. Luk og åbn kontrollen igen.' +
+      (autoSavedCount ? ' ' + autoSavedCount + ' tomme attestkommentarer blev gemt og genlæst før afbrydelsen.' : '') +
       (uncertainWrite ? ' En gemning var allerede sendt; udfaldet er uafklaret. Kontrollér attesten i den oprindelige konto før et nyt forsøg.' : '');
     const render = current => {
       if (closed) return;
@@ -8359,6 +8440,7 @@
       control('Pause').disabled = !active; control('Stop').disabled = !active;
       control('Pause').textContent = current.state === 'paused' ? 'Fortsæt' : 'Pause';
       control('Status').textContent = (stateLabels[current.state] || '') + ' · ' + current.current + ' / ' + eligible.length;
+      if (uncertainWrite || (!active && autoWritePending)) control('Status').textContent += ' En gemning var allerede sendt; udfaldet er uafklaret. Kontrollér attesten før et nyt forsøg.';
       control('Progress').value = current.current;
       for(let index=0;index<current.results.length;index++) {
         const result=current.results[index],rowCells=cells[index];
@@ -8370,6 +8452,12 @@
         rowCells[1].className = result.state === 'valid' ? 'tpAnnualValid' : 'tpAnnualReview';
         if(['manual-confirmed','saved-confirmation'].includes(result.identity)){
           const confirmed=document.createElement('small');confirmed.textContent=result.identity==='manual-confirmed'?'Bekræftet manuelt · gemt på vikaren':'Tidligere personkobling · genkontrolleret';rowCells[1].appendChild(confirmed);
+        }
+        if(result.certificateSaved==='automatic'){
+          const saved=document.createElement('small');saved.textContent='Indsat automatisk i tom attest · genlæst';rowCells[1].appendChild(saved);
+        }
+        if(result.identity==='attest-match'){
+          const match=document.createElement('small');match.textContent='Attest-ID · fornavn og efternavn matcher';rowCells[1].appendChild(match);
         }
         if(['manual-id','manual-identity'].includes(result.state)){
           const review=document.createElement('button');review.type='button';review.textContent='Gennemgå match';review.disabled=active || !!dismissMatch;reviewButtons.push(review);rowCells[1].appendChild(review);
@@ -8411,12 +8499,20 @@
           'Behandlede: ' + stats.processed + ' af ' + eligible.length + ' · Ikke kontrolleret: ' + stats.remaining + ' · Udeladt: ' + current.excluded,
           'Gyldige: ' + stats.valid + ' · Midlertidige: ' + stats.temporary + ' · Ikke gyldige: ' + stats.invalid + ' · Uafklarede / manuelt match: ' + stats.manual,
           'Bekræftet manuelt og gemt: ' + stats.confirmed,
+          'Indsat automatisk i tom attest: ' + Math.max(autoSavedCount,stats.automaticallySaved) +
+            ' · Heraf med uafsluttet kontrol: ' + Math.max(0,autoSavedCount-stats.automaticallySaved),
           current.mode.supervision ? 'Offentligt tilsyn: Ingen vist: ' + stats.noPublished + ' · Fund: ' + stats.findings + ' · Uafklaret / ikke undersøgt: ' + stats.extraUnknown : 'Offentligt tilsyn og begrænsninger er fravalgt og ikke undersøgt.',
           'Manuel opfølgning: ' + stats.followup + ' af de behandlede. Ingen automatisk godkendelse.'];
         for (const line of lines) {const p = document.createElement('p'); p.textContent = line; report.appendChild(p);}
       }
     };
-    const manualRequest=createAnnualAuthorizationRequests(sameScope,true);
+    const manualRequest=createAnnualAuthorizationRequests(sameScope);
+    const trackAutomaticWrite = state => {
+      if (state === 'verified' && autoWritePending) autoSavedCount++;
+      autoWritePending = state === 'started';
+      if (state === 'unknown') uncertainWrite = true;
+      if (run && !closed) render(run);
+    };
     const canStart = eligible.length > 0 && snapshot.total <= 300 && !!navigator.locks?.request && annualTransportSupported();
     if (!navigator.locks?.request) control('Status').textContent = 'Browseren understøtter ikke sikker flerfanekontrol';
     else if (!annualTransportSupported()) control('Status').textContent = 'Opdatér Tampermonkey til version 5.4 eller nyere før årskontrollen';
@@ -8435,7 +8531,7 @@
     document.addEventListener('input',expire,true);
     const cleanup = event => {
       if (closed) return;
-      if(event?.type !== 'pagehide' && dismissMatch?.pendingWrite?.() &&
+      if(event?.type !== 'pagehide' && (uncertainWrite || autoWritePending || dismissMatch?.pendingWrite?.()) &&
         !window.confirm('Gemningen er sendt, men udfaldet er endnu ukendt. Kontrollér attesten på profilen før et nyt forsøg. Luk alligevel?'))return false;
       closed = true; run?.dispose(); clearRows(); clearInterval(timer); document.removeEventListener('change',expire,true);
       document.removeEventListener('input',expire,true);
@@ -8452,7 +8548,7 @@
     if (canStart && sameScope()) {
       run = createAnnualAuthorizationRun(snapshot,{supervision:options.supervision === true},{
         lock:fn => navigator.locks.request('tpAnnualAuthorizationV1',{ifAvailable:true},lock => fn(!!lock)),
-        check:sameScope,process:createAnnualAuthorizationProcessor(snapshot,sameScope),changed:render
+        check:sameScope,process:createAnnualAuthorizationProcessor(snapshot,sameScope,trackAutomaticWrite),changed:render
       });
       void run.start();
     } else expire();
