@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.30
+// @version      7.14.31
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -25,7 +25,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.30';
+  const TP_VERSION = '7.14.31';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -7655,7 +7655,9 @@
       if (!number || number !== row.number || !annualAuthorizationNameComplete(name) || !annualAuthorizationNameComplete(row.name) ||
           normalizeAuthorizationName(name) !== normalizeAuthorizationName(row.name) ||
           selectedList !== listValue) throw new Error('ANNUAL_SOURCE_SCHEMA');
-      const professionCodes = annualProfessionCodes(annualSourceOne(doc, '#themaincontent h1').textContent);
+      // Nested notifications also contain h1 elements; only the profile header identifies its professions.
+      const professionCodes = annualProfessionCodes(annualSourceOne(doc,
+        '#themaincontent > h1, #themaincontent > .contentpadding > h1').textContent);
       if (!professionCodes.length || !Array.isArray(row.professionCodes) ||
           JSON.stringify(professionCodes) !== JSON.stringify([...row.professionCodes].sort())) throw new Error('ANNUAL_SOURCE_SCHEMA');
       const birthDate = parseCprBirthDate(annualSourceOne(doc, '#cpr_nr').value);
@@ -8142,7 +8144,7 @@
       if (closed) return;
       if (current.state === 'invalidated') {
         scopeInvalid = true; clearRows();
-        control('Status').textContent = 'Listen, profilen eller kontoen er ændret. Resultater er ryddet. Luk og åbn kontrollen igen.';
+        control('Status').textContent = 'Kontrolgrundlaget (liste, profil eller konto) er ændret eller kunne ikke bekræftes. Resultater er ryddet. Luk og åbn kontrollen igen.';
         control('Pause').disabled = true; control('Stop').disabled = true;
         control('Progress').value = 0;
         return;
@@ -8202,7 +8204,7 @@
       if (closed || sameScope()) return;
       run?.dispose(); clearRows();
       control('Pause').disabled = true; control('Stop').disabled = true;
-      control('Status').textContent = 'Listen eller kontoen er ændret. Resultater er ryddet. Luk og åbn kontrollen igen.';
+      control('Status').textContent = 'Kontrolgrundlaget (liste, profil eller konto) er ændret eller kunne ikke bekræftes. Resultater er ryddet. Luk og åbn kontrollen igen.';
     };
     const timer = setInterval(expire,1000);
     document.addEventListener('change',expire,true);
