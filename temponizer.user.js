@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.33
+// @version      7.14.34
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -25,7 +25,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.33';
+  const TP_VERSION = '7.14.34';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -7737,6 +7737,11 @@
       ? normalizeAuthorizationName(first + ' ' + last) : null;
   }
 
+  // Public detail pages wrap names in Key/Value; direct API/search names remain strings.
+  function annualSupervisionDetailName(value) {
+    return annualSupervisionObject(value) ? value.Value : value;
+  }
+
   function annualSupervisionDate(value) {
     if (typeof value !== 'string' || !/^\d{2}\.\d{2}\.\d{4}$/.test(value)) return null;
     const [day, month, year] = value.split('.');
@@ -7800,7 +7805,7 @@
       if (nodes.length !== 1 || !nodes[0].hasAttribute(':person')) return unknown;
       const person = JSON.parse(nodes[0].getAttribute(':person'));
       if (!annualSupervisionObject(person) || annualSupervisionGuid(person.ContactId) !== expectedGuid
-          || annualSupervisionName(person.FirstName, person.LastName) !== expected.name
+          || annualSupervisionName(annualSupervisionDetailName(person.FirstName), annualSupervisionDetailName(person.LastName)) !== expected.name
           || !annualSupervisionPlain(person.FullName)
           || !annualAuthorizationNameComplete(person.FullName)
           || normalizeAuthorizationName(person.FullName) !== expected.name
@@ -7821,7 +7826,7 @@
           || authorization.AuthorizationStatus.IsValid !== expected.valid
           || !Array.isArray(authorization.Sanction) || authorization.Sanction.length > 100) return unknown;
       if (authorization.Sanction.length === 0) return { status: 'none-published', items: [] };
-      // Nonempty entry shapes are bundle-derived and synthetic-tested, not live-positive evidence.
+      // Keep validated findings visible even if another entry has an unknown shape.
       const items = [];
       let incomplete = false;
       for (const entry of authorization.Sanction) {
@@ -8305,6 +8310,11 @@
     });
   }
 
+  function annualSupervisionResultState(result) {
+    return result.supervision === 'none-published' && result.items?.length > 0
+      ? 'unknown' : result.supervision;
+  }
+
   function summarizeAnnualAuthorization(current,total) {
     const results = current.results;
     const count = predicate => results.filter(predicate).length;
@@ -8318,8 +8328,8 @@
       confirmed:count(result => result.identity === 'manual-confirmed'),
       automaticallySaved:count(result => result.certificateSaved === 'automatic'),
       findings:count(result => result.supervision === 'published' || result.items?.length > 0),
-      noPublished:count(result => result.supervision === 'none-published'),
-      extraUnknown:count(result => !['none-published','published','excluded'].includes(result.supervision)),
+      noPublished:count(result => annualSupervisionResultState(result) === 'none-published'),
+      extraUnknown:count(result => !['none-published','published','excluded'].includes(annualSupervisionResultState(result))),
       followup:count(result => !identityVerified(result) || result.state !== 'valid' ||
         (current.mode.supervision && result.supervision !== 'none-published') || result.items?.length > 0)};
   }
@@ -8472,9 +8482,13 @@
         if (result.registerName && result.identity !== 'exact') {
           const name = document.createElement('small'); name.textContent = 'Register: ' + result.registerName; rowCells[1].appendChild(name);
         }
-        const extras = {'none-published':'Ingen vist i registersvaret',published:'Oplysninger fundet: gennemgå manuelt',unknown:'Kunne ikke bekræftes',excluded:'Fravalgt: ikke undersøgt','not-checked':'Ikke undersøgt'};
-        rowCells[2].textContent = extras[result.supervision] || 'Ikke undersøgt';
-        if (result.supervision !== 'none-published') rowCells[2].className = 'tpAnnualReview';
+        const supervision = annualSupervisionResultState(result);
+        const extras = {'none-published':'Ingen bemærkninger',published:'Oplysninger fundet: gennemgå manuelt',unknown:'Kunne ikke bekræftes',excluded:'Fravalgt: ikke undersøgt','not-checked':'Ikke undersøgt'};
+        rowCells[2].textContent = extras[supervision] || 'Ikke undersøgt';
+        rowCells[2].className = supervision === 'none-published' ? 'tpAnnualValid' : 'tpAnnualReview';
+        if (supervision === 'none-published') {
+          const scope = document.createElement('small'); scope.textContent = 'I det offentlige register'; rowCells[2].appendChild(scope);
+        }
         for (const item of result.items || []) {
           const detail = document.createElement('details'), title = document.createElement('summary'), text = document.createElement('p');
           title.textContent = item.title; text.textContent = item.text; detail.append(title,text); rowCells[2].appendChild(detail);
@@ -8501,7 +8515,7 @@
           'Bekræftet manuelt og gemt: ' + stats.confirmed,
           'Indsat automatisk i tom attest: ' + Math.max(autoSavedCount,stats.automaticallySaved) +
             ' · Heraf med uafsluttet kontrol: ' + Math.max(0,autoSavedCount-stats.automaticallySaved),
-          current.mode.supervision ? 'Offentligt tilsyn: Ingen vist: ' + stats.noPublished + ' · Fund: ' + stats.findings + ' · Uafklaret / ikke undersøgt: ' + stats.extraUnknown : 'Offentligt tilsyn og begrænsninger er fravalgt og ikke undersøgt.',
+          current.mode.supervision ? 'Offentligt tilsyn: Ingen bemærkninger: ' + stats.noPublished + ' · Fund: ' + stats.findings + ' · Uafklaret / ikke undersøgt: ' + stats.extraUnknown : 'Offentligt tilsyn og begrænsninger er fravalgt og ikke undersøgt.',
           'Manuel opfølgning: ' + stats.followup + ' af de behandlede. Ingen automatisk godkendelse.'];
         for (const line of lines) {const p = document.createElement('p'); p.textContent = line; report.appendChild(p);}
       }
