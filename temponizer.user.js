@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.29
+// @version      7.14.30
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -25,7 +25,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.29';
+  const TP_VERSION = '7.14.30';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -7556,9 +7556,11 @@
       for (const tr of Array.from(tables[0].rows).slice(1)) {
         const cells = Array.from(tr.cells);
         if (cells.length !== 11 || cells.some(cell => cell.colSpan !== 1 || cell.rowSpan !== 1)) throw new Error('ANNUAL_SOURCE_SCHEMA');
-        const links = cells[2].querySelectorAll('a[href]');
-        if (links.length !== 1) throw new Error('ANNUAL_SOURCE_SCHEMA');
+        // Native rows repeat profile shortcuts and may include an inert "more" link.
+        const links = Array.from(cells[2].querySelectorAll('a[href]')).filter(link => link.getAttribute('href') !== '#');
+        if (!links.length) throw new Error('ANNUAL_SOURCE_SCHEMA');
         const id = annualSourceWorkerLink(links[0].getAttribute('href'));
+        if (links.some(link => annualSourceWorkerLink(link.getAttribute('href')) !== id)) throw new Error('ANNUAL_SOURCE_SCHEMA');
         for (const link of tr.querySelectorAll('a[href]')) {
           const href = link.getAttribute('href');
           if (/vikar_id|showvikaroplysninger/.test(href) && annualSourceWorkerLink(href) !== id) throw new Error('ANNUAL_SOURCE_SCHEMA');
@@ -7631,7 +7633,7 @@
       doc.body.append(form, count);
       const actual = readAnnualListSnapshot(doc);
       if (actual.fingerprint !== scope.fingerprint || actual.listValue !== scope.listValue ||
-          actual.listLabel !== scope.listLabel || actual.rows.some(row => !annualAuthorizationNameComplete(row.name))) {
+          actual.listLabel !== scope.listLabel) {
         throw new Error('ANNUAL_SOURCE_SCHEMA');
       }
       return actual;
@@ -7988,6 +7990,9 @@
       return result;
     }
     return async (row,mode,signal,checkpoint = async () => {}) => {
+      await checkpoint();
+      if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
+      if (!annualAuthorizationNameComplete(row.name)) return {state:'manual-profile',supervision:'not-checked'};
       const get = (kind,key) => request(kind,key,signal,checkpoint);
       let profile;
       try {
