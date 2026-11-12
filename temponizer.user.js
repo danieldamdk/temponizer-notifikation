@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.27
+// @version      7.14.28
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_info
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
@@ -14,6 +15,7 @@
 // @connect      ajourcare.temponizer.dk
 // @connect      vipvikaraps.sharepoint.com
 // @connect      autregwebservice.stps.dk
+// @connect      autregweb.stps.dk
 // @connect      default5ba2afb43ff949bbbbec063d521acc.76.environment.api.powerplatform.com
 // @run-at       document-idle
 // @noframes
@@ -23,7 +25,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.27';
+  const TP_VERSION = '7.14.28';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -741,7 +743,7 @@
   const runtimeFeatures = Object.freeze({
     diagnostics:'Diagnose', receiver:'Opkaldsmodtagelse', migration:'Personlige indstillinger',
     broadcast:'Notifikationsvisning', outgoing:'Udgaaende opkald', panel:'Notifikationspanel',
-    links:'Profilgenveje', authorization:'Autorisation', cpr:'CPR-kontrol', hover:'Vikaroverblik',
+    links:'Profilgenveje', authorization:'Autorisation', annualAuthorization:'Autorisation, aarskontrol', cpr:'CPR-kontrol', hover:'Vikaroverblik',
     quick:'Telefonregistrering', contacts:'Kontaktsynkronisering', sharing:'Diagnosedeling',
     storage:'Browserlager', leadership:'Faneansvar', messages:'Beskedkontrol',
     interest:'Interessekontrol', phone:'Opkaldskontrol', mail:'Mailkontrol', push:'Pushover', workflow:'Hjælp til udvikling'
@@ -7279,6 +7281,1002 @@
     };
     attach();
   }
+  function annualAuthorizationId(value) {
+    return typeof value === 'string' && /^[0-9BCDFGHJKLMNPQRSTVWXYZ]{5}$/.test(value);
+  }
+
+  // Labels are case-insensitive; IDs are not repaired, uppercased, or joined across fragments.
+  function parseAnnualAuthorizationIds(comment) {
+    if (comment === undefined || comment === null || comment === '') return {ids: [], status: 'missing'};
+    const invalid = () => ({ids: [], status: 'invalid'});
+    if (typeof comment !== 'string' || comment.length > 10000) return invalid();
+    if (!comment.trim()) return {ids: [], status: 'missing'};
+    if (/[<>\u2026]|\.{3}|[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(comment)) return invalid();
+    const text = comment.replace(/\r\n?/g, '\n').replace(/\u00a0/g, ' ');
+    const exclusion = /\b(?:forkert|fejl\w*|ikke|ingen|nej|gammel\w*|gamle|tidligere|historisk\w*|erstattet|rettet|udg[a\u00e5]et|for[ae\u00e6]ldet|ugyldig\w*|wrong|old|previous|invalid|obsolete|not)\b/i;
+    const labels = [...text.matchAll(/\bautorisations?[\s-]*(?:id\p{L}*|nummer|nr\.?)(?![\p{L}\p{N}])/giu)];
+    if (!labels.length) return {ids: [], status: 'missing'};
+    const found = [];
+    for (const [index, label] of labels.entries()) {
+      const start = text.lastIndexOf('\n', label.index - 1) + 1;
+      if (text.slice(start, label.index).trim() || !/^autorisations[\s-]*(?:id|nummer|nr\.?)$/i.test(label[0])) return invalid();
+      const afterLabel = label.index + label[0].length;
+      const value = /^[\t ]*(?::|-[\t ]+)[\t ]*(?:\n[\t ]*)?([^\n]*)/.exec(text.slice(afterLabel));
+      if (!value || !annualAuthorizationId(value[1].trim())) return invalid();
+      // Unlabelled continuation belongs to this field; the next labelled field does not.
+      const remainder = text.slice(afterLabel + value[0].length, labels[index + 1]?.index ?? text.length);
+      for (const line of remainder.split('\n')) {
+        if (/^[^:]+:/.test(line)) break;
+        if (exclusion.test(line) ||
+          /^[\t ]*[a-z0-9]{5}[\t ]*$/i.test(line)) return invalid();
+      }
+      found.push(value[1].trim());
+    }
+    const ids = [...new Set(found)].sort();
+    // ID warnings can live in an adjacent heading or a later note, outside the value field.
+    const idReference = /\bautorisations?[\s-]*(?:id|nummer|nr\.?)\b|(?:^|[\s(])id\b|\b(?:dette|det|angivne|oplyste|ovenst[a\u00e5]ende)\s+nummer\b/i;
+    const idHeading = /^(?:(?:forkert|tidligere|gammelt?|historisk|ugyldigt|for[ae\u00e6]ldet)\s+)*(?:id|nummer)\s*$/i;
+    const literalIds = ids.map(id => new RegExp('(?:^|[^A-Z0-9])' + id + '(?![A-Z0-9])'));
+    for (const line of text.split('\n')) {
+      if (!exclusion.test(line)) continue;
+      const separator = line.indexOf(':');
+      const heading = separator < 0 ? '' : line.slice(0, separator).trim();
+      const body = separator < 0 ? line : line.slice(separator + 1);
+      if (idHeading.test(heading) || idReference.test(body) || literalIds.some(pattern => pattern.test(line))) return invalid();
+    }
+    return {ids, status: ids.length === 1 ? 'unique' : 'multiple'};
+  }
+
+  function annualProfessionCodes(text) {
+    if (typeof text !== 'string' || text.length > 1000) return [];
+    const codes = new Set();
+    for (const part of text.toLocaleLowerCase('da').split(/[/,;|+\r\n]+/)) {
+      if (/studerende|student|elev|under\s+uddannelse|\b(?:stud|ikke|tidligere)\b/.test(part)) continue;
+      if (/(?:^|[^\p{L}\p{N}])(?:ssa|social\s*-?\s*og\s*sundhedsassistent)(?=$|[^\p{L}\p{N}])/u.test(part)) codes.add('5152');
+      if (/(?:^|[^\p{L}\p{N}])(?:spl|sygeplejerske)(?=$|[^\p{L}\p{N}])/u.test(part)) codes.add('5166');
+    }
+    return [...codes].sort();
+  }
+
+  function annualAuthorizationError(input = false) {
+    const error = new Error(input ? 'Invalid annual authorization input' : 'Invalid annual authorization response');
+    error.code = input ? 'ANNUAL_AUTHORIZATION_INPUT' : 'ANNUAL_AUTHORIZATION_SCHEMA';
+    return error;
+  }
+
+  // API dates are civil dates, sometimes serialized as ISO timestamps; do not shift timezones.
+  function annualAuthorizationDate(value, optional = false) {
+    if (optional && (value === undefined || value === null || value === '')) return '';
+    if (typeof value !== 'string') return null;
+    if (optional && /^0001-01-01(?:T00:00:00(?:\.0{1,7})?(?:Z|[+-]00:00)?)?$/.test(value)) return '';
+    const match = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,7})?(?:Z|[+-](\d{2}):(\d{2}))?)?$/.exec(value);
+    if (!match) return null;
+    const [, yearText, monthText, dayText, hour = '00', minute = '00', second = '00', offsetHour = '00', offsetMinute = '00'] = match;
+    const year = Number(yearText), month = Number(monthText), day = Number(dayText);
+    if (year < 1800 || year > 2999 || Number(hour) > 23 || Number(minute) > 59 || Number(second) > 59 ||
+      Number(offsetHour) > 14 || Number(offsetMinute) > 59 || (Number(offsetHour) === 14 && Number(offsetMinute) !== 0)) return null;
+    const date = new Date(Date.UTC(year, month - 1, day));
+    if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+    return `${yearText}-${monthText}-${dayText}`;
+  }
+
+  function annualAuthorizationText(value) {
+    return typeof value === 'string' && value.length <= 300 && normalizeText(value) !== '' &&
+      !/[\u0000-\u001f\u007f]/.test(value);
+  }
+
+  function annualAuthorizationNameComplete(value) {
+    const text = normalizeText(value).normalize('NFC');
+    if (!/^[\p{Script=Latin} '\u2019-]+$/u.test(text)) return false;
+    const normalized = normalizeAuthorizationName(text);
+    if (normalized !== text.toLocaleLowerCase('da').replace(/[ '\u2019-]+/g, ' ').trim()) return false;
+    const words = normalized.split(' ');
+    return words.length >= 2 && words.every(word => word.length >= 2);
+  }
+
+  function annualAuthorizationObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value) &&
+      Object.prototype.toString.call(value) === '[object Object]';
+  }
+
+  function annualAuthorizationRecord(record, today) {
+    const required = ['AuthorizationID', 'FirstName', 'LastName', 'BirthDate', 'ProfessionCode', 'AuthorizationValid'];
+    if (!annualAuthorizationObject(record) || required.some(key => !Object.hasOwn(record, key))) throw annualAuthorizationError();
+    if (!annualAuthorizationId(record.AuthorizationID) ||
+      !annualAuthorizationText(record.FirstName) || !annualAuthorizationText(record.LastName) ||
+      typeof record.ProfessionCode !== 'string' || !/^\d{4}$/.test(record.ProfessionCode) ||
+      typeof record.AuthorizationValid !== 'boolean') throw annualAuthorizationError();
+    const birthDate = annualAuthorizationDate(record.BirthDate);
+    const authorizationDate = annualAuthorizationDate(record.AuthorizationDate, true);
+    const begin = annualAuthorizationDate(record.TempAuthorizationBegin, true);
+    const end = annualAuthorizationDate(record.TempAuthorizationEnd, true);
+    if (birthDate === null || birthDate > today || authorizationDate === null || begin === null || end === null) throw annualAuthorizationError();
+    return {
+      AuthorizationID: record.AuthorizationID,
+      FirstName: normalizeText(record.FirstName),
+      LastName: normalizeText(record.LastName),
+      BirthDate: birthDate,
+      ProfessionCode: record.ProfessionCode,
+      AuthorizationValid: record.AuthorizationValid,
+      AuthorizationDate: authorizationDate,
+      TempAuthorizationBegin: begin,
+      TempAuthorizationEnd: end
+    };
+  }
+
+  // status describes this candidate's validity, never identity approval or supervision coverage.
+  function validateAnnualAuthorizationRecord(payload, expected, today) {
+    if (typeof today !== 'string' || today.length !== 10 || annualAuthorizationDate(today) !== today) throw annualAuthorizationError(true);
+    if (!annualAuthorizationObject(payload) || Object.keys(payload).length !== 1 ||
+      !Object.hasOwn(payload, 'GetHealthProfessionalResult')) throw annualAuthorizationError();
+    const record = annualAuthorizationRecord(payload.GetHealthProfessionalResult, today);
+    const conflict = reason => ({identity: 'conflict', status: 'unknown', reason});
+    if (!annualAuthorizationObject(expected) || !annualAuthorizationId(expected.authorizationId) ||
+      !annualAuthorizationText(expected.name) || typeof expected.birthDate !== 'string' || expected.birthDate.length !== 10 ||
+      annualAuthorizationDate(expected.birthDate) !== expected.birthDate || expected.birthDate > today ||
+      !Array.isArray(expected.professionCodes) || !expected.professionCodes.length ||
+      expected.professionCodes.some(code => code !== '5152' && code !== '5166')) return conflict('invalid-expected');
+    if (record.AuthorizationID !== expected.authorizationId) return conflict('id-mismatch');
+    if (record.BirthDate !== expected.birthDate) return conflict('birth-date-mismatch');
+    if (!expected.professionCodes.includes(record.ProfessionCode)) return conflict('profession-mismatch');
+    const returnedName = `${record.FirstName} ${record.LastName}`;
+    const exactName = annualAuthorizationNameComplete(expected.name) && annualAuthorizationNameComplete(returnedName) &&
+      normalizeAuthorizationName(returnedName) === normalizeAuthorizationName(expected.name);
+    const identity = exactName ? 'exact' : 'name-difference';
+    const begin = record.TempAuthorizationBegin, end = record.TempAuthorizationEnd;
+    let status, reason = exactName ? '' : 'name-difference';
+    if (begin && end && begin > end) {
+      status = 'unknown';
+      reason = 'period-conflict';
+    } else if (!record.AuthorizationValid) status = 'invalid';
+    else if ((end && end < today) || (begin && begin > today) || (record.AuthorizationDate && record.AuthorizationDate > today)) {
+      status = 'unknown';
+      reason = 'validity-date-conflict';
+    } else status = begin || end ? 'temporary' : 'valid';
+    return {record, identity, status, ...(reason ? {reason} : {})};
+  }
+  function annualSourceError(code) {
+    const error = new Error(code);
+    error.code = code;
+    return error;
+  }
+
+  function annualSourceOne(doc, selector) {
+    const nodes = doc.querySelectorAll(selector);
+    if (nodes.length !== 1) throw new Error('ANNUAL_SOURCE_SCHEMA');
+    return nodes[0];
+  }
+
+  function annualSourceText(value) {
+    return normalizeText(value).normalize('NFC');
+  }
+
+  function annualSourceHidden(node) {
+    for (let current = node; current?.nodeType === 1; current = current.parentElement) {
+      if (current.hidden || current.getAttribute('aria-hidden') === 'true' ||
+          /^(?:none)$/i.test(current.style?.display) || /^(?:hidden|collapse)$/i.test(current.style?.visibility)) return true;
+      const view = current.ownerDocument.defaultView;
+      if (view && current.isConnected) {
+        const style = view.getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return true;
+      }
+    }
+    return false;
+  }
+
+  function annualAccountIdentity(doc = document) {
+    try {
+      const link = annualSourceOne(doc, 'a[href="index.php?page=showmy_settings"]');
+      if (!link.parentElement || annualSourceHidden(link)) return '';
+      const parent = link.parentElement;
+      if (doc.defaultView && parent.isConnected) return annualSourceText(parent.innerText);
+      const copy = parent.cloneNode(true);
+      for (const node of copy.querySelectorAll('*')) {
+        if (/^(?:SCRIPT|STYLE|TEMPLATE)$/.test(node.tagName) || annualSourceHidden(node)) node.remove();
+        else if (node.tagName === 'BR') node.replaceWith(' ');
+      }
+      return annualSourceText(copy.textContent);
+    } catch (_) { return ''; }
+  }
+
+  function annualSourceListSelection(doc) {
+    const form = annualSourceOne(doc, 'form#vikarsearchform');
+    if (form.closest('[aria-busy="true" i]')) throw new Error('ANNUAL_SOURCE_SCHEMA');
+    const select = annualSourceOne(doc, 'select#misc_22[name="misc_22"]');
+    const selected = Array.from(select.selectedOptions);
+    if (select.form !== form || select.matches(':disabled') || select.multiple || selected.length !== 1 ||
+        selected[0].disabled || selected[0].parentElement.disabled || !annualSourceText(select.value) ||
+        Array.from(select.options).filter(option => option.value === select.value).length !== 1) {
+      throw new Error('ANNUAL_SOURCE_SCHEMA');
+    }
+    const label = annualSourceText(selected[0].label);
+    if (!label) throw new Error('ANNUAL_SOURCE_SCHEMA');
+    return { form, value: select.value, label };
+  }
+
+  function annualListFingerprint(doc = document) {
+    try {
+      const { form } = annualSourceListSelection(doc);
+      const pairs = [];
+      // Read successful controls without dispatching the native FormData event.
+      for (const field of form.elements) {
+        if (!field.name || field.matches(':disabled') || /^tp/i.test(field.name) || field.closest('[id^="tp" i]') ||
+            !/^(?:INPUT|SELECT|TEXTAREA)$/.test(field.tagName) ||
+            /^(?:submit|reset|button|image)$/i.test(field.type) ||
+            (/^(?:checkbox|radio)$/i.test(field.type) && !field.checked)) continue;
+        if (/cpr|password|token|secret/i.test(field.name) || field.type === 'password' || field.type === 'file') {
+          throw new Error('ANNUAL_SOURCE_SCHEMA');
+        }
+        const values = field.tagName === 'SELECT'
+          ? Array.from(field.selectedOptions).filter(option => !option.disabled && !option.parentElement.disabled).map(option => option.value)
+          : [field.value];
+        for (const value of values) pairs.push([field.name, value]);
+      }
+      pairs.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0);
+      return JSON.stringify(pairs);
+    } catch (_) { throw annualSourceError('ANNUAL_LIST_SOURCE_INVALID'); }
+  }
+
+  function annualSourceLabel(value) {
+    return annualSourceText(value).toLocaleLowerCase('da').replace(/[^\p{L}\p{N}]/gu, '');
+  }
+
+  function annualSourceWorkerLink(href) {
+    if (!/^(?:\?|(?:\.\/)?index\.php\?)/.test(href)) throw new Error('ANNUAL_SOURCE_SCHEMA');
+    const url = new URL(href, 'https://annual.invalid/index.php');
+    const id = url.searchParams.get('vikar_id');
+    if (url.searchParams.getAll('page').length !== 1 || url.searchParams.get('page') !== 'showvikaroplysninger' ||
+        url.searchParams.getAll('vikar_id').length !== 1 || !/^[1-9]\d*$/.test(id || '')) throw new Error('ANNUAL_SOURCE_SCHEMA');
+    return id;
+  }
+
+  function readAnnualListSnapshot(doc = document) {
+    try {
+      const selection = annualSourceListSelection(doc);
+      const fingerprint = annualListFingerprint(doc);
+      const count = annualSourceText(annualSourceOne(doc, '#resultatcnt').textContent);
+      if (!/^(?:0|[1-9]\d*)$/.test(count) || !Number.isSafeInteger(Number(count))) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const expected = ['', '', 'navn', 'vikarnr', 'postnummerby', 'telefon', 'email', 'uddannelse', 'aktiv', 'valgt'];
+      const tables = Array.from(doc.querySelectorAll('table')).filter(table => {
+        const cells = Array.from(table.rows[0]?.cells || []);
+        return cells.length === expected.length && cells.every((cell, i) =>
+          cell.rowSpan === 1 && cell.colSpan === (i === 2 ? 2 : 1) && annualSourceLabel(cell.textContent) === expected[i]);
+      });
+      if (tables.length !== 1 || tables[0].querySelector('table') || tables[0].closest('[aria-busy="true" i]')) {
+        throw new Error('ANNUAL_SOURCE_SCHEMA');
+      }
+      const rows = new Map(), numbers = new Set();
+      for (const tr of Array.from(tables[0].rows).slice(1)) {
+        const cells = Array.from(tr.cells);
+        if (cells.length !== 11 || cells.some(cell => cell.colSpan !== 1 || cell.rowSpan !== 1)) throw new Error('ANNUAL_SOURCE_SCHEMA');
+        const links = cells[2].querySelectorAll('a[href]');
+        if (links.length !== 1) throw new Error('ANNUAL_SOURCE_SCHEMA');
+        const id = annualSourceWorkerLink(links[0].getAttribute('href'));
+        for (const link of tr.querySelectorAll('a[href]')) {
+          const href = link.getAttribute('href');
+          if (/vikar_id|showvikaroplysninger/.test(href) && annualSourceWorkerLink(href) !== id) throw new Error('ANNUAL_SOURCE_SCHEMA');
+        }
+        const number = annualSourceText(cells[4].textContent);
+        const name = annualSourceText(cells[3].textContent);
+        const profession = annualSourceText(cells[8].textContent);
+        const activeText = annualSourceText(cells[9].textContent).toLocaleLowerCase('da');
+        if (!/^[1-9]\d*$/.test(number) || !name || !profession || !['ja', 'nej'].includes(activeText)) throw new Error('ANNUAL_SOURCE_SCHEMA');
+        const record = { id, number, name, profession, professionCodes: annualProfessionCodes(profession), active: activeText === 'ja' };
+        const semantic = JSON.stringify({ ...record, name: normalizeAuthorizationName(name), profession: profession.toLocaleLowerCase('da') });
+        if (rows.has(id)) {
+          const previous = rows.get(id);
+          if (!annualAuthorizationNameComplete(name) || !annualAuthorizationNameComplete(previous.record.name) ||
+              previous.semantic !== semantic) throw new Error('ANNUAL_SOURCE_SCHEMA');
+        } else {
+          if (numbers.has(number)) throw new Error('ANNUAL_SOURCE_SCHEMA');
+          rows.set(id, { record, semantic });
+          numbers.add(number);
+        }
+      }
+      if (rows.size !== Number(count)) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      return { fingerprint, listValue: selection.value, listLabel: selection.label,
+        rows: Array.from(rows.values(), item => item.record), total: Number(count) };
+    } catch (_) { throw annualSourceError('ANNUAL_LIST_SOURCE_INVALID'); }
+  }
+
+  function annualSourceSemanticRows(rows) {
+    if (!Array.isArray(rows) || rows.length > 300) throw new Error('ANNUAL_SOURCE_SCHEMA');
+    const ids = new Set(), numbers = new Set();
+    return rows.map(row => {
+      if (!row || typeof row.id !== 'string' || !/^[1-9]\d*$/.test(row.id) ||
+          typeof row.number !== 'string' || !/^[1-9]\d*$/.test(row.number) ||
+          !annualAuthorizationNameComplete(row.name) || typeof row.profession !== 'string' || !annualSourceText(row.profession) ||
+          typeof row.active !== 'boolean' || !Array.isArray(row.professionCodes) || ids.has(row.id) || numbers.has(row.number)) {
+        throw new Error('ANNUAL_SOURCE_SCHEMA');
+      }
+      const codes = annualProfessionCodes(row.profession);
+      if (JSON.stringify([...row.professionCodes].sort()) !== JSON.stringify(codes)) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      ids.add(row.id);
+      numbers.add(row.number);
+      return [row.id, row.number, normalizeAuthorizationName(row.name),
+        annualSourceText(row.profession).toLocaleLowerCase('da'), codes, row.active];
+    }).sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  }
+
+  function verifyAnnualListResponse(html, snapshot) {
+    try {
+      if (typeof html !== 'string' || html.length > 2000000 || !snapshot ||
+          !Number.isSafeInteger(snapshot.total) || snapshot.total < 0 || snapshot.total > 300 ||
+          typeof snapshot.listValue !== 'string' || !annualSourceText(snapshot.listValue) ||
+          typeof snapshot.listLabel !== 'string' || !annualSourceText(snapshot.listLabel) ||
+          typeof snapshot.fingerprint !== 'string' || snapshot.fingerprint.length > 100000) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const expectedRows = annualSourceSemanticRows(snapshot.rows);
+      if (expectedRows.length !== snapshot.total) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const pairs = JSON.parse(snapshot.fingerprint);
+      if (!Array.isArray(pairs) || pairs.length > 1000 || pairs.some(pair => !Array.isArray(pair) || pair.length !== 2 ||
+          pair.some(value => typeof value !== 'string') || !pair[0])) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const listPairs = pairs.filter(pair => pair[0] === 'misc_22');
+      if (listPairs.length !== 1 || listPairs[0][1] !== snapshot.listValue) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const scripts = doc.querySelectorAll('script'), tables = doc.querySelectorAll('table');
+      if (scripts.length !== 1 || scripts[0].hasAttribute('src') ||
+          (scripts[0].type && !/^(?:text|application)\/javascript$/i.test(scripts[0].type)) ||
+          tables.length !== 1 || tables[0].rows.length > 301 ||
+          doc.querySelector('form, #misc_22, #resultatcnt')) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      // This is a fixed completion marker, never JavaScript to execute.
+      const marker = scripts[0].textContent.match(/^\s*newoffset\s*=\s*0\s*;\s*remaining\s*=\s*0\s*;\s*jQuery\(\s*(['"])#resultatcnt\1\s*\)\s*\.html\(\s*(0|[1-9]\d*)\s*\)\s*;\s*update_selects\(\s*\)\s*;\s*activate_vikarstatus\(\s*\)\s*;\s*$/);
+      if (!marker || Number(marker[2]) !== snapshot.total) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      scripts[0].remove();
+      // Reconstruct only detached parsing context; transport must send these same pairs.
+      const form = doc.createElement('form');
+      form.id = 'vikarsearchform';
+      for (const [name, value] of pairs) {
+        const field = doc.createElement(name === 'misc_22' ? 'select' : 'input');
+        field.name = name;
+        if (name === 'misc_22') {
+          field.id = 'misc_22';
+          const option = doc.createElement('option');
+          option.value = value;
+          option.textContent = snapshot.listLabel;
+          option.selected = true;
+          field.appendChild(option);
+        } else { field.type = 'hidden'; field.value = value; }
+        form.appendChild(field);
+      }
+      const count = doc.createElement('span');
+      count.id = 'resultatcnt';
+      count.textContent = marker[2];
+      doc.body.append(form, count);
+      const actual = readAnnualListSnapshot(doc);
+      if (actual.fingerprint !== snapshot.fingerprint || actual.listValue !== snapshot.listValue ||
+          actual.listLabel !== snapshot.listLabel || actual.total !== snapshot.total ||
+          JSON.stringify(annualSourceSemanticRows(actual.rows)) !== JSON.stringify(expectedRows)) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      return true;
+    } catch (_) { throw annualSourceError('ANNUAL_LIST_RESPONSE_INVALID'); }
+  }
+
+  function readAnnualProfileHTML(html, row, listValue, account) {
+    let profile;
+    try {
+      if (typeof html !== 'string' || !annualSourceText(account) || typeof listValue !== 'string' || !listValue) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      if (annualAccountIdentity(doc) !== annualSourceText(account)) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const number = annualSourceText(annualSourceOne(doc, '#vikar_nr').value);
+      const name = annualSourceText(annualSourceOne(doc, '#navn').value);
+      const selectedList = annualSourceOne(doc, '#misc_text_typer-22').value;
+      if (!number || number !== row.number || !annualAuthorizationNameComplete(name) || !annualAuthorizationNameComplete(row.name) ||
+          normalizeAuthorizationName(name) !== normalizeAuthorizationName(row.name) ||
+          selectedList !== listValue) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const professionCodes = annualProfessionCodes(annualSourceOne(doc, '#themaincontent h1').textContent);
+      if (!professionCodes.length || !Array.isArray(row.professionCodes) ||
+          JSON.stringify(professionCodes) !== JSON.stringify([...row.professionCodes].sort())) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const birthDate = parseCprBirthDate(annualSourceOne(doc, '#cpr_nr').value);
+      profile = { name, birthDate, professionCodes };
+    } catch (_) { throw annualSourceError('ANNUAL_PROFILE_SOURCE_INVALID'); }
+    if (!profile.birthDate) throw annualSourceError('ANNUAL_PROFILE_IDENTITY_INCOMPLETE');
+    return profile;
+  }
+
+  function parseAnnualCertificateHTML(html, workerId) {
+    try {
+      if (typeof html !== 'string' || !/^[1-9]\d*$/.test(String(workerId || ''))) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const headings = Array.from(doc.querySelectorAll('[id^="kursus_td_name_"]'));
+      if (!headings.length) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      const matches = [], courses = new Set();
+      for (const heading of headings) {
+        const course = heading.id.match(/^kursus_td_name_([1-9]\d*)$/)?.[1];
+        const title = annualSourceLabel(heading.textContent);
+        if (!course || !title || courses.has(course)) throw new Error('ANNUAL_SOURCE_SCHEMA');
+        courses.add(course);
+        const courseRow = annualSourceOne(doc, '#kursusrow_' + course);
+        const dateName = 'datefrom_' + course + '_' + workerId;
+        const dateSelector = '[name="' + dateName + '"], [id="' + dateName + '"]';
+        const date = annualSourceOne(courseRow, dateSelector);
+        const dateBindings = courseRow.querySelectorAll('input[name^="datefrom_"], input[id^="datefrom_"]');
+        if (date.tagName !== 'INPUT' || date.closest('[id^="kursusrow_"]') !== courseRow || dateBindings.length !== 1 ||
+            doc.querySelectorAll(dateSelector).length !== 1 ||
+            [date.id, date.name].some(value => value.startsWith('datefrom_') && value !== dateName)) {
+          throw new Error('ANNUAL_SOURCE_SCHEMA');
+        }
+        if (title === 'autorisationsbeviskunssaogspl') matches.push({ course, courseRow });
+        else if (title.includes('autorisationsbevis')) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      }
+      if (matches.length > 1) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      if (!matches.length) return { ids: [], status: 'missing' };
+      const { course, courseRow } = matches[0];
+      const textarea = annualSourceOne(courseRow, 'textarea');
+      const handler = textarea.getAttribute('onkeyup') || '';
+      const binding = handler.match(/^\s*saveKursusText\(\s*this\.value\s*,\s*(['"]?)([1-9]\d*)\1\s*,\s*(['"]?)([1-9]\d*)\3\s*\)\s*;?\s*$/);
+      if (!binding || binding[2] !== String(workerId) || binding[4] !== course) throw new Error('ANNUAL_SOURCE_SCHEMA');
+      return parseAnnualAuthorizationIds(textarea.value);
+    } catch (_) { throw annualSourceError('ANNUAL_CERTIFICATE_SOURCE_INVALID'); }
+  }
+  function annualSupervisionObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function annualSupervisionPlain(value, maxLength = 256) {
+    return typeof value === 'string' && value.length <= maxLength
+      && !/[<>\u0000-\u001f\u007f]/.test(value) && normalizeText(value) !== '';
+  }
+
+  function annualSupervisionGuid(value) {
+    return typeof value === 'string'
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+      && value !== '00000000-0000-0000-0000-000000000000' ? value.toLowerCase() : null;
+  }
+
+  function annualSupervisionName(first, last) {
+    return annualSupervisionPlain(first) && annualSupervisionPlain(last)
+      && annualAuthorizationNameComplete(first + ' ' + last)
+      ? normalizeAuthorizationName(first + ' ' + last) : null;
+  }
+
+  function annualSupervisionDate(value) {
+    if (typeof value !== 'string' || !/^\d{2}\.\d{2}\.\d{4}$/.test(value)) return null;
+    const [day, month, year] = value.split('.');
+    const iso = year + '-' + month + '-' + day;
+    return isMeaningfulAuthorizationDate(iso) ? iso : null;
+  }
+
+  function annualSupervisionVerified(record) {
+    if (!annualSupervisionObject(record)
+        || typeof record.AuthorizationID !== 'string' || !/^[a-z0-9-]{1,64}$/i.test(record.AuthorizationID)
+        || typeof record.AuthorizationValid !== 'boolean'
+        || typeof record.BirthDate !== 'string' || !isMeaningfulAuthorizationDate(record.BirthDate)) return null;
+    const name = annualSupervisionName(record.FirstName, record.LastName);
+    const professions = { '5152': 'Social- og sundhedsassistent', '5166': 'Sygeplejerske' };
+    const profession = typeof record.ProfessionCode === 'string' && Object.hasOwn(professions, record.ProfessionCode)
+      ? professions[record.ProfessionCode] : null;
+    if (!name || !profession) return null;
+    if (record.ProfessionCodeName !== undefined
+        && !annualSupervisionProfession(record.ProfessionCodeName, normalizeAuthorizationName(profession))) return null;
+    return { id: record.AuthorizationID, name, date: record.BirthDate.slice(0, 10),
+      profession: normalizeAuthorizationName(profession), valid: record.AuthorizationValid };
+  }
+
+  function annualSupervisionProfession(value, expected) {
+    return annualSupervisionPlain(value) && normalizeAuthorizationName(value) === expected;
+  }
+
+  // verifiedRecord must be the independent, identity-checked direct API record.
+  function parseAnnualRegisterSearch(payload, verifiedRecord) {
+    const expected = annualSupervisionVerified(verifiedRecord);
+    if (!expected || !annualSupervisionObject(payload) || payload.totalCount !== 1
+        || payload.redirectToSingle !== true || !Array.isArray(payload.items) || payload.items.length !== 1) return null;
+    const item = payload.items[0];
+    if (!annualSupervisionObject(item) || annualSupervisionName(item.column1, item.column2) !== expected.name
+        || annualSupervisionDate(item.column3) !== expected.date
+        || !annualSupervisionProfession(item.column4, expected.profession)
+        || !annualSupervisionObject(item.authorizationStatusObject)
+        || item.authorizationStatusObject.isValid !== expected.valid) return null;
+    return annualSupervisionGuid(item.id);
+  }
+
+  function annualSupervisionDisplayText(value, maxLength) {
+    if (typeof value !== 'string' || value.length > maxLength) return null;
+    const doc = new DOMParser().parseFromString(value, 'text/html');
+    doc.querySelectorAll('script,style,template,noscript,iframe,object,embed,svg,math,link,meta,base,img,input')
+      .forEach(node => node.remove());
+    doc.querySelectorAll('p,div,li,br,hr,tr,td,th,h1,h2,h3,h4,h5,h6')
+      .forEach(node => node.appendChild(doc.createTextNode(' ')));
+    const text = normalizeText(doc.body.textContent.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ''));
+    return text || null;
+  }
+
+  // items are plain text for textContent, never HTML. Unknown can retain validated findings.
+  function parseAnnualSupervisionHTML(html, guid, verifiedRecord) {
+    const unknown = { status: 'unknown', items: [] };
+    const expected = annualSupervisionVerified(verifiedRecord), expectedGuid = annualSupervisionGuid(guid);
+    if (!expected || !expectedGuid || typeof html !== 'string' || html.length > 2000000) return unknown;
+    try {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const nodes = doc.querySelectorAll('stps-personal');
+      if (nodes.length !== 1 || !nodes[0].hasAttribute(':person')) return unknown;
+      const person = JSON.parse(nodes[0].getAttribute(':person'));
+      if (!annualSupervisionObject(person) || annualSupervisionGuid(person.ContactId) !== expectedGuid
+          || annualSupervisionName(person.FirstName, person.LastName) !== expected.name
+          || !annualSupervisionPlain(person.FullName)
+          || !annualAuthorizationNameComplete(person.FullName)
+          || normalizeAuthorizationName(person.FullName) !== expected.name
+          || !annualSupervisionObject(person.Birthdate)
+          || annualSupervisionDate(person.Birthdate.Value) !== expected.date
+          || !Array.isArray(person.Authorizations) || person.Authorizations.length > 100) return unknown;
+      const matches = [];
+      for (const authorization of person.Authorizations) {
+        if (!annualSupervisionObject(authorization) || !annualSupervisionObject(authorization.AuthorizationId)
+            || !annualSupervisionPlain(authorization.AuthorizationId.Value, 64)) return unknown;
+        if (authorization.AuthorizationId.Value === expected.id) matches.push(authorization);
+      }
+      if (matches.length !== 1) return unknown;
+      const authorization = matches[0];
+      if (!annualSupervisionObject(authorization.Profession)
+          || !annualSupervisionProfession(authorization.Profession.Value, expected.profession)
+          || !annualSupervisionObject(authorization.AuthorizationStatus)
+          || authorization.AuthorizationStatus.IsValid !== expected.valid
+          || !Array.isArray(authorization.Sanction) || authorization.Sanction.length > 100) return unknown;
+      if (authorization.Sanction.length === 0) return { status: 'none-published', items: [] };
+      // Nonempty entry shapes are bundle-derived and synthetic-tested, not live-positive evidence.
+      const items = [];
+      let incomplete = false;
+      for (const entry of authorization.Sanction) {
+        if (!annualSupervisionObject(entry) || typeof entry.IsWarning !== 'boolean') {
+          incomplete = true;
+          continue;
+        }
+        const title = annualSupervisionDisplayText(entry.Title, 2000);
+        const text = annualSupervisionDisplayText(entry.Text, 20000);
+        if (!title || !text) { incomplete = true; continue; }
+        items.push({ title, text, isWarning: entry.IsWarning });
+      }
+      return { status: incomplete ? 'unknown' : 'published', items };
+    } catch (_) {
+      return unknown;
+    }
+  }
+  function annualTransportSupported() {
+    if (typeof GM_info !== 'object' || GM_info.scriptHandler !== 'Tampermonkey') return false;
+    const match = String(GM_info.version || '').match(/^(\d+)\.(\d+)(?:\.|$)/);
+    return !!match && (Number(match[1]) > 5 || Number(match[1]) === 5 && Number(match[2]) >= 4);
+  }
+
+  async function annualAuthorizationRequest(kind, key, signal) {
+    if (signal.aborted) throw new Error('TP_ANNUAL_STOP');
+    let url, body, method = 'GET', external = false, json = false;
+    if (kind === 'list') {
+      let pairs;
+      try { pairs = typeof key === 'string' && key.length <= 16000 ? JSON.parse(key) : null; } catch (_) {}
+      if (!Array.isArray(pairs) || !pairs.length || pairs.length > 300 || pairs.some(pair =>
+        !Array.isArray(pair) || pair.length !== 2 || pair.some(value => typeof value !== 'string') ||
+        !/^[a-zA-Z0-9_\[\]-]{1,100}$/.test(pair[0]) || pair[1].length > 1000 ||
+        /cpr|password|token|secret/i.test(pair[0]) || /^(page|ajax|offset|showheader|all|printlist|ids)$/i.test(pair[0])) ||
+        pairs.filter(pair => pair[0] === 'misc_22' && pair[1].trim()).length !== 1) throw new Error('TP_ANNUAL_TARGET');
+      url = location.origin + '/index.php'; method = 'POST';
+      const params = new URLSearchParams(pairs);
+      for (const [name,value] of Object.entries({page:'vikarlist_get',ajax:'true',offset:'0',showheader:'true',all:'1'})) params.set(name,value);
+      body = params.toString();
+    } else if (['profile','certificate'].includes(kind) && /^[1-9]\d{0,8}$/.test(key)) {
+      url = location.origin + '/index.php';
+      if (kind === 'profile') url += '?page=showvikaroplysninger&vikar_id=' + key;
+      else {
+        method = 'POST';
+        body = new URLSearchParams({page:'vikar_settings_get_kurser',ajax:'true',vikar_id:key,faguddannelser_id:'0'}).toString();
+      }
+    } else if (['register','search'].includes(kind) && /^[0-9BCDFGHJKLMNPQRSTVWXYZ]{5}$/.test(key)) {
+      external = true; json = true;
+      if (kind === 'register') url = 'https://autregwebservice.stps.dk/api/AutReg/GetHealthProfessional?AuthorizationID=' + key;
+      else {
+        url = 'https://autregweb.stps.dk/api/search/GetSearchResults'; method = 'POST';
+        body = JSON.stringify({Category:'Sundhedsperson',Page:0,PageSize:5,Query:'?quickSearch=' + key,Language:'da'});
+      }
+    } else if (kind === 'detail' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(key)) {
+      external = true; url = 'https://autregweb.stps.dk/da/personal?id=' + key;
+    } else throw new Error('TP_ANNUAL_TARGET');
+
+    const checked = (text, finalUrl) => {
+      if (signal.aborted) throw new Error('TP_ANNUAL_STOP');
+      if (typeof text !== 'string' || text.length > 3000000) throw new Error('TP_ANNUAL_RESPONSE');
+      if (typeof finalUrl !== 'string' || !finalUrl || new URL(finalUrl).href !== new URL(url).href) throw new Error('TP_ANNUAL_REDIRECT');
+      if (!json) return text;
+      try { return JSON.parse(text); } catch (_) { throw new Error('TP_ANNUAL_JSON'); }
+    };
+    if (external && !annualTransportSupported()) throw new Error('TP_ANNUAL_TRANSPORT_UNSUPPORTED');
+    if (external) return new Promise((resolve,reject) => {
+      let transport, finished = false;
+      const finish = (error,value) => {
+        if (finished) return;
+        finished = true; clearTimeout(timer); signal.removeEventListener('abort',abort);
+        if (error) reject(new Error(error)); else resolve(value);
+      };
+      const abort = () => { finish('TP_ANNUAL_STOP'); transport?.abort(); };
+      const timer = setTimeout(() => { finish('TP_ANNUAL_TIMEOUT'); transport?.abort(); }, 20000);
+      signal.addEventListener('abort',abort,{once:true});
+      try {
+        transport = GM_xmlhttpRequest({method,url,data:body,anonymous:true,fetch:true,redirect:'error',timeout:20000,
+          headers:{Accept:json ? 'application/json' : 'text/html',...(body ? {'Content-Type':'application/json'} : {})},
+          onload:response => {
+            if (response.status !== 200) { finish('TP_ANNUAL_HTTP'); return; }
+            try { finish(null,checked(response.responseText,response.finalUrl)); }
+            catch (_) { finish('TP_ANNUAL_RESPONSE'); }
+          },
+          onerror:() => finish('TP_ANNUAL_NETWORK'), ontimeout:() => finish('TP_ANNUAL_TIMEOUT'),
+          onabort:() => finish('TP_ANNUAL_STOP')
+        });
+      } catch (_) { finish('TP_ANNUAL_NETWORK'); }
+    });
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal.addEventListener('abort',abort,{once:true});
+    let timer;
+    try {
+      return await Promise.race([
+        new Promise((_,reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('TP_ANNUAL_TIMEOUT')); },20000); }),
+        (async () => {
+          const response = await fetch(url,{method,body,credentials:'same-origin',cache:'no-store',redirect:'error',signal:controller.signal,
+            headers:body ? {'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'} : {}});
+          if (!response.ok) throw new Error('TP_ANNUAL_HTTP');
+          return checked(await response.text(),response.url);
+        })()
+      ]);
+    } finally { clearTimeout(timer); signal.removeEventListener('abort',abort); }
+  }
+
+  function createAnnualAuthorizationRun(snapshot, options, dependencies) {
+    if (!Array.isArray(snapshot?.rows) || snapshot.rows.length > 300 || !snapshot.rows.length) {
+      throw new Error('TP_ANNUAL_SCOPE');
+    }
+    const rows = snapshot.rows.filter(row => row.active && row.professionCodes?.length)
+      .map(row => ({...row, professionCodes:[...row.professionCodes]}));
+    const mode = Object.freeze({supervision:options.supervision === true});
+    const controller = new AbortController();
+    let wake = null, started = false, deadline;
+    const run = {
+      state:'ready', rows, results:[], excluded:snapshot.rows.length - rows.length,
+      current:0, mode, signal:controller.signal,
+      pause() { if (run.state === 'running') { run.state = 'paused'; notify(); } },
+      resume() { if (run.state === 'paused') { run.state = 'running'; wake?.(); wake = null; notify(); } },
+      stop() {
+        if (['complete','busy','failed','stopped','invalidated'].includes(run.state)) return;
+        run.state = 'stopped'; controller.abort(); wake?.(); wake = null; notify();
+      },
+      invalidate() {
+        run.state = 'invalidated'; controller.abort(); wake?.(); wake = null;
+        run.results.length = 0; run.rows.length = 0; notify();
+      },
+      dispose() { run.stop(); run.results.length = 0; run.rows.length = 0; },
+      async start() {
+        if (started) return;
+        started = true;
+        deadline = setTimeout(() => run.stop(), 60 * 60 * 1000);
+        try {
+          await dependencies.lock(async acquired => {
+            if (controller.signal.aborted) return;
+            if (!acquired) { run.state = 'busy'; notify(); return; }
+            run.state = 'running'; notify();
+            for (const row of rows) {
+              await checkpoint();
+              const result = await dependencies.process(row, mode, controller.signal, checkpoint);
+              await checkpoint();
+              run.results.push({row, ...result});
+              run.current += 1; notify();
+            }
+            run.state = 'complete'; notify();
+          });
+        } catch (error) {
+          if (!controller.signal.aborted) {
+            if (!dependencies.check() || error?.code === 'ANNUAL_PROFILE_SOURCE_INVALID') run.invalidate();
+            else { run.state = 'failed'; controller.abort(); notify(); }
+          }
+        } finally { clearTimeout(deadline); }
+      }
+    };
+    async function checkpoint() {
+      while (run.state === 'paused') await new Promise(resolve => { wake = resolve; });
+      if (controller.signal.aborted) throw new Error('TP_ANNUAL_STOP');
+      if (!dependencies.check()) { run.invalidate(); throw new Error('TP_ANNUAL_SCOPE'); }
+    }
+    function notify() { dependencies.changed?.(run); }
+    return run;
+  }
+
+  function createAnnualAuthorizationProcessor(snapshot, check) {
+    const {listValue,account} = snapshot;
+    let publicCalls = 0, nativeCalls = 0, lastPublicAt = 0;
+    async function request(kind,key,signal,checkpoint) {
+      await checkpoint();
+      if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
+      if (['profile','certificate'].includes(kind)) {
+        if (++nativeCalls > 600) throw new Error('TP_ANNUAL_LIMIT');
+      } else {
+        if (++publicCalls > 900) throw new Error('TP_ANNUAL_LIMIT');
+        const delay = Math.max(0, 2000 - (Date.now() - lastPublicAt));
+        if (delay) await annualAuthorizationDelay(delay,signal);
+        await checkpoint();
+        if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
+        lastPublicAt = Date.now();
+      }
+      const result = await annualAuthorizationRequest(kind,key,signal);
+      await checkpoint();
+      if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
+      return result;
+    }
+    return async (row,mode,signal,checkpoint = async () => {}) => {
+      const get = (kind,key) => request(kind,key,signal,checkpoint);
+      let profile;
+      try {
+        profile = readAnnualProfileHTML(await get('profile',row.id),row,listValue,account);
+      } catch (error) {
+        if (error.code === 'ANNUAL_PROFILE_IDENTITY_INCOMPLETE') return {state:'manual-profile',supervision:'not-checked'};
+        throw error;
+      }
+      if (profile.professionCodes.length !== 1) return {state:'manual-profile',supervision:'not-checked'};
+      const ids = parseAnnualCertificateHTML(await get('certificate',row.id),row.id);
+      if (ids.status !== 'unique') return {state:'manual-id',idStatus:ids.status,supervision:'not-checked'};
+      const id = ids.ids[0];
+      const verified = validateAnnualAuthorizationRecord(await get('register',id),
+        {...profile,authorizationId:id},formatIsoDate());
+      if (verified.identity === 'conflict') return {state:'manual-conflict',identity:'conflict',supervision:'not-checked'};
+      const record = verified.record;
+      const result = {state:verified.status,identity:verified.identity,authorizationId:id,
+        registerName:record ? record.FirstName + ' ' + record.LastName : '',
+        authorizationDate:record?.AuthorizationDate || '',
+        supervision:mode.supervision ? 'not-checked' : 'excluded',items:[],checkedAt:Date.now()};
+      if (verified.identity !== 'exact') { result.state = 'manual-identity'; return result; }
+      if (!mode.supervision) return result;
+      const guid = parseAnnualRegisterSearch(await get('search',id),record);
+      if (!guid) { result.supervision = 'unknown'; return result; }
+      const extra = parseAnnualSupervisionHTML(await get('detail',guid),guid,record);
+      result.supervision = extra.status; result.items = extra.items;
+      return result;
+    };
+  }
+
+  function annualAuthorizationDelay(ms,signal) {
+    return new Promise((resolve,reject) => {
+      if (signal.aborted) { reject(new Error('TP_ANNUAL_STOP')); return; }
+      const abort = () => { clearTimeout(timer); reject(new Error('TP_ANNUAL_STOP')); };
+      const timer = setTimeout(() => { signal.removeEventListener('abort',abort); resolve(); },ms);
+      signal.addEventListener('abort',abort,{once:true});
+    });
+  }
+
+  function summarizeAnnualAuthorization(current,total) {
+    const results = current.results;
+    const count = predicate => results.filter(predicate).length;
+    const verified = result => result.identity === 'exact' && ['valid','temporary','invalid'].includes(result.state);
+    return {processed:results.length,remaining:Math.max(0,total-results.length),
+      valid:count(result => verified(result) && result.state === 'valid'),
+      temporary:count(result => verified(result) && result.state === 'temporary'),
+      invalid:count(result => verified(result) && result.state === 'invalid'),
+      manual:count(result => !verified(result)),
+      findings:count(result => result.supervision === 'published' || result.items?.length > 0),
+      noPublished:count(result => result.supervision === 'none-published'),
+      extraUnknown:count(result => !['none-published','published','excluded'].includes(result.supervision)),
+      followup:count(result => result.identity !== 'exact' || result.state !== 'valid' ||
+        (current.mode.supervision && result.supervision !== 'none-published') || result.items?.length > 0)};
+  }
+
+  function injectAnnualAuthorizationStyles() {
+    if (document.getElementById('tpAnnualStyles')) return;
+    const style = document.createElement('style'); style.id = 'tpAnnualStyles';
+    style.textContent = `
+      #tpAnnualButton{margin:6px 0;padding:6px 10px;background:#69ad2f;color:#fff;border:1px solid #559a25;border-radius:3px;cursor:pointer}
+      #tpAnnualDialog{box-sizing:border-box;width:min(1200px,calc(100vw - 32px));max-height:calc(100vh - 32px);padding:0;border:1px solid #9ba2a7;border-radius:4px;color:#30363a;background:#fff;font:13px/1.4 Arial,sans-serif;letter-spacing:0}
+      #tpAnnualDialog::backdrop{background:rgba(0,0,0,.35)}
+      #tpAnnualDialog header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;background:#ededed;border-bottom:1px solid #b5b8bb}
+      #tpAnnualDialog h2{font:600 16px/1.4 Arial,sans-serif;margin:0;overflow-wrap:anywhere}
+      #tpAnnualDialog button{font:13px Arial,sans-serif;border:1px solid #aeb5ba;background:#f8f8f8;color:#30363a;border-radius:3px;min-height:32px;padding:6px 10px;cursor:pointer}
+      #tpAnnualDialog button:disabled{opacity:.5;cursor:default}
+      #tpAnnualDialog button:focus-visible,#tpAnnualDialog a:focus-visible{outline:2px solid #1673af;outline-offset:2px}
+      #tpAnnualDialog .tpAnnualControls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid #d4d7da}
+      #tpAnnualDialog label{display:flex;gap:6px;align-items:center;flex:1 1 290px}
+      #tpAnnualDialog input{margin:0;width:16px;height:16px;flex-shrink:0}
+      #tpAnnualDialog #tpAnnualStart{background:#69ad2f;border-color:#559a25;color:#fff}
+      #tpAnnualDialog .tpAnnualSummary{padding:10px 16px;margin:0}
+      #tpAnnualDialog #tpAnnualReport{padding:12px 16px;border-top:1px solid #b5b8bb;background:#f5f7f5}
+      #tpAnnualDialog #tpAnnualReport[hidden]{display:none}#tpAnnualDialog #tpAnnualReport p{margin:4px 0}
+      #tpAnnualDialog .tpAnnualTable{max-height:55vh;overflow:auto;border-top:1px solid #d4d7da}
+      #tpAnnualDialog table{border-collapse:collapse;width:100%;table-layout:fixed;font:12px/1.4 Arial,sans-serif}
+      #tpAnnualDialog th,#tpAnnualDialog td{padding:8px 10px;border-bottom:1px solid #e0e3e5;text-align:left;vertical-align:top;overflow-wrap:anywhere}
+      #tpAnnualDialog th{background:#eee;position:sticky;top:0;font-weight:600;z-index:1}
+      #tpAnnualDialog th:first-child{width:23%}#tpAnnualDialog th:nth-child(2){width:25%}#tpAnnualDialog th:nth-child(3){width:34%}#tpAnnualDialog th:last-child{width:18%}
+      #tpAnnualDialog a{color:#0073a6}#tpAnnualDialog small{display:block;color:#626a70;font-size:11px}
+      #tpAnnualDialog .tpAnnualReview{color:#8c5500}#tpAnnualDialog .tpAnnualValid{color:#357429}
+      #tpAnnualDialog footer{padding:10px 16px;color:#626a70;background:#f4f5f5;border-top:1px solid #d4d7da;font-size:11px}
+      #tpAnnualDialog progress{width:100%;height:8px;display:block;margin:0;border:0}
+      @media(max-width:600px){
+        #tpAnnualDialog{width:calc(100vw - 12px)}#tpAnnualDialog header,#tpAnnualDialog .tpAnnualControls{padding:10px}
+        #tpAnnualDialog thead{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+        #tpAnnualDialog tbody{display:block}#tpAnnualDialog tbody tr{display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid #b5b8bb}
+        #tpAnnualDialog td{display:block;padding:8px;min-width:0;border:0}#tpAnnualDialog td:first-child,#tpAnnualDialog td:last-child{grid-column:1/-1}
+        #tpAnnualDialog td::before{content:attr(data-label);display:block;font-weight:600;margin-bottom:4px}
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  let closeAnnualAuthorizationUI = null;
+  function openAnnualAuthorizationUI(snapshot) {
+    closeAnnualAuthorizationUI?.();
+    snapshot = {...snapshot,rows:snapshot.rows.slice()};
+    injectAnnualAuthorizationStyles();
+    const dialog = document.createElement('dialog'); dialog.id = 'tpAnnualDialog';
+    dialog.setAttribute('aria-labelledby','tpAnnualTitle');
+    dialog.innerHTML = `<header><h2 id="tpAnnualTitle">Autorisationskontrol</h2><button type="button" id="tpAnnualClose" aria-label="Luk kontrollen" title="Luk kontrollen">&times;</button></header>
+      <div class="tpAnnualControls"><label><input type="checkbox" id="tpAnnualSupervision" checked>Medtag offentligt tilsyn og begrænsninger</label><button type="button" id="tpAnnualStart">Start kontrol</button><button type="button" id="tpAnnualPause" disabled>Pause</button><button type="button" id="tpAnnualStop" disabled>Stop</button></div>
+      <p class="tpAnnualSummary" id="tpAnnualScope"></p><p class="tpAnnualSummary" id="tpAnnualStatus" role="status" aria-live="polite"></p><progress id="tpAnnualProgress" value="0" max="1" aria-label="Kontrollerede vikarer"></progress>
+      <div class="tpAnnualTable"><table><thead><tr><th>Vikar</th><th>Identitet / gyldighed</th><th>Offentligt tilsyn / begrænsninger</th><th>Register</th></tr></thead><tbody></tbody></table></div>
+      <section id="tpAnnualReport" hidden aria-label="Slutrapport"></section>
+      <footer>Kun læsning. Ingen profiler eller årslister ændres. Resultater slettes, når vinduet lukkes. Ikke alle tilsynsforhold offentliggøres; ingen automatisk godkendelse.</footer>`;
+    document.body.appendChild(dialog);
+    const control = id => dialog.querySelector('#tpAnnual' + id);
+    const eligible = snapshot.rows.filter(row => row.active && row.professionCodes.length);
+    control('Scope').textContent = snapshot.listLabel + ': ' + eligible.length + ' aktive SSA/SPL af ' + snapshot.total + ' på den filtrerede liste. ' + (snapshot.total - eligible.length) + ' udeladt.';
+    control('Status').textContent = 'Klar til kontrol';
+    control('Progress').max = Math.max(1,eligible.length);
+    const body = dialog.querySelector('tbody'), cells = [];
+    for (const row of eligible) {
+      const tr = document.createElement('tr');
+      for (const label of ['Vikar','Identitet / gyldighed','Offentligt tilsyn / begrænsninger','Register']) {
+        const cell = document.createElement('td'); cell.dataset.label = label; tr.appendChild(cell);
+      }
+      const link = document.createElement('a'); link.textContent = row.name;
+      link.href = '/index.php?page=showvikaroplysninger&vikar_id=' + row.id + '#kompetencer';
+      link.target = '_blank'; link.rel = 'noopener noreferrer'; tr.cells[0].appendChild(link);
+      tr.cells[1].textContent = 'Afventer'; tr.cells[2].textContent = 'Ikke undersøgt';
+      body.appendChild(tr); cells.push(tr.cells);
+    }
+    let run = null, rendered = 0, closed = false, scopeInvalid = false, finishedAt = null;
+    const clearRows = () => {
+      for (const rowCells of cells) for (const cell of rowCells) cell.replaceChildren();
+      cells.length = 0; eligible.length = 0; body.replaceChildren();
+      control('Report').replaceChildren(); control('Report').hidden = true;
+      if (snapshot) snapshot.rows.length = 0;
+      snapshot = null;
+    };
+    const sameScope = () => {
+      if (closed || scopeInvalid) return false;
+      try {
+        if (annualAccountIdentity(document) === snapshot.account && annualListFingerprint(document) === snapshot.fingerprint) return true;
+      } catch (_) {}
+      scopeInvalid = true; run?.invalidate(); return false;
+    };
+    const stateLabels = {running:'Kontrol i gang',paused:'Sat på pause',complete:'Kørslen er afsluttet; gennemgå resultaterne',
+      stopped:'Stoppet. Resterende vikarer er ikke kontrolleret',failed:'Stoppet ved kilde- eller netværksfejl. Aktuel og resterende vikarer kræver ny kontrol',busy:'En anden fane kører allerede en kontrol'};
+    const render = current => {
+      if (closed) return;
+      if (current.state === 'invalidated') {
+        scopeInvalid = true; clearRows();
+        control('Status').textContent = 'Listen, profilen eller kontoen er ændret. Resultater er ryddet. Luk og åbn kontrollen igen.';
+        control('Start').disabled = true; control('Pause').disabled = true; control('Stop').disabled = true;
+        control('Progress').value = 0;
+        return;
+      }
+      const active = ['running','paused'].includes(current.state);
+      control('Pause').disabled = !active; control('Stop').disabled = !active;
+      control('Pause').textContent = current.state === 'paused' ? 'Fortsæt' : 'Pause';
+      control('Status').textContent = (stateLabels[current.state] || '') + ' · ' + current.current + ' / ' + eligible.length;
+      control('Progress').value = current.current;
+      while (rendered < current.results.length) {
+        const result = current.results[rendered], rowCells = cells[rendered++];
+        const labels = {valid:'Gyldig i registeret',temporary:'Midlertidig autorisation',invalid:'Ikke gyldig i registeret',unknown:'Gyldighed uafklaret','manual-id':'Attest-ID kræver manuel kontrol','manual-identity':'Navneafvigelse: bekræft manuelt','manual-conflict':'Afvist match: kontrollér attest og profil','manual-profile':'Profil / faggrupper kræver manuel kontrol'};
+        rowCells[1].textContent = labels[result.state] || 'Kræver manuel kontrol';
+        rowCells[1].className = result.state === 'valid' ? 'tpAnnualValid' : 'tpAnnualReview';
+        if (result.registerName && result.identity !== 'exact') {
+          const name = document.createElement('small'); name.textContent = 'Register: ' + result.registerName; rowCells[1].appendChild(name);
+        }
+        const extras = {'none-published':'Ingen vist i registersvaret',published:'Oplysninger fundet: gennemgå manuelt',unknown:'Kunne ikke bekræftes',excluded:'Fravalgt: ikke undersøgt','not-checked':'Ikke undersøgt'};
+        rowCells[2].textContent = extras[result.supervision] || 'Ikke undersøgt';
+        if (result.supervision !== 'none-published') rowCells[2].className = 'tpAnnualReview';
+        for (const item of result.items || []) {
+          const detail = document.createElement('details'), title = document.createElement('summary'), text = document.createElement('p');
+          title.textContent = item.title; text.textContent = item.text; detail.append(title,text); rowCells[2].appendChild(detail);
+        }
+        if (result.authorizationId) {
+          const link = document.createElement('a'); link.textContent = result.authorizationId + ' ↗';
+          link.href = buildAuthorizationRegisterURL({AuthorizationID:result.authorizationId});
+          link.target = '_blank'; link.rel = 'noopener noreferrer'; rowCells[3].appendChild(link);
+          const date = document.createElement('small'); date.textContent = 'Udstedt ' + formatAuthorizationDate(result.authorizationDate); rowCells[3].appendChild(date);
+          if (result.checkedAt) { const at = document.createElement('small'); at.textContent = 'Opslag ' + new Date(result.checkedAt).toLocaleString('da-DK'); rowCells[3].appendChild(at); }
+        }
+      }
+      if (['stopped','failed','busy'].includes(current.state)) {
+        for (let i=rendered;i<cells.length;i++) cells[i][1].textContent = 'Ikke kontrolleret';
+      }
+      if (['complete','stopped','failed'].includes(current.state)) {
+        finishedAt ||= new Date().toLocaleString('da-DK');
+        const stats = summarizeAnnualAuthorization(current,eligible.length), report = control('Report');
+        report.replaceChildren(); report.hidden = false;
+        const title = document.createElement('strong'); title.textContent = current.state === 'complete' ? 'Slutrapport' : 'Delrapport: kørslen blev afbrudt'; report.appendChild(title);
+        const lines = [snapshot.listLabel + ' · ' + finishedAt,
+          'Behandlede: ' + stats.processed + ' af ' + eligible.length + ' · Ikke kontrolleret: ' + stats.remaining + ' · Udeladt: ' + current.excluded,
+          'Gyldige: ' + stats.valid + ' · Midlertidige: ' + stats.temporary + ' · Ikke gyldige: ' + stats.invalid + ' · Uafklarede / manuelt match: ' + stats.manual,
+          current.mode.supervision ? 'Offentligt tilsyn: Ingen vist: ' + stats.noPublished + ' · Fund: ' + stats.findings + ' · Uafklaret / ikke undersøgt: ' + stats.extraUnknown : 'Offentligt tilsyn og begrænsninger er fravalgt og ikke undersøgt.',
+          'Manuel opfølgning: ' + stats.followup + ' af de behandlede. Ingen automatisk godkendelse.'];
+        for (const line of lines) {const p = document.createElement('p'); p.textContent = line; report.appendChild(p);}
+      }
+    };
+    control('Start').disabled = !eligible.length || snapshot.total > 300 || !navigator.locks?.request || !annualTransportSupported();
+    if (!navigator.locks?.request) control('Status').textContent = 'Browseren understøtter ikke sikker flerfanekontrol';
+    else if (!annualTransportSupported()) control('Status').textContent = 'Opdatér Tampermonkey til version 5.4 eller nyere før årskontrollen';
+    else if (snapshot.total > 300) control('Status').textContent = 'Højst 300 listeposter pr. kørsel. Afgræns listen først.';
+    control('Start').addEventListener('click',() => {
+      if (!sameScope() || run) { control('Status').textContent = 'Listen eller kontoen er ændret. Luk og åbn kontrollen igen.'; return; }
+      control('Start').disabled = true; control('Supervision').disabled = true;
+      run = createAnnualAuthorizationRun(snapshot,{supervision:control('Supervision').checked},{
+        lock:fn => navigator.locks.request('tpAnnualAuthorizationV1',{ifAvailable:true},lock => fn(!!lock)),
+        check:sameScope,process:createAnnualAuthorizationProcessor(snapshot,sameScope),changed:render
+      });
+      void run.start();
+    });
+    control('Pause').addEventListener('click',() => run?.state === 'paused' ? run.resume() : run?.pause());
+    control('Stop').addEventListener('click',() => run?.stop());
+    const expire = () => {
+      if (closed || sameScope()) return;
+      run?.dispose(); clearRows(); control('Start').disabled = true;
+      control('Pause').disabled = true; control('Stop').disabled = true;
+      control('Status').textContent = 'Listen eller kontoen er ændret. Resultater er ryddet. Luk og åbn kontrollen igen.';
+    };
+    const timer = setInterval(expire,1000);
+    document.addEventListener('change',expire,true);
+    const cleanup = () => {
+      if (closed) return;
+      closed = true; run?.dispose(); clearRows(); clearInterval(timer); document.removeEventListener('change',expire,true);
+      window.removeEventListener('pagehide',cleanup); dialog.close(); dialog.remove();
+      if (closeAnnualAuthorizationUI === cleanup) closeAnnualAuthorizationUI = null;
+      document.getElementById('tpAnnualButton')?.focus();
+    };
+    closeAnnualAuthorizationUI = cleanup;
+    control('Close').addEventListener('click',cleanup);
+    window.addEventListener('pagehide',cleanup);
+    dialog.addEventListener('cancel',event => {event.preventDefault(); cleanup();});
+    dialog.addEventListener('close',cleanup,{once:true});
+    dialog.showModal(); control('Close').focus();
+    return dialog;
+  }
+
+  let annualPreparation = null;
+  function initAnnualAuthorization() {
+    if (new URL(location.href).searchParams.get('page') !== 'vikarlist' || document.getElementById('tpAnnualButton')) return;
+    const field = document.getElementById('misc_22');
+    if (!field) return;
+    injectAnnualAuthorizationStyles();
+    const button = document.createElement('button'); button.id = 'tpAnnualButton'; button.type = 'button';
+    button.textContent = 'Kontrollér autorisationer';
+    const status = document.createElement('span'); status.setAttribute('role','status');
+    status.style.cssText = 'display:block;font-size:12px;max-width:300px';
+    field.parentElement.append(button,status);
+    button.addEventListener('click',async () => {
+      annualPreparation?.abort();
+      const preparation = new AbortController(); annualPreparation = preparation;
+      const cancel = () => preparation.abort();
+      const form = field.form;
+      form?.addEventListener('input',cancel,true); form?.addEventListener('change',cancel,true);
+      window.addEventListener('pagehide',cancel);
+      button.disabled = true; status.textContent = '';
+      try {
+        const first = readAnnualListSnapshot(document);
+        const account = annualAccountIdentity(document);
+        if (!account) throw new Error('TP_ANNUAL_ACCOUNT');
+        if (first.total > 300) throw new Error('TP_ANNUAL_LIMIT');
+        const html = await annualAuthorizationRequest('list',first.fingerprint,preparation.signal);
+        verifyAnnualListResponse(html,first);
+        const second = readAnnualListSnapshot(document);
+        if (preparation.signal.aborted || annualPreparation !== preparation || !button.isConnected ||
+          JSON.stringify(first) !== JSON.stringify(second) || account !== annualAccountIdentity(document)) throw new Error('TP_ANNUAL_SCOPE');
+        openAnnualAuthorizationUI({...second,account});
+      } catch (error) {
+        const code = error?.code || error?.message;
+        if (preparation.signal.aborted || code === 'TP_ANNUAL_SCOPE') status.textContent = 'Listen eller kontoen blev ændret under kontrollen. Afvent søgningen, og prøv igen.';
+        else if (code === 'TP_ANNUAL_LIMIT') status.textContent = 'Højst 300 listeposter pr. kørsel. Afgræns listen først.';
+        else if (code === 'TP_ANNUAL_ACCOUNT') status.textContent = 'Kontroller login i Temponizer, og genindlæs siden.';
+        else if (['ANNUAL_LIST_SOURCE_INVALID','ANNUAL_LIST_RESPONSE_INVALID'].includes(code)) status.textContent = 'Vælg en kontrolliste, indlæs hele resultatet med Vis alle, og afvent søgningen. Det friske svar skal stemme med listen.';
+        else status.textContent = 'Den friske listekontrol kunne ikke gennemføres. Kontrollér forbindelsen, og prøv igen.';
+      } finally {
+        form?.removeEventListener('input',cancel,true); form?.removeEventListener('change',cancel,true);
+        window.removeEventListener('pagehide',cancel);
+        if (annualPreparation === preparation) annualPreparation = null;
+        button.disabled = false;
+      }
+    });
+  }
+
   function isCprLookupAction(button) {
     if (!(button instanceof HTMLButtonElement)) return false;
     const action = button.getAttribute('onclick') || '';
@@ -7627,6 +8625,7 @@
     runtimeGuard.run('panel', injectUI);
     runtimeGuard.run('links', initWorkerProfileDeepLinks);
     runtimeGuard.run('authorization', initAuthorizationLookup);
+    runtimeGuard.run('annualAuthorization', initAnnualAuthorization);
     runtimeGuard.run('cpr', initCprLookupActions);
     runtimeGuard.run('hover', initWorkerProfileHover);
     runtimeGuard.run('quick', initQuickNoAnswer);
@@ -7637,6 +8636,18 @@
     paintRuntimeWarning();
   }
   const TEST_API = Object.freeze({
+    createAnnualAuthorizationRun,
+    createAnnualAuthorizationProcessor,
+    annualAuthorizationRequest,
+    readAnnualListSnapshot,
+    readAnnualProfileHTML,
+    parseAnnualCertificateHTML,
+    parseAnnualAuthorizationIds,
+    validateAnnualAuthorizationRecord,
+    parseAnnualRegisterSearch,
+    parseAnnualSupervisionHTML,
+    openAnnualAuthorizationUI,
+    initAnnualAuthorization,
     createRuntimeSupervisor,
     createWorkflowTracker,
     workflowTracker,
