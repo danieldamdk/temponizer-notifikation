@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Temponizer -> Pushover + Toast + Mail + SMS + Quick "Intet Svar" (AjourCare)
 // @namespace    ajourcare.dk
-// @version      7.14.31
+// @version      7.14.32
 // @description  Notifikation ved nye indgaaende vikarbeskeder, interesse og IPnordic-opkald, Pushover/Toast, Mail-status, SMS, hurtig telefonregistrering, vikaroverblik og autorisationskontrol.
 // @match        https://ajourcare.temponizer.dk/*
 // @grant        GM_xmlhttpRequest
@@ -25,7 +25,7 @@
 
 (() => {
   'use strict';
-  const TP_VERSION = '7.14.31';
+  const TP_VERSION = '7.14.32';
   const IS_TEST = globalThis.__TP_TEST_MODE__ === true;
 
   const PUSHOVER_CONFIG_KEY = 'tpPushoverAppConfigV1';
@@ -7667,7 +7667,7 @@
     return profile;
   }
 
-  function parseAnnualCertificateHTML(html, workerId) {
+  function parseAnnualCertificateHTML(html, workerId, withComment = false) {
     try {
       if (typeof html !== 'string' || !/^[1-9]\d*$/.test(String(workerId || ''))) throw new Error('ANNUAL_SOURCE_SCHEMA');
       const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -7693,13 +7693,13 @@
         else if (title.includes('autorisationsbevis')) throw new Error('ANNUAL_SOURCE_SCHEMA');
       }
       if (matches.length > 1) throw new Error('ANNUAL_SOURCE_SCHEMA');
-      if (!matches.length) return { ids: [], status: 'missing' };
+      if (!matches.length) return { ids: [], status: 'missing', ...(withComment ? {courseId:'',comment:''} : {}) };
       const { course, courseRow } = matches[0];
       const textarea = annualSourceOne(courseRow, 'textarea');
       const handler = textarea.getAttribute('onkeyup') || '';
       const binding = handler.match(/^\s*saveKursusText\(\s*this\.value\s*,\s*(['"]?)([1-9]\d*)\1\s*,\s*(['"]?)([1-9]\d*)\3\s*\)\s*;?\s*$/);
       if (!binding || binding[2] !== String(workerId) || binding[4] !== course) throw new Error('ANNUAL_SOURCE_SCHEMA');
-      return parseAnnualAuthorizationIds(textarea.value);
+      return {...parseAnnualAuthorizationIds(textarea.value), ...(withComment ? {courseId:course,comment:textarea.value} : {})};
     } catch (_) { throw annualSourceError('ANNUAL_CERTIFICATE_SOURCE_INVALID'); }
   }
   function annualSupervisionObject(value) {
@@ -7853,6 +7853,14 @@
         method = 'POST';
         body = new URLSearchParams({page:'vikar_settings_get_kurser',ajax:'true',vikar_id:key,faguddannelser_id:'0'}).toString();
       }
+    } else if (kind === 'save-certificate' && key && /^[1-9]\d{0,8}$/.test(key.workerId) &&
+      /^[1-9]\d{0,8}$/.test(key.courseId) && typeof key.comment === 'string' && key.comment.length <= 10000) {
+      url = location.origin + '/index.php'; method = 'POST';
+      body = new URLSearchParams({page:'save_vikar_kursus_text',ajax:'true',vikar_id:key.workerId,kursus_id:key.courseId,kursus_text:key.comment}).toString();
+    } else if (kind === 'candidates' && key && typeof key.birthDate === 'string' && key.birthDate.length === 10 &&
+      annualAuthorizationDate(key.birthDate) === key.birthDate && key.birthDate <= formatIsoDate() && ['5152','5166'].includes(key.professionCode)) {
+      external = true; json = true;
+      url = buildAuthorizationLookupURL({name:'',birthDate:key.birthDate,professionCode:key.professionCode});
     } else if (['register','search'].includes(kind) && /^[0-9BCDFGHJKLMNPQRSTVWXYZ]{5}$/.test(key)) {
       external = true; json = true;
       if (kind === 'register') url = 'https://autregwebservice.stps.dk/api/AutReg/GetHealthProfessional?AuthorizationID=' + key;
@@ -7910,6 +7918,181 @@
         })()
       ]);
     } finally { clearTimeout(timer); signal.removeEventListener('abort',abort); }
+  }
+
+  function splitAnnualConfirmation(comment) {
+    if (typeof comment !== 'string' || comment.length > 10000) throw new Error('TP_ANNUAL_NOTE');
+    if (!comment.includes('TP-AUTH-LINK')) return {base:comment,link:null};
+    const match = /\n\n\[TP-AUTH-LINK v1\]\n([^]*?)\n\[\/TP-AUTH-LINK\]$/.exec(comment);
+    if (!match || (comment.match(/TP-AUTH-LINK/g) || []).length !== 2) throw new Error('TP_ANNUAL_NOTE');
+    const link = JSON.parse(match[1]);
+    if (!annualAuthorizationObject(link)) throw new Error('TP_ANNUAL_NOTE');
+    return {base:comment.slice(0,match.index),link};
+  }
+
+  async function annualConfirmationHash(text) {
+    const hash = await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(hash),byte => byte.toString(16).padStart(2,'0')).join('');
+  }
+
+  async function readAnnualConfirmation(comment,row,profile,courseId,today) {
+    try {
+      const {base,link} = splitAnnualConfirmation(comment);
+      if (!link) return {status:'absent'};
+      const keys = ['workerId','workerNumber','courseId','profileName','authorizationId','registerName','professionCode','confirmedAt','confirmedBy','contextHash'];
+      if (Object.keys(link).length !== keys.length || keys.some(key => typeof link[key] !== 'string') ||
+        link.workerId !== row.id || link.workerNumber !== row.number || link.courseId !== courseId ||
+        link.profileName !== profile.name || profile.professionCodes.length !== 1 || link.professionCode !== profile.professionCodes[0] ||
+        !annualAuthorizationId(link.authorizationId) || !annualAuthorizationNameComplete(link.registerName) ||
+        !annualAuthorizationText(link.confirmedBy) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(link.confirmedAt) ||
+        !Number.isFinite(Date.parse(link.confirmedAt)) || new Date(link.confirmedAt).toISOString() !== link.confirmedAt ||
+        link.confirmedAt.slice(0,10) > today || link.contextHash !== await annualConfirmationHash(base)) return {status:'invalid'};
+      return {status:'valid',link};
+    } catch (_) { return {status:'invalid'}; }
+  }
+
+  async function buildAnnualConfirmationComment(certificate,row,profile,record,account,at) {
+    const verified = validateAnnualAuthorizationRecord({GetHealthProfessionalResult:record},
+      {...profile,authorizationId:record.AuthorizationID},at.slice(0,10));
+    if (verified.identity === 'conflict' || !annualAuthorizationNameComplete(record.FirstName+' '+record.LastName) ||
+      profile.professionCodes.length !== 1 || !annualAuthorizationText(account) || !/^[1-9]\d*$/.test(certificate.courseId)) throw new Error('TP_ANNUAL_IDENTITY');
+    const {base} = splitAnnualConfirmation(certificate.comment);
+    const link = {workerId:row.id,workerNumber:row.number,courseId:certificate.courseId,profileName:profile.name,
+      authorizationId:record.AuthorizationID,registerName:record.FirstName+' '+record.LastName,professionCode:record.ProfessionCode,
+      confirmedAt:at,confirmedBy:account,contextHash:await annualConfirmationHash(base)};
+    const comment = base+'\n\n[TP-AUTH-LINK v1]\n'+JSON.stringify(link,null,2)+'\n[/TP-AUTH-LINK]';
+    if (comment.length > 10000 || (await readAnnualConfirmation(comment,row,profile,certificate.courseId,at.slice(0,10))).status !== 'valid') throw new Error('TP_ANNUAL_NOTE');
+    return comment;
+  }
+
+  function parseAnnualConfirmationCandidates(payload,profile,today) {
+    if (!annualAuthorizationObject(payload) || Object.keys(payload).length !== 1 ||
+      !Array.isArray(payload.GetHealthProfessionalsResult) || payload.GetHealthProfessionalsResult.length > 30) throw annualAuthorizationError();
+    const records = payload.GetHealthProfessionalsResult.map(record => annualAuthorizationRecord(record,today));
+    if (new Set(records.map(record => record.AuthorizationID)).size !== records.length) throw annualAuthorizationError();
+    return records.filter(record => record.BirthDate === profile.birthDate && profile.professionCodes.length === 1 &&
+      record.ProfessionCode === profile.professionCodes[0] && annualAuthorizationNameComplete(record.FirstName+' '+record.LastName));
+  }
+
+  async function prepareAnnualConfirmation(snapshot,row,previous,get,check) {
+    if (!['manual-id','manual-identity'].includes(previous.state) || !check()) throw new Error('TP_ANNUAL_SCOPE');
+    const profile = readAnnualProfileHTML(await get('profile',row.id),row,snapshot.listValue,snapshot.account);
+    if (profile.professionCodes.length !== 1) throw new Error('TP_ANNUAL_IDENTITY');
+    const certificate = parseAnnualCertificateHTML(await get('certificate',row.id),row.id,true);
+    if (!certificate.courseId) throw new Error('TP_ANNUAL_NOTE');
+    if (typeof previous.certificateHash !== 'string' || previous.certificateHash !== await annualConfirmationHash(certificate.comment)) throw new Error('TP_ANNUAL_CHANGED');
+    splitAnnualConfirmation(certificate.comment);
+    let candidates;
+    if (previous.state === 'manual-identity' && annualAuthorizationId(previous.authorizationId)) {
+      const verified = validateAnnualAuthorizationRecord(await get('register',previous.authorizationId),
+        {...profile,authorizationId:previous.authorizationId},formatIsoDate());
+      if (verified.identity === 'conflict') throw new Error('TP_ANNUAL_IDENTITY');
+      candidates = [verified.record];
+    } else candidates = parseAnnualConfirmationCandidates(await get('candidates',{
+      birthDate:profile.birthDate,professionCode:profile.professionCodes[0]}),profile,formatIsoDate());
+    if (!check()) throw new Error('TP_ANNUAL_SCOPE');
+    const preparedAt = Date.now();
+    let consumed = false;
+    return {profile,candidates,async save(id,mode) {
+      if (consumed || !check() || Date.now()-preparedAt > 600000) throw new Error('TP_ANNUAL_SCOPE');
+      // A second click must begin a new review, including after an uncertain write.
+      consumed = true;
+      const candidate = candidates.find(record => record.AuthorizationID === id);
+      if (!candidate) throw new Error('TP_ANNUAL_IDENTITY');
+      const freshProfile = readAnnualProfileHTML(await get('profile',row.id),row,snapshot.listValue,snapshot.account);
+      if (JSON.stringify(profile) !== JSON.stringify(freshProfile)) throw new Error('TP_ANNUAL_CHANGED');
+      const verified = validateAnnualAuthorizationRecord(await get('register',id),{...freshProfile,authorizationId:id},formatIsoDate());
+      if (verified.identity === 'conflict' || verified.record.FirstName !== candidate.FirstName ||
+        verified.record.LastName !== candidate.LastName) throw new Error('TP_ANNUAL_CHANGED');
+      const record = verified.record;
+      const result = {state:verified.status,identity:'manual-confirmed',authorizationId:id,
+        registerName:record.FirstName+' '+record.LastName,authorizationDate:record.AuthorizationDate,
+        supervision:mode.supervision ? 'unknown' : 'excluded',items:[],checkedAt:Date.now()};
+      // Supervision uncertainty never turns an identity confirmation into a clean result.
+      if (mode.supervision) {
+        try {
+          const guid = parseAnnualRegisterSearch(await get('search',id),record);
+          if (guid) { const extra = parseAnnualSupervisionHTML(await get('detail',guid),guid,record); result.supervision=extra.status; result.items=extra.items; }
+        } catch (_) { if (!check()) throw new Error('TP_ANNUAL_SCOPE'); }
+      }
+      const finalProfile = readAnnualProfileHTML(await get('profile',row.id),row,snapshot.listValue,snapshot.account);
+      if (JSON.stringify(freshProfile) !== JSON.stringify(finalProfile)) throw new Error('TP_ANNUAL_CHANGED');
+      const fresh = parseAnnualCertificateHTML(await get('certificate',row.id),row.id,true);
+      if (fresh.courseId !== certificate.courseId || fresh.comment !== certificate.comment) throw new Error('TP_ANNUAL_CHANGED');
+      const at = new Date().toISOString();
+      const comment = await buildAnnualConfirmationComment(fresh,row,freshProfile,record,snapshot.account,at);
+      if (!check()) throw new Error('TP_ANNUAL_SCOPE');
+      try {
+        await get('save-certificate',{workerId:row.id,courseId:fresh.courseId,comment});
+      } catch (_) {
+        // The server may have committed despite a lost response. Read once; never resend.
+        if (!check()) throw new Error('TP_ANNUAL_SAVE_UNKNOWN');
+      }
+      let readback;
+      try { readback = parseAnnualCertificateHTML(await get('certificate',row.id),row.id,true); }
+      catch (_) { throw new Error('TP_ANNUAL_SAVE_UNKNOWN'); }
+      if (readback.courseId !== fresh.courseId || readback.comment !== comment || !check()) throw new Error('TP_ANNUAL_SAVE_UNKNOWN');
+      result.confirmedAt=at;
+      return result;
+    }};
+  }
+
+  function showAnnualConfirmation(host,snapshot,row,previous,mode,request,scopeCheck,onResult,onDismiss) {
+    const panel = document.createElement('section'); panel.id='tpAnnualMatch'; panel.setAttribute('aria-label','Manuelt personmatch');
+    panel.innerHTML='<h3 tabindex="-1">Gennemgå match</h3><p class="tpMatchPerson"></p><p class="tpMatchStatus" role="status"></p><div class="tpMatchCandidates"></div><p class="tpMatchWarning">Personkobling, ikke godkendelse af autorisation. Eksisterende attesttekst bevares. Undgå samtidig redigering af denne attest.</p><button type="button" class="tpMatchSave" disabled>Bekræft og gem på vikaren</button> <button type="button" class="tpMatchCancel">Annuller</button>';
+    host.appendChild(panel);
+    const status=panel.querySelector('.tpMatchStatus'),choices=panel.querySelector('.tpMatchCandidates'),save=panel.querySelector('.tpMatchSave');
+    panel.querySelector('.tpMatchPerson').textContent=row.name;
+    let closed=false,session=null,selected='',pending=false,controller=null,writeStarted=false,writeSettled=false,uncertain=false;
+    const check=()=>!closed && !controller?.signal.aborted && scopeCheck();
+    const markUncertain=()=>{if(writeStarted&&!writeSettled&&!uncertain){uncertain=true;onResult({...previous,state:'manual-save-unknown',identity:'unconfirmed'});}};
+    const dispose=()=>{markUncertain();closed=true;controller?.abort();session=null;selected='';panel.replaceChildren();panel.remove();};
+    dispose.pendingWrite=()=>writeStarted&&!writeSettled;
+    const dismiss=()=>{dispose();onDismiss();};
+    panel.querySelector('.tpMatchCancel').addEventListener('click',dismiss);
+    panel.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();dismiss();}});
+    async function operation(action) {
+      if(pending || closed)return;
+      pending=true;save.disabled=true;controller=new AbortController();
+      for(const input of choices.querySelectorAll('input'))input.disabled=true;
+      const timer=setTimeout(()=>controller.abort(),120000);
+      try {
+        await navigator.locks.request('tpAnnualAuthorizationV1',{ifAvailable:true},async lock=>{
+          if(!lock)throw new Error('TP_ANNUAL_BUSY');
+          if(!check())throw new Error('TP_ANNUAL_SCOPE');
+          await action((kind,key)=>{if(kind==='save-certificate')writeStarted=true;return request(kind,key,controller.signal);});
+        });
+      } catch(error) {
+        markUncertain();
+        if(!closed){
+          session=null;choices.replaceChildren();selected='';
+          const messages={TP_ANNUAL_BUSY:'En anden fane arbejder med autorisationskontrol.',TP_ANNUAL_CHANGED:'Profilen, attesten eller registerpersonen er ændret. Start årskontrollen igen; intet er gemt herfra.',TP_ANNUAL_NOTE:'Attestkommentaren kræver kontrol på profilen før gemning.',TP_ANNUAL_SAVE_UNKNOWN:'Gemningen kunne ikke bekræftes. Kontrollér attesten på profilen og start kontrollen igen.'};
+          status.textContent=messages[error.message] || 'Kontrollen kunne ikke afsluttes. Kontrollér attesten på profilen, og åbn match igen.';
+        }
+      } finally {clearTimeout(timer);pending=false;if(!closed){save.disabled=!session || !selected;for(const input of choices.querySelectorAll('input'))input.disabled=false;}}
+    }
+    save.addEventListener('click',()=>operation(async()=>{
+      if(!session || !selected)return;
+      status.textContent='Genkontrollerer og gemmer personkobling…';
+      const result=await session.save(selected,mode);
+      if(!check())throw new Error('TP_ANNUAL_SAVE_UNKNOWN');
+      writeSettled=true;onResult(result);dispose();onDismiss();
+    }));
+    panel.querySelector('h3').focus();status.textContent='Henter friske registeroplysninger…';
+    void operation(async get=>{
+      session=await prepareAnnualConfirmation(snapshot,row,previous,get,check);
+      if(!check())throw new Error('TP_ANNUAL_SCOPE');
+      status.textContent=session.candidates.length ? 'Fødselsdato og faggruppe stemmer. Personens identitet skal bekræftes manuelt.' : 'Ingen kandidater fundet med samme fødselsdato og faggruppe.';
+      for(const record of session.candidates){
+        const label=document.createElement('label'),radio=document.createElement('input'),text=document.createElement('span'),link=document.createElement('a');
+        radio.type='radio';radio.name='tpAnnualPerson';radio.value=record.AuthorizationID;
+        text.textContent=record.FirstName+' '+record.LastName+' · '+record.BirthDate+' · '+(record.ProfessionCode==='5152'?'SSA':'SPL')+' · '+record.AuthorizationID;
+        radio.addEventListener('change',()=>{selected=radio.value;save.disabled=pending;});
+        link.textContent='Åbn register ↗';link.href=buildAuthorizationRegisterURL(record);link.target='_blank';link.rel='noopener noreferrer';
+        label.append(radio,text);choices.append(label,link);
+      }
+    });
+    return dispose;
   }
 
   function createAnnualAuthorizationRun(snapshot, options, dependencies) {
@@ -7970,16 +8153,15 @@
     return run;
   }
 
-  function createAnnualAuthorizationProcessor(snapshot, check) {
-    const {listValue,account} = snapshot;
+  function createAnnualAuthorizationRequests(check, manual = false) {
     let publicCalls = 0, nativeCalls = 0, lastPublicAt = 0;
-    async function request(kind,key,signal,checkpoint) {
+    return async function request(kind,key,signal,checkpoint = async () => {}) {
       await checkpoint();
       if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
-      if (['profile','certificate'].includes(kind)) {
-        if (++nativeCalls > 600) throw new Error('TP_ANNUAL_LIMIT');
+      if (['profile','certificate','save-certificate'].includes(kind)) {
+        if (++nativeCalls > (manual ? 2100 : 600)) throw new Error('TP_ANNUAL_LIMIT');
       } else {
-        if (++publicCalls > 900) throw new Error('TP_ANNUAL_LIMIT');
+        if (++publicCalls > (manual ? 1200 : 900)) throw new Error('TP_ANNUAL_LIMIT');
         const delay = Math.max(0, 2000 - (Date.now() - lastPublicAt));
         if (delay) await annualAuthorizationDelay(delay,signal);
         await checkpoint();
@@ -7990,7 +8172,12 @@
       await checkpoint();
       if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
       return result;
-    }
+    };
+  }
+
+  function createAnnualAuthorizationProcessor(snapshot, check) {
+    const {listValue,account} = snapshot;
+    const request = createAnnualAuthorizationRequests(check);
     return async (row,mode,signal,checkpoint = async () => {}) => {
       await checkpoint();
       if (signal.aborted || !check()) throw new Error('TP_ANNUAL_SCOPE');
@@ -8004,9 +8191,11 @@
         throw error;
       }
       if (profile.professionCodes.length !== 1) return {state:'manual-profile',supervision:'not-checked'};
-      const ids = parseAnnualCertificateHTML(await get('certificate',row.id),row.id);
-      if (ids.status !== 'unique') return {state:'manual-id',idStatus:ids.status,supervision:'not-checked'};
-      const id = ids.ids[0];
+      const ids = parseAnnualCertificateHTML(await get('certificate',row.id),row.id,true);
+      const certificateHash = await annualConfirmationHash(ids.comment);
+      const saved = await readAnnualConfirmation(ids.comment,row,profile,ids.courseId,formatIsoDate());
+      if (saved.status === 'invalid' || (saved.status !== 'valid' && ids.status !== 'unique')) return {state:'manual-id',idStatus:ids.status,certificateHash,supervision:'not-checked'};
+      const id = saved.status === 'valid' ? saved.link.authorizationId : ids.ids[0];
       const verified = validateAnnualAuthorizationRecord(await get('register',id),
         {...profile,authorizationId:id},formatIsoDate());
       if (verified.identity === 'conflict') return {state:'manual-conflict',identity:'conflict',supervision:'not-checked'};
@@ -8015,7 +8204,10 @@
         registerName:record ? record.FirstName + ' ' + record.LastName : '',
         authorizationDate:record?.AuthorizationDate || '',
         supervision:mode.supervision ? 'not-checked' : 'excluded',items:[],checkedAt:Date.now()};
-      if (verified.identity !== 'exact') { result.state = 'manual-identity'; return result; }
+      if (saved.status === 'valid' && normalizeAuthorizationName(saved.link.registerName) === normalizeAuthorizationName(result.registerName)) {
+        result.identity = 'saved-confirmation';
+        result.confirmedAt = saved.link.confirmedAt;
+      } else if (verified.identity !== 'exact' || saved.status === 'valid') { result.state = 'manual-identity'; result.certificateHash=certificateHash; return result; }
       if (!mode.supervision) return result;
       const guid = parseAnnualRegisterSearch(await get('search',id),record);
       if (!guid) { result.supervision = 'unknown'; return result; }
@@ -8037,16 +8229,18 @@
   function summarizeAnnualAuthorization(current,total) {
     const results = current.results;
     const count = predicate => results.filter(predicate).length;
-    const verified = result => result.identity === 'exact' && ['valid','temporary','invalid'].includes(result.state);
+    const identityVerified = result => ['exact','manual-confirmed','saved-confirmation'].includes(result.identity);
+    const verified = result => identityVerified(result) && ['valid','temporary','invalid'].includes(result.state);
     return {processed:results.length,remaining:Math.max(0,total-results.length),
       valid:count(result => verified(result) && result.state === 'valid'),
       temporary:count(result => verified(result) && result.state === 'temporary'),
       invalid:count(result => verified(result) && result.state === 'invalid'),
       manual:count(result => !verified(result)),
+      confirmed:count(result => result.identity === 'manual-confirmed'),
       findings:count(result => result.supervision === 'published' || result.items?.length > 0),
       noPublished:count(result => result.supervision === 'none-published'),
       extraUnknown:count(result => !['none-published','published','excluded'].includes(result.supervision)),
-      followup:count(result => result.identity !== 'exact' || result.state !== 'valid' ||
+      followup:count(result => !identityVerified(result) || result.state !== 'valid' ||
         (current.mode.supervision && result.supervision !== 'none-published') || result.items?.length > 0)};
   }
 
@@ -8080,6 +8274,11 @@
       #tpAnnualDialog .tpAnnualReview{color:#8c5500}#tpAnnualDialog .tpAnnualValid{color:#357429}
       #tpAnnualDialog footer{padding:10px 16px;color:#626a70;background:#f4f5f5;border-top:1px solid #d4d7da;font-size:11px}
       #tpAnnualDialog progress{width:100%;height:8px;display:block;margin:0;border:0}
+      #tpAnnualMatch{padding:12px 16px;border-bottom:1px solid #aeb5ba;max-height:40vh;overflow:auto;background:#f5f8fa}
+      #tpAnnualMatch h3{margin:0;font-size:14px}#tpAnnualMatch p{margin:8px 0}
+      #tpAnnualMatch label{margin:8px 0 2px;align-items:flex-start;overflow-wrap:anywhere}
+      #tpAnnualMatch .tpMatchWarning{font-size:12px;color:#626a70}
+      #tpAnnualMatch .tpMatchSave{background:#69ad2f;color:white;border-color:#559a25}
       @media(max-width:600px){
         #tpAnnualDialog{width:calc(100vw - 12px)}#tpAnnualDialog header,#tpAnnualDialog .tpAnnualControls{padding:10px}
         #tpAnnualDialog thead{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
@@ -8093,7 +8292,7 @@
 
   let closeAnnualAuthorizationUI = null;
   function openAnnualAuthorizationUI(snapshot, options = {supervision:true}) {
-    closeAnnualAuthorizationUI?.();
+    if (closeAnnualAuthorizationUI?.() === false) return document.getElementById('tpAnnualDialog');
     snapshot = {...snapshot,rows:snapshot.rows.slice()};
     injectAnnualAuthorizationStyles();
     const dialog = document.createElement('dialog'); dialog.id = 'tpAnnualDialog';
@@ -8101,9 +8300,10 @@
     dialog.innerHTML = `<header><h2 id="tpAnnualTitle">Autorisationskontrol</h2><button type="button" id="tpAnnualClose" aria-label="Luk kontrollen" title="Luk kontrollen">&times;</button></header>
       <div class="tpAnnualControls"><label><input type="checkbox" id="tpAnnualSupervision" disabled>Medtag offentligt tilsyn og begrænsninger</label><button type="button" id="tpAnnualPause" disabled>Pause</button><button type="button" id="tpAnnualStop" disabled>Stop</button></div>
       <p class="tpAnnualSummary" id="tpAnnualScope"></p><p class="tpAnnualSummary" id="tpAnnualStatus" role="status" aria-live="polite"></p><progress id="tpAnnualProgress" value="0" max="1" aria-label="Kontrollerede vikarer"></progress>
+      <div id="tpAnnualMatchHost"></div>
       <div class="tpAnnualTable"><table><thead><tr><th>Vikar</th><th>Identitet / gyldighed</th><th>Offentligt tilsyn / begrænsninger</th><th>Register</th></tr></thead><tbody></tbody></table></div>
       <section id="tpAnnualReport" hidden aria-label="Slutrapport"></section>
-      <footer>Kun læsning. Ingen profiler eller årslister ændres. Resultater slettes, når vinduet lukkes. Ikke alle tilsynsforhold offentliggøres; ingen automatisk godkendelse.</footer>`;
+      <footer>Kørslen er kun læsende. Kun “Bekræft og gem på vikaren” ændrer attestkommentaren. Ingen årslister ændres. Resultater slettes ved lukning; gemte personkoblinger bevares. Ikke alle tilsynsforhold offentliggøres; ingen automatisk godkendelse.</footer>`;
     document.body.appendChild(dialog);
     const control = id => dialog.querySelector('#tpAnnual' + id);
     control('Supervision').checked = options.supervision === true;
@@ -8123,8 +8323,11 @@
       tr.cells[1].textContent = 'Afventer'; tr.cells[2].textContent = 'Ikke undersøgt';
       body.appendChild(tr); cells.push(tr.cells);
     }
-    let run = null, rendered = 0, closed = false, scopeInvalid = false, finishedAt = null;
+    let run = null, rendered = 0, closed = false, scopeInvalid = false, finishedAt = null, dismissMatch = null, uncertainWrite = false;
+    const renderedResults = [], reviewButtons = [];
     const clearRows = () => {
+      uncertainWrite ||= !!dismissMatch?.pendingWrite?.();
+      dismissMatch?.(); dismissMatch=null; renderedResults.length=0; reviewButtons.length=0;
       for (const rowCells of cells) for (const cell of rowCells) cell.replaceChildren();
       cells.length = 0; eligible.length = 0; body.replaceChildren();
       control('Report').replaceChildren(); control('Report').hidden = true;
@@ -8140,25 +8343,44 @@
     };
     const stateLabels = {running:'Kontrol i gang',paused:'Sat på pause',complete:'Kørslen er afsluttet; gennemgå resultaterne',
       stopped:'Stoppet. Resterende vikarer er ikke kontrolleret',failed:'Stoppet ved kilde- eller netværksfejl. Aktuel og resterende vikarer kræver ny kontrol',busy:'En anden fane kører allerede en kontrol'};
+    const invalidStatus = () => 'Kontrolgrundlaget (liste, profil eller konto) er ændret eller kunne ikke bekræftes. Resultater er ryddet. Luk og åbn kontrollen igen.' +
+      (uncertainWrite ? ' En gemning var allerede sendt; udfaldet er uafklaret. Kontrollér attesten i den oprindelige konto før et nyt forsøg.' : '');
     const render = current => {
       if (closed) return;
       if (current.state === 'invalidated') {
         scopeInvalid = true; clearRows();
-        control('Status').textContent = 'Kontrolgrundlaget (liste, profil eller konto) er ændret eller kunne ikke bekræftes. Resultater er ryddet. Luk og åbn kontrollen igen.';
+        control('Status').textContent = invalidStatus();
         control('Pause').disabled = true; control('Stop').disabled = true;
         control('Progress').value = 0;
         return;
       }
       const active = ['running','paused'].includes(current.state);
+      for(const button of reviewButtons)button.disabled=active || !!dismissMatch;
       control('Pause').disabled = !active; control('Stop').disabled = !active;
       control('Pause').textContent = current.state === 'paused' ? 'Fortsæt' : 'Pause';
       control('Status').textContent = (stateLabels[current.state] || '') + ' · ' + current.current + ' / ' + eligible.length;
       control('Progress').value = current.current;
-      while (rendered < current.results.length) {
-        const result = current.results[rendered], rowCells = cells[rendered++];
-        const labels = {valid:'Gyldig i registeret',temporary:'Midlertidig autorisation',invalid:'Ikke gyldig i registeret',unknown:'Gyldighed uafklaret','manual-id':'Attest-ID kræver manuel kontrol','manual-identity':'Navneafvigelse: bekræft manuelt','manual-conflict':'Afvist match: kontrollér attest og profil','manual-profile':'Profil / faggrupper kræver manuel kontrol'};
+      for(let index=0;index<current.results.length;index++) {
+        const result=current.results[index],rowCells=cells[index];
+        if(renderedResults[index]===result)continue;
+        renderedResults[index]=result;rendered=Math.max(rendered,index+1);
+        for(let j=1;j<4;j++){rowCells[j].replaceChildren();rowCells[j].className='';}
+        const labels = {valid:'Gyldig i registeret',temporary:'Midlertidig autorisation',invalid:'Ikke gyldig i registeret',unknown:'Gyldighed uafklaret','manual-id':'Attest-ID kræver manuel kontrol','manual-identity':'Navneafvigelse: bekræft manuelt','manual-conflict':'Afvist match: kontrollér attest og profil','manual-profile':'Profil / faggrupper kræver manuel kontrol','manual-save-unknown':'Gemning uafklaret: kontrollér attesten og start kontrollen igen'};
         rowCells[1].textContent = labels[result.state] || 'Kræver manuel kontrol';
         rowCells[1].className = result.state === 'valid' ? 'tpAnnualValid' : 'tpAnnualReview';
+        if(['manual-confirmed','saved-confirmation'].includes(result.identity)){
+          const confirmed=document.createElement('small');confirmed.textContent=result.identity==='manual-confirmed'?'Bekræftet manuelt · gemt på vikaren':'Tidligere personkobling · genkontrolleret';rowCells[1].appendChild(confirmed);
+        }
+        if(['manual-id','manual-identity'].includes(result.state)){
+          const review=document.createElement('button');review.type='button';review.textContent='Gennemgå match';review.disabled=active || !!dismissMatch;reviewButtons.push(review);rowCells[1].appendChild(review);
+          review.addEventListener('click',()=>{
+            if(dismissMatch || !sameScope() || !['complete','stopped','failed'].includes(run?.state))return;
+            dismissMatch=showAnnualConfirmation(control('MatchHost'),snapshot,eligible[index],run.results[index],run.mode,manualRequest,sameScope,result=>{
+              if(!sameScope())return;run.results[index]=result;render(run);
+            },()=>{dismissMatch=null;if(!closed && !scopeInvalid){render(run);(review.isConnected?review:rowCells[0].querySelector('a'))?.focus();}});
+            for(const button of reviewButtons)button.disabled=true;
+          });
+        }
         if (result.registerName && result.identity !== 'exact') {
           const name = document.createElement('small'); name.textContent = 'Register: ' + result.registerName; rowCells[1].appendChild(name);
         }
@@ -8188,11 +8410,13 @@
         const lines = [snapshot.listLabel + ' · ' + finishedAt,
           'Behandlede: ' + stats.processed + ' af ' + eligible.length + ' · Ikke kontrolleret: ' + stats.remaining + ' · Udeladt: ' + current.excluded,
           'Gyldige: ' + stats.valid + ' · Midlertidige: ' + stats.temporary + ' · Ikke gyldige: ' + stats.invalid + ' · Uafklarede / manuelt match: ' + stats.manual,
+          'Bekræftet manuelt og gemt: ' + stats.confirmed,
           current.mode.supervision ? 'Offentligt tilsyn: Ingen vist: ' + stats.noPublished + ' · Fund: ' + stats.findings + ' · Uafklaret / ikke undersøgt: ' + stats.extraUnknown : 'Offentligt tilsyn og begrænsninger er fravalgt og ikke undersøgt.',
           'Manuel opfølgning: ' + stats.followup + ' af de behandlede. Ingen automatisk godkendelse.'];
         for (const line of lines) {const p = document.createElement('p'); p.textContent = line; report.appendChild(p);}
       }
     };
+    const manualRequest=createAnnualAuthorizationRequests(sameScope,true);
     const canStart = eligible.length > 0 && snapshot.total <= 300 && !!navigator.locks?.request && annualTransportSupported();
     if (!navigator.locks?.request) control('Status').textContent = 'Browseren understøtter ikke sikker flerfanekontrol';
     else if (!annualTransportSupported()) control('Status').textContent = 'Opdatér Tampermonkey til version 5.4 eller nyere før årskontrollen';
@@ -8204,13 +8428,15 @@
       if (closed || sameScope()) return;
       run?.dispose(); clearRows();
       control('Pause').disabled = true; control('Stop').disabled = true;
-      control('Status').textContent = 'Kontrolgrundlaget (liste, profil eller konto) er ændret eller kunne ikke bekræftes. Resultater er ryddet. Luk og åbn kontrollen igen.';
+      control('Status').textContent = invalidStatus();
     };
     const timer = setInterval(expire,1000);
     document.addEventListener('change',expire,true);
     document.addEventListener('input',expire,true);
-    const cleanup = () => {
+    const cleanup = event => {
       if (closed) return;
+      if(event?.type !== 'pagehide' && dismissMatch?.pendingWrite?.() &&
+        !window.confirm('Gemningen er sendt, men udfaldet er endnu ukendt. Kontrollér attesten på profilen før et nyt forsøg. Luk alligevel?'))return false;
       closed = true; run?.dispose(); clearRows(); clearInterval(timer); document.removeEventListener('change',expire,true);
       document.removeEventListener('input',expire,true);
       window.removeEventListener('pagehide',cleanup); dialog.close(); dialog.remove();
@@ -8656,6 +8882,9 @@
   const TEST_API = Object.freeze({
     createAnnualAuthorizationRun,
     createAnnualAuthorizationProcessor,
+    prepareAnnualConfirmation,
+    readAnnualConfirmation,
+    buildAnnualConfirmationComment,
     annualAuthorizationRequest,
     readAnnualListSnapshot,
     readAnnualProfileHTML,
